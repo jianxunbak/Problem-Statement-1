@@ -1,0 +1,116 @@
+--- NEW SERVER RUN ---
+Background thread started. Checking imports...
+Python Version: 3.12.3 (tags/v3.12.3:f6650f9, Apr  9 2024, 14:05:25) [MSC v.1938 64 bit (AMD64)]
+Imported asyncio.
+Enforced WindowsSelectorEventLoopPolicy for thread safety.
+Imported mcp from revit_mcp.server.
+Listening on 0.0.0.0:8000
+Imported uvicorn.
+FATAL THREAD ERROR: 'Server' object has no attribute 'create_starlette_app'
+Traceback (most recent call last):
+  File "C:\Users\jianxun\Documents\Revit 2026 MCP\revit-MCP\GeminiMCP.extension\lib\revit_mcp\runner.py", line 59, in run_server
+    app = mcp._mcp_server.create_starlette_app()
+          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AttributeError: 'Server' object has no attribute 'create_starlette_app'
+
+--- NEW SERVER RUN ---
+Background thread started. Checking imports...
+Python Version: 3.12.3 (tags/v3.12.3:f6650f9, Apr  9 2024, 14:05:25) [MSC v.1938 64 bit (AMD64)]
+Imported asyncio.
+Enforced WindowsSelectorEventLoopPolicy for thread safety.
+Imported mcp from revit_mcp.server.
+Listening on 0.0.0.0:8000
+Imported uvicorn.
+Preparing Starlette SSE app...
+Starlette SSE app created successfully.
+Configuring Uvicorn with host=0.0.0.0, port=8000
+FATAL THREAD ERROR: Unable to configure formatter 'default'
+--- NEW SERVER RUN ---
+Background thread started. Checking imports...
+Python Version: 3.12.3 (tags/v3.12.3:f6650f9, Apr  9 2024, 14:05:25) [MSC v.1938 64 bit (AMD64)]
+Imported asyncio.
+Enforced WindowsSelectorEventLoopPolicy for thread safety.
+Imported mcp from revit_mcp.server.
+Listening on 0.0.0.0:8000
+Imported uvicorn.
+Preparing Starlette SSE app...
+Starlette SSE app created successfully.
+Configuring Uvicorn with host=0.0.0.0, port=8000
+Building Uvicorn server...
+Uvicorn Server built. Disabling signal handlers...
+Starting event loop serving...
+--- NEW SERVER RUN ---
+Background thread started. Checking imports...
+Python Version: 3.12.3 (tags/v3.12.3:f6650f9, Apr  9 2024, 14:05:25) [MSC v.1938 64 bit (AMD64)]
+Imported asyncio.
+Enforced WindowsSelectorEventLoopPolicy for thread safety.
+Imported mcp from revit_mcp.server.
+Listening on 0.0.0.0:8000
+Imported uvicorn.
+Preparing Starlette SSE app...
+Starlette SSE app created successfully.
+Configuring Uvicorn with host=0.0.0.0, port=8000
+Building Uvicorn server...
+Uvicorn Server built. Disabling signal handlers...
+Starting event loop serving sequence...
+Creating new event loop...
+Loop created successfully.
+Loop set as current for thread.
+--- NEW SERVER RUN ---
+Background thread started. Checking imports...
+Python Version: 3.12.3 (tags/v3.12.3:f6650f9, Apr  9 2024, 14:05:25) [MSC v.1938 64 bit (AMD64)]
+[2026-03-13 23:56:23] Top-level runner.py loading...
+[2026-03-13 23:56:24] Global: Set WindowsSelectorEventLoopPolicy
+[2026-03-13 23:56:27] Global: Pre-loaded mcp and uvicorn
+[2026-03-13 23:56:29] Main: Launching background thread...
+[2026-03-13 23:56:29] Thread: Started run_server
+[2026-03-13 23:56:29] Thread: Preparing app
+[2026-03-13 23:56:29] Thread: App created
+[2026-03-13 23:56:29] Thread: Configuring Uvicorn
+[2026-03-13 23:56:29] Thread: Starting asyncio.run
+[2026-03-13 23:56:29] Async: Inside serve_async
+[2026-03-14 00:01:02] Top-level runner.py loading...
+[2026-03-14 00:01:02] Global: Set WindowsSelectorEventLoopPolicy
+[2026-03-14 00:01:06] Global: Pre-loaded mcp and uvicorn
+[2026-03-14 00:01:07] Thread: Started run_server
+[2026-03-14 00:01:07] Thread: Preparing app
+[2026-03-14 00:01:07] Thread: Configuring Uvicorn on 0.0.0.0:8001
+[2026-03-14 00:01:07] Thread: Starting asyncio.run
+[2026-03-14 00:01:07] Async: Inside serve_async
+[2026-03-14 00:05:36] SimpleTest: Starting on port 8002
+[2026-03-14 00:05:36] RealServer: Started
+[2026-03-14 00:05:36] SimpleTest: Listening on 8002. Try: http://localhost:8002
+[2026-03-14 00:05:36] RealServer: Running server on 8001
+[2026-03-14 00:10:08] HEARTBEAT #1 - Engine persistent
+[2026-03-14 00:10:08] SimpleTest: Starting on port 8002
+[2026-03-14 00:10:08] Main: All threads launched. Engine should stay persistent.
+[2026-03-14 00:10:08] SimpleTest: Listening on 127.0.0.1:8002
+[2026-03-14 00:10:08] RealServer: Starting Uvicorn on port 8001
+[2026-03-14 00:40:32] Main: start_mcp_server() entered
+[2026-03-14 00:40:37] Main: mcp loaded successfully
+[2026-03-14 00:40:37] Main: Spawning Server Thread
+[2026-03-14 00:40:37] UvicornThread: Initializing...
+[2026-03-14 00:40:37] UvicornThread: Generating App...
+[2026-03-14 00:40:37] UvicornThread: Starting Loop on 0.0.0.0:8001
+[2026-03-14 00:40:37] Main: Thread started
+[2026-03-14 00:49:57] Main: start_mcp_server() entered
+[2026-03-14 00:50:00] Main: mcp loaded successfully
+[2026-03-14 00:50:00] Main: Spawning Server Thread
+[2026-03-14 00:50:00] UvicornThread: Initializing...
+[2026-03-14 00:50:00] UvicornThread: Generating App...
+[2026-03-14 00:50:00] UvicornThread: Starting Loop on 0.0.0.0:8001
+[2026-03-14 00:50:00] Main: Thread started
+[2026-03-14 00:52:39] Main: start_mcp_server() entered
+[2026-03-14 00:52:41] Main: mcp loaded successfully
+[2026-03-14 00:52:41] Main: Spawning Server Thread
+[2026-03-14 00:52:41] UvicornThread: Initializing...
+[2026-03-14 00:52:41] UvicornThread: Generating App...
+[2026-03-14 00:52:41] UvicornThread: Starting Loop on 0.0.0.0:8001
+[2026-03-14 00:52:41] Main: Thread started
+[2026-03-14 00:56:04] Main: start_mcp_server() entered
+[2026-03-14 00:56:06] Main: mcp loaded successfully
+[2026-03-14 00:56:06] Main: Spawning Server Thread
+[2026-03-14 00:56:06] UvicornThread: Initializing...
+[2026-03-14 00:56:06] UvicornThread: Generating App...
+[2026-03-14 00:56:06] UvicornThread: Starting Loop on 0.0.0.0:8001
+[2026-03-14 00:56:06] Main: Thread started

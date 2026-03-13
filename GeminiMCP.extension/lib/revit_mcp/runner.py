@@ -1,119 +1,109 @@
 # -*- coding: utf-8 -*-
+from __future__ import print_function
 import threading
 import traceback
 import sys
+import os
+import time
+import logging
+import socket
 
-_server_thread = None
+# --- LOGGING ---
+LOG_FILE = os.path.join(os.path.dirname(__file__), "fastmcp_server.log")
 
-class FlushFile:
-    def __init__(self, f):
-        self.f = f
-    def write(self, x):
-        self.f.write(x)
-        self.f.flush()
-    def flush(self):
-        self.f.flush()
-        
-def run_server():
-    """Runs the FastMCP SSE server."""
-    import os
-    import traceback
-    log_file_path = os.path.join(os.path.dirname(__file__), "fastmcp_server.log")
-    
-    def log(msg):
-        with open(log_file_path, "a") as f:
-            f.write(msg + "\n")
-            
-    log("--- NEW SERVER RUN ---")
-    log("Background thread started. Checking imports...")
-    
+def log(msg):
     try:
-        import sys
-        log("Python Version: " + sys.version)
-        import asyncio
-        log("Imported asyncio.")
-        
-        if sys.platform == 'win32':
-            # Python 3.8+ defaults to ProactorEventLoop on Windows.
-            # ProactorEventLoop is notoriously unstable on background threads 
-            # and inside embedded interpreters like Python.Net.
-            # We must force the older, thread-safe SelectorEventLoop.
-            asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
-            log("Enforced WindowsSelectorEventLoopPolicy for thread safety.")
-        
-        try:
-            from revit_mcp.server import mcp
-            log("Imported mcp from revit_mcp.server.")
-        except Exception as e:
-            log("Error importing mcp: " + str(e))
-            log(traceback.format_exc())
-            return
-            
+        timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
+        with open(LOG_FILE, "a") as f:
+            f.write("[{}] {}\n".format(timestamp, msg))
+            f.flush()
+            os.fsync(f.fileno())
+    except:
+        pass
+
+# --- GLOBALS ---
+_server_thread = None
+_mcp_instance = None
+
+def run_uvicorn_process(mcp_instance):
+    """The main server thread."""
+    log("UvicornThread: Initializing...")
+    try:
         host = "0.0.0.0"
-        port = 8000
-        log("Listening on {}:{}".format(host, port))
+        port = 8001
+        
+        logging.basicConfig(filename=LOG_FILE, level=logging.DEBUG)
+        
+        log("UvicornThread: Generating App...")
+        app = mcp_instance.sse_app()
         
         import uvicorn
-        log("Imported uvicorn.")
-        
-        app = mcp._mcp_server.create_starlette_app()
-        log("Created Starlette app.")
-        
         config = uvicorn.Config(
-            app=app,
-            host=host,
-            port=port,
-            loop="asyncio",
-            log_level="info"
+            app=app, 
+            host=host, 
+            port=port, 
+            loop="asyncio", 
+            log_level="debug",
+            log_config=None,
+            workers=1
         )
-        
-        log("Building Uvicorn server...")
         server = uvicorn.Server(config)
-        
-        log("Disabling signal handlers...")
         server.install_signal_handlers = lambda: None
         
-        log("Uvicorn Server built. Starting event loop serving...")
-        
+        log("UvicornThread: Starting Loop on {}:{}".format(host, port))
+        import asyncio
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
+        loop.run_until_complete(server.serve())
         
-        log("Asyncio loop created. Serving...")
-        try:
-            loop.run_until_complete(server.serve())
-        except KeyboardInterrupt:
-            log("Server stopped by user.")
-        finally:
-            loop.close()
-            log("Asyncio loop closed.")
-            
     except Exception as e:
-        log("FATAL THREAD ERROR: " + str(e))
+        log("UvicornThread FATAL: " + str(e))
         log(traceback.format_exc())
 
 def start_mcp_server():
+    """
+    Triggered by the button. 
+    Moved loading here so it happens AFTER pyRevit initialization.
+    """
+    global _mcp_instance
     global _server_thread
-    
-    if _server_thread is not None and _server_thread.is_alive():
-        print("MCP Server is already running.")
+
+    log("Main: start_mcp_server() entered")
+
+    # Check if already running
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        s.bind(("127.0.0.1", 8001))
+        s.close()
+    except:
+        print("Gemini: Server is already active on port 8001.")
+        s.close()
         return
-        
-    print("Pre-loading C-extensions on main thread...")
+
+    # Load MCP and setup asyncio policy ON THE MAIN THREAD
     try:
         import asyncio
         if sys.platform == 'win32':
             asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
-        import uvicorn
-        from revit_mcp.server import mcp
-        print("Main thread pre-load complete.")
-    except Exception as e:
-        print("MAIN THREAD IMPORT FAILED: " + str(e))
-        import traceback
-        traceback.print_exc()
-        raise e
         
-    print("Initializing background thread for FastMCP...")
-    # Using daemon=True so the server dies if Revit is closed
-    _server_thread = threading.Thread(target=run_server, daemon=True)
+        # Import mcp only now. This avoids the early instantiation conflict.
+        from revit_mcp.server import mcp
+        _mcp_instance = mcp
+        log("Main: mcp loaded successfully")
+    except Exception as e:
+        print("Gemini: Failed to load server instance: {}".format(e))
+        log("Main: Load failed: " + str(e))
+        log(traceback.format_exc())
+        return
+
+    log("Main: Spawning Server Thread")
+    _server_thread = threading.Thread(
+        target=run_uvicorn_process, 
+        args=(_mcp_instance,), 
+        name="Gemini_Uvicorn", 
+        daemon=True
+    )
     _server_thread.start()
-    print("Background thread started. Waiting for SSE client at http://<VM_IP>:8000/sse")
+    
+    print("Gemini: Server spawned in background on port 8001.")
+    log("Main: Thread started")
