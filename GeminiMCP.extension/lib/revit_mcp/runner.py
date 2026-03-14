@@ -123,13 +123,16 @@ def start_mcp_server():
     global _server_thread
     log("Main: start_mcp_server() entered.")
 
-    # If we have a running server, stop it first
+    # If we have a running server, ensure we still refresh the Revit app reference
     if is_port_in_use(8001):
-        log("Main: Port 8001 in use. Stopping existing server...")
-        stop_server()
-        time.sleep(1.5)
-        if is_port_in_use(8001):
-            log("Main: Port 8001 still in use after stop attempt. Aborting.")
+        log("Main: Port 8001 in use. Re-linking existing server context.")
+        try:
+            from revit_mcp.server import set_revit_app
+            set_revit_app(__revit__)
+            log("Main: Existing server context re-linked.")
+            return True # Tell script.py to proceed as if started
+        except Exception as e:
+            log("Main: Re-link failed: " + str(e))
             return False
 
     try:
