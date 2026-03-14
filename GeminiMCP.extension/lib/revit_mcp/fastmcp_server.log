@@ -2142,3 +2142,29 @@ ced - RUNNING
 [2026-03-14 22:46:55] [Gemini] Executing Tool: create_wall with args: {'start_y': 5000, 'height_mm': 3000, 'thickness_mm': 200, 'end_y': 15000, 'level_name': 'Level 3', 'start_x': 5000, 'end_x': 5000}
 [2026-03-14 22:46:57] [Gemini] AI finished with text: Success: Done! Duplicated the 1st storey walls to ...
 [2026-03-14 22:46:57] [Gemini] Thread: Gemini returned: Success: Done! Duplicated the 
+[2026-03-14 23:02:51] Main: start_mcp_server() entered.
+[2026-03-14 23:02:59] Main: UIApplication stored via set_revit_app.
+[2026-03-14 23:02:59] Main: All components pre-loaded.
+[2026-03-14 23:02:59] Main: Spawning server thread (daemon=True)...
+[2026-03-14 23:02:59] UvicornThread: IO replaced - RUNNING
+[2026-03-14 23:02:59] UvicornThread: Importing uvicorn...
+[2026-03-14 23:02:59] UvicornThread: Importing asyncio...
+[2026-03-14 23:02:59] UvicornThread: Building SSE app...
+[2026-03-14 23:02:59] UvicornThread: SSE app ready.
+[2026-03-14 23:02:59] &clt;ul&cgt;&clt;li&cgt;&clt;strong&cgt;Port:&clt;/strong&cgt; 8001&clt;/li&cgt;&clt;/ul&cgt;
+[2026-03-14 23:02:59] UvicornThread: Creating asyncio loop...
+[2026-03-14 23:02:59] &clt;ul&cgt;&clt;li&cgt;&clt;strong&cgt;Inspector:&clt;/strong&cgt; &clt;code&cgt;http://localhost:8001/sse&clt;/code&cgt;&clt;/li&cgt;&clt;/ul&cgt;
+[2026-03-14 23:02:59] &clt;hr /&cgt;
+[2026-03-14 23:02:59] UvicornThread: server.serve() STARTING on 0.0.0.0:8001
+[2026-03-14 23:03:00] &clt;hr /&cgt;
+[2026-03-14 23:03:00] &clt;p&cgt;The AI Server is running in the background.&clt;/p&cgt;
+[2026-03-14 23:03:44] [Gemini] Thread: Calling Gemini for prompt: add 1 horizonta grid line
+[2026-03-14 23:03:48] [Gemini] AI finished with text: I can help with that. What are the start and end p...
+[2026-03-14 23:03:48] [Gemini] Thread: Gemini returned: I can help with that. What are
+[2026-03-14 23:03:58] [Gemini] Thread: Calling Gemini for prompt: place it at 0,0
+[2026-03-14 23:04:02] [Gemini] AI finished with text: To place a horizontal grid line, I need two points...
+[2026-03-14 23:04:02] [Gemini] Thread: Gemini returned: To place a horizontal grid lin
+[2026-03-14 23:04:15] [Gemini] Thread: Calling Gemini for prompt: 10000mm
+[2026-03-14 23:04:17] [Gemini] Executing Tool: create_grid with args: {'x1': 0, 'x2': 10000, 'y1': 0, 'y2': 0}
+[2026-03-14 23:04:19] [Gemini] AI finished with text: Success: Done! Created a horizontal grid line from...
+[2026-03-14 23:04:19] [Gemini] Thread: Gemini returned: Success: Done! Created a horiz
