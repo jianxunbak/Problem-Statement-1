@@ -1,57 +1,83 @@
 #! python3
 # -*- coding: utf-8 -*-
+"""
+Gemini MCP Server - Start Button Script
+
+Uses direct drain_queue() on the script thread + Application.DoEvents()
+to pump Windows messages, preventing the STA thread deadlock that occurs
+when Revit's view regeneration fires COM callbacks after Transaction.Commit().
+"""
 import sys
-
-# 1. IMPORT PYREVIT FIRST (Diagnostic)
-try:
-    print("Initalizing pyRevit...")
-    import pyrevit
-    print("pyrevit base imported.")
-    from pyrevit import script
-    print("pyrevit.script imported.")
-    from pyrevit import forms
-    print("pyrevit.forms imported.")
-    print("pyRevit modules loaded successfully.")
-except Exception as e:
-    print("\n" + "="*50)
-    print("CRITICAL ERROR: Could not load pyRevit modules.")
-    print("Technical error type: " + str(type(e)))
-    print("Technical error: " + str(e))
-    import traceback
-    traceback.print_exc()
-    print("="*50 + "\n")
-    sys.exit(1)
-
-# 2. ONLY NOW add the custom library path
 import os
+import time
+
 lib_path = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..', '..', 'lib'))
 if lib_path not in sys.path:
-    # Use append (not insert) to prioritize Revit's own libraries
     sys.path.append(lib_path)
 
-# 3. Import our custom runner
+from pyrevit import script
+
+# Import message pump - critical for STA thread compatibility
 try:
-    from revit_mcp.runner import start_mcp_server
-    print("Gemini MCP Runner loaded.")
-except Exception as e:
-    print("Error loading MCP Runner: " + str(e))
-    # We use a lazy import for traceback to keep it light
-    import traceback
-    traceback.print_exc()
+    import clr
+    clr.AddReference('System.Windows.Forms')
+    from System.Windows.Forms import Application as WinForms
+    _has_doevents = True
+except:
+    _has_doevents = False
+
+def pump():
+    """Pump Windows messages to keep STA message queue clear."""
+    if _has_doevents:
+        try:
+            WinForms.DoEvents()
+        except:
+            pass
 
 def main():
-    output = script.get_output()
-    output.print_md("# Gemini MCP Server")
-    
-    print("Attempting to start background service...")
-    try:
-        start_mcp_server()
-        output.print_md("### Server Status: **ACTIVE** (Port 8001)")
-    except Exception as e:
-        print("Error starting server: " + str(e))
+    # Clear stale cached modules
+    for mod_name in list(sys.modules.keys()):
+        if mod_name.startswith("revit_mcp"):
+            del sys.modules[mod_name]
 
-    forms.alert("Gemini MCP Server is now running in the background.\n\nKeep the Output window open for monitoring.\n\nClick OK only when you want to stop the script.", 
-                title="Gemini MCP")
+    output = script.get_output()
+    output.close_others(all_open_outputs=True)
+
+    try:
+        from revit_mcp.runner import start_mcp_server
+        success = start_mcp_server()
+    except Exception as e:
+        import traceback
+        output.print_md("## ❌ Failed to Start")
+        output.print_md("**Error:** `{}`\n```\n{}\n```".format(str(e), traceback.format_exc()))
+        return
+
+    if not success:
+        output.print_md("## ⚠️ Server already running on Port 8001.")
+        return
+
+    output.print_md("## ✅ Gemini MCP Server: Active")
+    output.print_md("- **Port:** 8001")
+    output.print_md("- **Inspector:** `http://localhost:8001/sse`")
+    output.print_md("- **DoEvents pump:** `{}`".format("✅ Active" if _has_doevents else "⚠️ Unavailable"))
+    output.print_md("---")
+    output.print_md("⚠️ **Minimize** this window — do NOT close it.")
+
+    from revit_mcp.event_handler import drain_queue
+
+    # KEEP-ALIVE + DISPATCH LOOP
+    # pump() is called every iteration to prevent STA message queue starvation
+    # which would cause Transaction.Commit() to deadlock on Revit view regeneration.
+    try:
+        while True:
+            drain_queue()   # Execute any pending Revit API work
+            pump()          # Pump Windows messages to unblock STA callbacks
+            time.sleep(0.05)  # 50ms - short sleep, minimal message starvation
+    except:
+        pass
+
+    output.print_md("---")
+    output.print_md("🛑 Server stopped.")
 
 if __name__ == '__main__':
     main()

@@ -8,12 +8,19 @@ except ImportError:
 # We move CLR imports inside the functions or into a lazy initialization
 # to prevent breaking pyRevit's own initialization during script load.
 
-mcp = FastMCP("Revit2026_MCP", debug=True)
+mcp = FastMCP("Revit2026_MCP", debug=False)
+
+# Stored at server startup from the pyRevit UI thread context
+_uiapp = None
+
+def set_revit_app(uiapp):
+    """Called from runner.py at startup to store UIApplication from the UI thread."""
+    global _uiapp
+    _uiapp = uiapp
 
 def _get_revit_app():
-    """Access the global __revit__ object provided by pyRevit."""
-    global __revit__
-    return __revit__
+    """Return the stored UIApplication. Set at startup by set_revit_app()."""
+    return _uiapp
 
 def get_doc_info_ui():
     import Autodesk.Revit.DB as DB # type: ignore
@@ -79,6 +86,62 @@ def read_element(element_id: int) -> str:
     from .event_handler import mcp_event_handler
     try:
         result = mcp_event_handler.run_on_main_thread(read_element_ui, element_id)
+        return json.dumps(result)
+    except Exception as e:
+        return json.dumps({"error": str(e)})
+
+def create_wall_ui(length_ft):
+    import Autodesk.Revit.DB as DB # type: ignore
+    uiapp = _get_revit_app()
+    if not uiapp:
+        return {"error": "No Revit application available (HOST_APP.uiapp is None)."}
+    uidoc = uiapp.ActiveUIDocument
+    if not uidoc:
+        return {"error": "No active document open in Revit. Please open a project file first."}
+    doc = uidoc.Document
+    if not doc:
+        return {"error": "Active document is null."}
+        
+    try:
+        # 1. Find the first Level in the document
+        collector = DB.FilteredElementCollector(doc).OfClass(DB.Level)
+        level = collector.FirstElement()
+        if not level:
+            return {"error": "No level found in document"}
+            
+        # 2. Define a Line (coordinates in feet)
+        p1 = DB.XYZ(0, 0, 0)
+        p2 = DB.XYZ(length_ft, 0, 0)
+        line = DB.Line.CreateBound(p1, p2)
+        
+        # 3. Create Wall inside a Transaction
+        # Use explicit Start/Commit - Python.NET does not support 'with' for DB.Transaction
+        t = DB.Transaction(doc, "MCP: Create Wall")
+        t.Start()
+        try:
+            new_wall = DB.Wall.Create(doc, line, level.Id, False)
+            t.Commit()
+        except Exception as tx_err:
+            t.RollbackToBeforeStart()
+            return {"error": "Transaction failed: " + str(tx_err)}
+            
+        return {
+            "success": True, 
+            "message": "Wall created successfully!",
+            "wall_id": str(new_wall.Id.Value),
+            "length": length_ft,
+            "level": level.Name
+        }
+    except Exception as e:
+        import traceback
+        return {"error": str(e), "traceback": traceback.format_exc()}
+
+@mcp.tool()
+def create_wall(length: float = 10.0) -> str:
+    """Create a simple wall in the active Revit document (specify length in feet)."""
+    from .event_handler import mcp_event_handler
+    try:
+        result = mcp_event_handler.run_on_main_thread(create_wall_ui, length)
         return json.dumps(result)
     except Exception as e:
         return json.dumps({"error": str(e)})
