@@ -1,0 +1,23 @@
+# Environment variables
+.env
+
+# Logs
+*.log
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.venv/
+env/
+venv/
+
+# Revit/pyRevit specific
+*.recovery.rvt
+*.backup.*
+*.000*.rvt
+
+# OS
+.DS_Store
+Thumbs.db

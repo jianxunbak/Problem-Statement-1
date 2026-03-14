@@ -34,6 +34,7 @@
             <Grid.ColumnDefinitions>
                 <ColumnDefinition Width="*"/>
                 <ColumnDefinition Width="Auto"/>
+                <ColumnDefinition Width="Auto"/>
             </Grid.ColumnDefinitions>
             
             <Border Background="#2D2D2D" CornerRadius="20" Grid.Column="0" Padding="15,5">
@@ -51,12 +52,30 @@
             <Button Name="SendButton" 
                     Grid.Column="1" 
                     Content="Send" 
-                    Width="70" 
+                    Width="60" 
                     Height="35" 
                     Margin="10,0,0,0"
                     Background="#007ACC" 
                     Foreground="White" 
                     FontWeight="Bold"
+                    Cursor="Hand">
+                <Button.Resources>
+                    <Style TargetType="Border">
+                        <Setter Property="CornerRadius" Value="17"/>
+                    </Style>
+                </Button.Resources>
+            </Button>
+
+            <Button Name="StopButton" 
+                    Grid.Column="2" 
+                    Content="Stop" 
+                    Width="60" 
+                    Height="35" 
+                    Margin="5,0,0,0"
+                    Background="#B22222" 
+                    Foreground="White" 
+                    FontWeight="Bold"
+                    Visibility="Collapsed"
                     Cursor="Hand">
                 <Button.Resources>
                     <Style TargetType="Border">

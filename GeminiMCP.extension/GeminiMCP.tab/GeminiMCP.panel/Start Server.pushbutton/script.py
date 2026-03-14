@@ -35,7 +35,7 @@ import System.Windows.Input
 import threading
 from System.Windows import Window, HorizontalAlignment, Thickness, CornerRadius, TextWrapping
 from System.Windows.Media import Brushes, Color, SolidColorBrush
-from System.Windows.Controls import Border, TextBlock
+from System.Windows.Controls import Border, TextBox
 from System.Windows.Markup import XamlReader
 from System.IO import FileStream, FileMode, FileAccess, FileShare
 from System.Windows.Interop import WindowInteropHelper
@@ -55,6 +55,8 @@ class AIChatWindow(object):
             stream.Close()
         
         self.history = []
+        self.is_thinking = False
+        self.cancelled = False
         self.setup_ui()
 
     def setup_ui(self):
@@ -65,11 +67,15 @@ class AIChatWindow(object):
         self.ChatHistory = self.window.FindName("ChatHistory")
         self.ChatScroller = self.window.FindName("ChatScroller")
         
+        self.StopButton = self.window.FindName("StopButton")
+        
         if self.UserInput:
             self.UserInput.Focus()
             self.UserInput.KeyDown += self.on_key_down
         if self.SendButton:
             self.SendButton.Click += self.on_send_click
+        if self.StopButton:
+            self.StopButton.Click += self.on_stop_click
 
     def add_message(self, message, is_user=True):
         """Add a message to the chat history block."""
@@ -88,10 +94,15 @@ class AIChatWindow(object):
             new_border.HorizontalAlignment = HorizontalAlignment.Left
             new_border.Margin = Thickness(0, 5, 50, 5)
 
-        txt = TextBlock()
+        txt = TextBox()
         txt.Text = message
         txt.TextWrapping = TextWrapping.Wrap
         txt.Foreground = Brushes.White
+        txt.IsReadOnly = True
+        txt.BorderThickness = Thickness(0)
+        txt.Background = Brushes.Transparent
+        # Allow selection while keeping it looking like a label
+        txt.VerticalScrollBarVisibility = System.Windows.Controls.ScrollBarVisibility.Disabled
         
         new_border.Child = txt
         if self.ChatHistory:
@@ -111,6 +122,14 @@ class AIChatWindow(object):
             self.add_message(user_text, is_user=True)
             
             # Show thinking state
+            self.is_thinking = True
+            self.cancelled = False
+            if self.StopButton:
+                import System.Windows
+                self.StopButton.Visibility = System.Windows.Visibility.Visible
+            if self.SendButton:
+                self.SendButton.IsEnabled = False
+
             thinking_msg = "Thinking..."
             self.add_message(thinking_msg, is_user=False)
             
@@ -119,6 +138,17 @@ class AIChatWindow(object):
             thread.daemon = True
             thread.start()
 
+    def on_stop_click(self, sender, e):
+        """Handle the stop button click."""
+        self.cancelled = True
+        self.is_thinking = False
+        if self.StopButton:
+            import System.Windows
+            self.StopButton.Visibility = System.Windows.Visibility.Collapsed
+        if self.SendButton:
+            self.SendButton.IsEnabled = True
+        self.replace_last_message("Operation cancelled by user.")
+
     def get_gemini_response(self, prompt):
         """Call Gemini API and update UI with response."""
         try:
@@ -126,22 +156,33 @@ class AIChatWindow(object):
             client.log("Thread: Calling Gemini for prompt: {}".format(prompt[:30]))
             response = client.chat(prompt, history=self.history[:-1])
             client.log("Thread: Gemini returned: {}".format(response[:30]))
-            
             # Update UI on the UI thread
             from System import Action
-            self.window.Dispatcher.Invoke(Action(lambda: self.replace_last_message(response)))
+            self.window.Dispatcher.Invoke(Action(lambda: self.on_response_finished(response)))
         except Exception as e:
+            if self.cancelled: return
             err_msg = "Error: " + str(e)
             from revit_mcp.gemini_client import client
             client.log("Thread Exception: " + err_msg)
             from System import Action
-            self.window.Dispatcher.Invoke(Action(lambda: self.replace_last_message(err_msg)))
+            self.window.Dispatcher.Invoke(Action(lambda: self.on_response_finished(err_msg)))
+
+    def on_response_finished(self, response):
+        """Handle finished response (success or error)."""
+        if self.cancelled: return
+        self.is_thinking = False
+        if self.StopButton:
+            import System.Windows
+            self.StopButton.Visibility = System.Windows.Visibility.Collapsed
+        if self.SendButton:
+            self.SendButton.IsEnabled = True
+        self.replace_last_message(response)
 
     def replace_last_message(self, new_text):
         """Replace the last message (Thinking...) with actual response."""
         if self.ChatHistory and self.ChatHistory.Children.Count > 0:
             last_border = self.ChatHistory.Children[self.ChatHistory.Children.Count - 1]
-            if isinstance(last_border.Child, TextBlock):
+            if isinstance(last_border.Child, TextBox):
                 last_border.Child.Text = new_text
                 
                 # Update background based on content for visual feedback
@@ -213,33 +254,20 @@ def main():
     output.print_md("---")
     output.print_md("⚠️ **Minimize** this window — do NOT close it (it keeps the server alive).")
 
-    from Autodesk.Revit.UI import UIApplication
-    uiapp = UIApplication(HOST_APP.uiapp)
+    uiapp = HOST_APP.uiapp
 
     # Initialize and show the chat window
     xaml_file = os.path.join(os.path.dirname(__file__), "chat_ui.xaml")
     chat_window = AIChatWindow(xaml_file)
-    chat_window.Show(uiapp) # Pass uiapp for ownership
+    chat_window.Show(uiapp) 
 
-    from revit_mcp.event_handler import drain_queue
-
-    # KEEP-ALIVE + DISPATCH LOOP
-    try:
-        # Check IsVisible property (.NET capitalization often preferred)
-        while chat_window.Visibility.ToString() == "Visible":
-            drain_queue()   # Execute any pending Revit API work
-            pump()          # Pump Windows messages to unblock STA callbacks
-            time.sleep(0.05)  # 50ms
-    except Exception as e:
-        print("Loop error: {}".format(e))
+    # INITIALIZE BRIDGE (CRITICAL for non-blocking UI)
+    from revit_mcp.bridge import init_bridge
+    init_bridge(uiapp)
 
     output.print_md("---")
-    output.print_md("🛑 Server stopped.")
-    try:
-        if chat_window.Visibility.ToString() == "Visible":
-            chat_window.Close()
-    except:
-        pass
+    output.print_md("🚀 **UI Unblocked.** You can now select elements and edit normally.")
+    output.print_md("The AI Server is running in the background.")
 
 if __name__ == '__main__':
     main()

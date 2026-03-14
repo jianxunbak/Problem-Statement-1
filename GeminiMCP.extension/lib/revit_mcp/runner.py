@@ -142,7 +142,7 @@ def start_mcp_server():
             asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
         from revit_mcp.server import mcp, set_revit_app
-        from revit_mcp.event_handler import mcp_event_handler  # noqa
+        from revit_mcp.bridge import mcp_event_handler  # noqa
 
         try:
             set_revit_app(__revit__)
