@@ -1,4 +1,9 @@
 # -*- coding: utf-8 -*-
+# NOTE: Do NOT import Autodesk.Revit.DB at module level here.
+# This file is imported on the background Uvicorn thread which has no
+# access to the Revit .NET runtime. All DB usage must be inside functions
+# that run via mcp_event_handler.run_on_main_thread() — each function
+# does its own local `import Autodesk.Revit.DB as DB`.
 import json
 try:
     from mcp.server.fastmcp import FastMCP
@@ -102,18 +107,27 @@ def create_wall_ui(params):
     
     length_mm = params.get('length_mm', 5000)
     height_mm = params.get('height_mm', 3000)
-    start_x = params.get('start_x', 0)
-    start_y = params.get('start_y', 0)
+    # Define points
+    sx = params.get('start_x', 0)
+    sy = params.get('start_y', 0)
+    p1 = DB.XYZ(mm_to_ft(sx), mm_to_ft(sy), 0)
     
-    p1 = DB.XYZ(mm_to_ft(params.get('start_x', 0)), mm_to_ft(params.get('start_y', 0)), 0)
+    ex = params.get('end_x')
+    ey = params.get('end_y')
     
-    if 'end_x' in params and 'end_y' in params:
-        p2 = DB.XYZ(mm_to_ft(params['end_x']), mm_to_ft(params['end_y']), 0)
+    if ex is not None and ey is not None:
+        p2 = DB.XYZ(mm_to_ft(ex), mm_to_ft(ey), 0)
     else:
-        length_mm = params.get('length_mm', 5000)
-        p2 = DB.XYZ(mm_to_ft(params.get('start_x', 0) + length_mm), mm_to_ft(params.get('start_y', 0)), 0)
+        l_mm = params.get('length_mm', 5000)
+        p2 = DB.XYZ(mm_to_ft(sx + l_mm), mm_to_ft(sy), 0)
     
-    line = DB.Line.CreateBound(p1, p2)
+    try:
+        line = DB.Line.CreateBound(p1, p2)
+    except Exception as e:
+        # Avoid UnboundLocalError by calculating distance safely
+        dist_ft = p1.DistanceTo(p2) if 'p2' in locals() else 0
+        msg = "Failed to create wall curve: {}. Target length: {}mm. Revit min is ~1.6mm.".format(str(e), ft_to_mm(dist_ft))
+        return {"error": msg}
     
     level = _find_level(doc, params.get('level_name') or params.get('level_id'))
     
@@ -174,19 +188,32 @@ def get_element_details_ui(element_id_val):
             p = loc.Point
             info["point"] = {"x": ft_to_mm(p.X), "y": ft_to_mm(p.Y), "z": ft_to_mm(p.Z)}
 
-        # If it's a Floor, get its boundaries
+        # If it's a Floor, get its boundaries (horizontal only)
         if isinstance(el, DB.Floor):
             opt = DB.Options()
             geo = el.get_Geometry(opt)
+            seen_lines = set() # To deduplicate (top/bottom edges)
             for g in geo:
                 if isinstance(g, DB.Solid):
                     for edge in g.Edges:
                         c = edge.AsCurve()
                         if isinstance(c, DB.Line):
+                            p1 = c.GetEndPoint(0)
+                            p2 = c.GetEndPoint(1)
+                            # Skip vertical edges (no length in XY)
+                            if abs(p1.X - p2.X) < 0.001 and abs(p1.Y - p2.Y) < 0.001:
+                                continue
+                            
+                            # Simple key to avoid duplicates
+                            line_key = tuple(sorted([(round(p1.X,3), round(p1.Y,3)), (round(p2.X,3), round(p2.Y,3))]))
+                            if line_key in seen_lines:
+                                continue
+                            seen_lines.add(line_key)
+                            
                             info["geometry"].append({
                                 "type": "line",
-                                "start": {"x": ft_to_mm(c.GetEndPoint(0).X), "y": ft_to_mm(c.GetEndPoint(0).Y)},
-                                "end": {"x": ft_to_mm(c.GetEndPoint(1).X), "y": ft_to_mm(c.GetEndPoint(1).Y)}
+                                "start": {"x": ft_to_mm(p1.X), "y": ft_to_mm(p1.Y)},
+                                "end": {"x": ft_to_mm(p2.X), "y": ft_to_mm(p2.Y)}
                             })
         
         return info
@@ -227,7 +254,10 @@ def edit_wall_ui(params):
         if hasattr(lc, "Curve") and isinstance(lc.Curve, DB.Line):
             old_line = lc.Curve
             new_end = old_line.GetEndPoint(0) + old_line.Direction.Normalize() * mm_to_ft(float(params['length_mm']))
-            lc.Curve = DB.Line.CreateBound(old_line.GetEndPoint(0), new_end)
+            try:
+                lc.Curve = DB.Line.CreateBound(old_line.GetEndPoint(0), new_end)
+            except Exception as e:
+                 return {"error": "Failed to resize wall: {}. Target length: {} mm ({} ft).".format(str(e), params['length_mm'], mm_to_ft(float(params['length_mm'])))}
             
     t.Commit()
     return {"success": True}
@@ -273,10 +303,13 @@ def create_floor_ui(params):
         p3 = DB.XYZ(x + w/2, y + l/2, 0)
         p4 = DB.XYZ(x - w/2, y + l/2, 0)
         profile = DB.CurveLoop()
-        profile.Append(DB.Line.CreateBound(p1, p2))
-        profile.Append(DB.Line.CreateBound(p2, p3))
-        profile.Append(DB.Line.CreateBound(p3, p4))
-        profile.Append(DB.Line.CreateBound(p4, p1))
+        try:
+            profile.Append(DB.Line.CreateBound(p1, p2))
+            profile.Append(DB.Line.CreateBound(p2, p3))
+            profile.Append(DB.Line.CreateBound(p3, p4))
+            profile.Append(DB.Line.CreateBound(p4, p1))
+        except Exception as e:
+            return {"error": "Failed to create floor boundary: {}. Check if width/length are too small (min 2mm recommended).".format(str(e))}
         
         loops = Generic.List[DB.CurveLoop]()
         loops.Add(profile)
@@ -555,8 +588,8 @@ def get_document_info() -> str:
     return json.dumps(mcp_event_handler.run_on_main_thread(get_doc_info_ui))
 
 @mcp.tool()
-def create_wall(length_mm: float = 5000, height_mm: float = 3000, start_x: float = 0, start_y: float = 0, end_x: float = 0, end_y: float = 0, thickness_mm: float = 0, level_name: str = "") -> str:
-    """Create a wall. Specify length or use end_x/end_y. level_name is optional."""
+def create_wall(length_mm: float = 5000, height_mm: float = 3000, start_x: float = 0, start_y: float = 0, end_x: float = None, end_y: float = None, thickness_mm: float = 0, level_name: str = "") -> str:
+    """Create a wall. Specify length_mm (default 5000) or both end_x and end_y. All dimensions in mm. level_name is optional."""
     from .bridge import mcp_event_handler
     params = locals()
     return json.dumps(mcp_event_handler.run_on_main_thread(create_wall_ui, params))
@@ -572,15 +605,15 @@ def delete_walls() -> str:
     from .bridge import mcp_event_handler
     return json.dumps(mcp_event_handler.run_on_main_thread(delete_walls_ui))
 
-@mcp.tool()
-def edit_wall(wall_id: str, length_mm: float = -1.0, height_mm: float = -1.0, type_name: str = "") -> str:
-    """Edit wall properties. Use -1 for numbers or empty string for type to keep current."""
-    from .bridge import mcp_event_handler
-    params = {"wall_id": wall_id, 
-              "length_mm": length_mm if length_mm != -1.0 else None, 
-              "height_mm": height_mm if height_mm != -1.0 else None,
-              "type_name": type_name if type_name else None}
-    return json.dumps(mcp_event_handler.run_on_main_thread(edit_wall_ui, params))
+# @mcp.tool()
+# def detailed_edit_single_wall_by_id(wall_id: str, length_mm: float = -1.0, height_mm: float = -1.0, type_name: str = "") -> str:
+#     """Detailed low-level edit for a SINGLE wall only. Do NOT use this for resizing the whole building. Use edit_entire_building_dimensions or sync_multi_story_building_model instead."""
+#     from .bridge import mcp_event_handler
+#     params = {"wall_id": wall_id, 
+#               "length_mm": length_mm if length_mm != -1.0 else None, 
+#               "height_mm": height_mm if height_mm != -1.0 else None,
+#               "type_name": type_name if type_name else None}
+#     return json.dumps(mcp_event_handler.run_on_main_thread(edit_wall_ui, params))
 
 @mcp.tool()
 def move_element(element_id: str, dx_mm: float = 0, dy_mm: float = 0, dz_mm: float = 0, direction: str = "", distance_mm: float = 0) -> str:
@@ -609,9 +642,10 @@ def query_levels() -> str:
     """List all levels in the project."""
     from .bridge import mcp_event_handler
     def action():
+        import Autodesk.Revit.DB as DB # type: ignore
         uiapp = _get_revit_app(); doc = uiapp.ActiveUIDocument.Document
         cl = DB.FilteredElementCollector(doc).OfClass(DB.Level)
-        return [{"id": str(lvl.Id.Value), "name": lvl.Name, "elevation": ft_to_mm(lvl.Elevation)} for lvl in cl]
+        return [{"id": str(lvl.Id.Value), "name": lvl.Name, "elevation": (lvl.Elevation * 304.8)} for lvl in cl]
     return json.dumps(mcp_event_handler.run_on_main_thread(action))
 
 def edit_floor_ui(params):
@@ -630,14 +664,14 @@ def edit_floor_ui(params):
     t.Commit()
     return {"success": True}
 
-@mcp.tool()
-def edit_floor(floor_id: str, type_name: str = "", offset_mm: float = -1.0) -> str:
-    """Edit floor properties. Use -1 for offset or empty string for type to keep current."""
-    from .bridge import mcp_event_handler
-    params = {"floor_id": floor_id, 
-              "type_name": type_name if type_name else None, 
-              "offset_mm": offset_mm if offset_mm != -1.0 else None}
-    return json.dumps(mcp_event_handler.run_on_main_thread(edit_floor_ui, params))
+# @mcp.tool()
+# def detailed_edit_single_floor_by_id(floor_id: str, type_name: str = "", offset_mm: float = -1.0) -> str:
+#     """Detailed low-level edit for a SINGLE floor only. Do NOT use this for resizing the whole building."""
+#     from .bridge import mcp_event_handler
+#     params = {"floor_id": floor_id, 
+#               "type_name": type_name if type_name else None, 
+#               "offset_mm": offset_mm if offset_mm != -1.0 else None}
+#     return json.dumps(mcp_event_handler.run_on_main_thread(edit_floor_ui, params))
 
 def list_elements_ui(category):
     import Autodesk.Revit.DB as DB # type: ignore
@@ -776,8 +810,11 @@ def create_polygon_floor_ui(params):
         for i in range(len(points)):
             p1 = points[i]
             p2 = points[(i+1)%len(points)]
-            loop.Append(DB.Line.CreateBound(DB.XYZ(mm_to_ft(p1['x']), mm_to_ft(p1['y']), 0), 
-                                          DB.XYZ(mm_to_ft(p2['x']), mm_to_ft(p2['y']), 0)))
+            try:
+                loop.Append(DB.Line.CreateBound(DB.XYZ(mm_to_ft(p1['x']), mm_to_ft(p1['y']), 0), 
+                                              DB.XYZ(mm_to_ft(p2['x']), mm_to_ft(p2['y']), 0)))
+            except Exception as e:
+                return {"error": "Failed to create floor segment: {}. Segment length might be too small.".format(str(e))}
         
         loops = Generic.List[DB.CurveLoop]()
         loops.Add(loop)
@@ -832,7 +869,11 @@ def create_grid_ui(params):
     uiapp = _get_revit_app(); doc = uiapp.ActiveUIDocument.Document
     p1 = DB.XYZ(mm_to_ft(params['x1']), mm_to_ft(params['y1']), 0)
     p2 = DB.XYZ(mm_to_ft(params['x2']), mm_to_ft(params['y2']), 0)
-    line = DB.Line.CreateBound(p1, p2)
+    try:
+        line = DB.Line.CreateBound(p1, p2)
+    except Exception as e:
+        msg = "Failed to create grid curve: {}. Line length was {} mm ({} ft). Revit minimum is approx 1.6mm.".format(str(e), ft_to_mm(p1.DistanceTo(p2)), p1.DistanceTo(p2))
+        return {"error": msg}
     t = DB.Transaction(doc, "MCP: Grid")
     t.Start()
     grid = DB.Grid.Create(doc, line)
@@ -962,3 +1003,68 @@ def edit_type(type_name: str = "", type_id: str = "", parameters: dict = None) -
     from .bridge import mcp_event_handler
     params = {"type_name": type_name, "type_id": type_id if type_id else None, "parameters": parameters if parameters else {}}
     return json.dumps(mcp_event_handler.run_on_main_thread(edit_type_ui, params))
+
+@mcp.tool()
+def sync_multi_story_building_model(prompt: str) -> str:
+    """COMMAND: MANDATORY tool for building or updating entire MULTI-STORY buildings (e.g. 10 floors, 20 floors). 
+    This tool has been specially optimized to handle massive multi-level assemblies in one turn. USE THIS for any 'build' or 'edit building' request."""
+    from .dispatcher import orchestrator
+    uiapp = _get_revit_app()
+    return orchestrator.run_full_stack(uiapp, prompt)
+
+@mcp.tool()
+def orchestrate_build(prompt: str) -> str:
+    """High-level building architect. Use this for all multi-story building requests."""
+    return sync_multi_story_building_model(prompt)
+
+@mcp.tool()
+def edit_entire_building_dimensions(width_mm: float, depth_mm: float, height_mm: float) -> str:
+    """
+    COMMAND: USE THIS FOR ALL GLOBAL BUILDING RESIZING. 
+    Modify the entire building footprint and height at once. 
+    This tool is fully 'State-Aware' and does NOT need element IDs. It will update the existing building automatically.
+    """
+    from .bridge import mcp_event_handler
+    
+    def get_building_metrics():
+        import Autodesk.Revit.DB as DB # type: ignore
+        uiapp = _get_revit_app()
+        doc = uiapp.ActiveUIDocument.Document
+        
+        levels = []
+        for l in DB.FilteredElementCollector(doc).OfClass(DB.Level):
+            name = l.Name
+            if name.startswith("AI Level") or name.startswith("AI_Level"):
+                levels.append(l)
+                
+        levels.sort(key=lambda x: x.Elevation)
+        count = len(levels)
+        
+        # Calculate floor height from first two levels if possible
+        floor_height_mm = 0
+        if count >= 2:
+            elev_diff_ft = levels[1].Elevation - levels[0].Elevation
+            floor_height_mm = DB.UnitUtils.ConvertFromInternalUnits(elev_diff_ft, DB.UnitTypeId.Millimeters)
+            
+        return count, floor_height_mm
+        
+    try:
+        level_count, existing_floor_height = mcp_event_handler.run_on_main_thread(get_building_metrics)
+    except Exception as e:
+        print(f"Server: Error in get_building_metrics: {e}")
+        level_count = 0
+        existing_floor_height = 0
+        
+    level_instruction = f"Keep the building exactly {level_count - 1} storeys tall." if level_count > 1 else "Maintain the current number of levels."
+    if existing_floor_height > 0:
+        level_instruction += f" Keep the floor height exactly {existing_floor_height:.1f}mm."
+        
+    print(f"Server: level_instruction -> {level_instruction}")
+    
+    prompt = f"Edit the building to be {width_mm}mm wide, {depth_mm}mm deep, and {height_mm}mm tall. {level_instruction}"
+    return orchestrate_build(prompt)
+
+@mcp.tool()
+def generate_building_system(width_mm: float, depth_mm: float, height_mm: float) -> str:
+    """Standard building generator alias. Use this to create or update building dimensions."""
+    return edit_entire_building_dimensions(width_mm, depth_mm, height_mm)

@@ -47,10 +47,10 @@ def run_on_main_thread(func, *args):
     }
     _work_queue.put((func, args, holder))
     
-    # Wait up to 30 seconds for Revit to pick it up
-    completed = holder['done'].wait(timeout=30)
+    # Wait up to 300 seconds for Revit to pick it up
+    completed = holder['done'].wait(timeout=300)
     if not completed:
-        raise RuntimeError("Revit is busy or bridge failed (30s timeout)")
+        raise RuntimeError("Revit is busy or bridge failed (300s timeout)")
     
     if holder['error']:
         raise holder['error']

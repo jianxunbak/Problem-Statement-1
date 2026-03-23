@@ -141,11 +141,18 @@ def start_mcp_server():
         if sys.platform == 'win32':
             asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
+        # FORCE RELOAD to catch latest code changes
+        import importlib
+        if 'revit_mcp.server' in sys.modules:
+            importlib.reload(sys.modules['revit_mcp.server'])
+            log("Main: revit_mcp.server reloaded.")
+        
         from revit_mcp.server import mcp, set_revit_app
         from revit_mcp.bridge import mcp_event_handler  # noqa
-
+        
         try:
-            set_revit_app(__revit__)
+            from pyrevit import HOST_APP
+            set_revit_app(HOST_APP.uiapp)
             log("Main: UIApplication stored via set_revit_app.")
         except Exception as e:
             log("Main: set_revit_app failed: " + str(e))

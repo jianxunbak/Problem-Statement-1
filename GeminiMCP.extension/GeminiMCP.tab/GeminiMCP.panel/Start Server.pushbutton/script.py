@@ -151,21 +151,32 @@ class AIChatWindow(object):
 
     def get_gemini_response(self, prompt):
         """Call Gemini API and update UI with response."""
+        responded = False
         try:
             from revit_mcp.gemini_client import client
             client.log("Thread: Calling Gemini for prompt: {}".format(prompt[:30]))
             response = client.chat(prompt, history=self.history[:-1])
-            client.log("Thread: Gemini returned: {}".format(response[:30]))
+            client.log("Thread: Gemini returned: {}".format(str(response)[:50]))
+            responded = True
             # Update UI on the UI thread
             from System import Action
             self.window.Dispatcher.Invoke(Action(lambda: self.on_response_finished(response)))
         except Exception as e:
             if self.cancelled: return
             err_msg = "Error: " + str(e)
-            from revit_mcp.gemini_client import client
-            client.log("Thread Exception: " + err_msg)
+            try:
+                from revit_mcp.gemini_client import client
+                client.log("Thread Exception: " + err_msg)
+            except: pass
+            responded = True
             from System import Action
             self.window.Dispatcher.Invoke(Action(lambda: self.on_response_finished(err_msg)))
+        finally:
+            # Safety net: only fires if no response was dispatched above
+            if not responded and not self.cancelled:
+                from System import Action
+                try: self.window.Dispatcher.Invoke(Action(lambda: self.on_response_finished("Error: Request timed out or failed unexpectedly.")))
+                except: pass
 
     def on_response_finished(self, response):
         """Handle finished response (success or error)."""
