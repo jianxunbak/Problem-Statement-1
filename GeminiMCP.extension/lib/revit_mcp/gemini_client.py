@@ -4,6 +4,8 @@ import json
 import urllib.request
 import ssl
 import threading
+import datetime
+import time
 try:
     import urllib.error
 except ImportError:
@@ -13,11 +15,23 @@ class GeminiClient:
     def __init__(self):
         self._load_config()
         self.lock = threading.Lock()
+        # REMOVED: Blocking network check in constructor to avoid "Thinking" hangs on background threads.
+        # self._test_connectivity()
+
+    def _test_connectivity(self):
+        """Minimal ping to verify internet access and API key validity."""
+        try:
+            self.log("DEBUG: Testing Google API connectivity...")
+            url = "https://generativelanguage.googleapis.com/v1beta/models?key={}".format(self.api_key)
+            with urllib.request.urlopen(url, timeout=10) as f:
+                self.log("DEBUG: Google API Connectivity Check: SUCCESS (Model List Accessible)")
+        except Exception as e:
+            self.log("DEBUG: Google API Connectivity Check: FAILED - {}".format(str(e)))
 
     def _load_config(self):
         env_path = os.path.join(os.path.dirname(__file__), "..", "..", ".env")
         self.api_key = None
-        self.model = "gemini-2.0-flash"
+        self.model = "gemini-1.5-flash"
         if os.path.exists(env_path):
             with open(env_path, "r") as f:
                 for line in f:
@@ -27,11 +41,17 @@ class GeminiClient:
                         if k.strip() == "GEMINI_MODEL": self.model = v.strip()
 
     def log(self, message):
-        log_path = os.path.join(os.path.dirname(__file__), "fastmcp_server.log")
-        with self.lock:
+        """Unified logging to the main server log only."""
+        timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        # Global absolute path for reliability across all Revit/Python threads
+        log_path = r"c:\Users\jianxun\Documents\Revit 2026 MCP\revit-MCP\GeminiMCP.extension\lib\revit_mcp\fastmcp_server.log"
+        log_msg = "[{}] [Gemini] {}\n".format(timestamp, message)
+        
+        try:
             with open(log_path, "a") as f:
-                import datetime
-                f.write("[{}] [Gemini] {}\n".format(datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"), message))
+                f.write(log_msg)
+                f.flush()
+        except: pass
 
     def get_tools(self):
         return [
@@ -82,7 +102,7 @@ class GeminiClient:
                     },
                     {
                         "name": "orchestrate_build",
-                        "description": "MANDATORY: Use this for ALL building-wide requests: creating, editing, or resizing multi-story buildings. Works from a single high-level prompt. Do NOT ask for IDs.",
+                        "description": "MANDATORY: Use this for ALL building-wide requests: creating, editing, resizing, or ADDING/REMOVING/INSERTING storeys in multi-story buildings. Works from a single high-level prompt. Do NOT ask for IDs.",
                         "parameters": {
                             "type": "object",
                             "properties": {
@@ -93,15 +113,16 @@ class GeminiClient:
                     },
                     {
                         "name": "edit_entire_building_dimensions",
-                        "description": "STATE-AWARE SYNC: Instantly update the entire building to new width, depth, and height without needing any element IDs. Use this when the user says 'edit', 'resize', or 'change shape'.",
+                        "description": "STATE-AWARE SYNC: Instantly update the entire building (footprint, height, storeys) OR specific individual floors. Use this for ANY 'edit', 'resize', 'add floor', 'remove floor', or 'remodel' request.",
                         "parameters": {
                             "type": "object",
                             "properties": {
-                                "width_mm": {"type": "number", "description": "New building width in mm (e.g. 20000 for 20m)"},
-                                "depth_mm": {"type": "number", "description": "New building depth in mm (e.g. 25000 for 25m)"},
-                                "height_mm": {"type": "number", "description": "Total building height in mm (e.g. 30000 for 10 floors at 3m each)"}
+                                "width_mm": {"type": "number", "description": "New building width in mm. Pass 0 if only editing specific floor overrides."},
+                                "depth_mm": {"type": "number", "description": "New building depth in mm. Pass 0 if only editing specific floor overrides."},
+                                "height_mm": {"type": "number", "description": "Total building height in mm. Pass 0 if only editing specific floor overrides."},
+                                "advanced_instructions": {"type": "string", "description": "Pass any floor-specific overrides or constraints requested by the user here."}
                             },
-                            "required": ["width_mm", "depth_mm", "height_mm"]
+                            "required": []
                         }
                     },
                     {
@@ -422,6 +443,17 @@ class GeminiClient:
                             "required": ["element_id"]
                         }
                     },
+                    {
+                        "name": "sync_building_manifest",
+                        "description": "HIGH PERFORMANCE: Create or update a full multi-story building model (levels, walls, floors) from a JSON manifest. Extremely efficient for large projects.",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "manifest_json": {"type": "string", "description": "JSON string defining levels, walls, and floors."}
+                            },
+                            "required": ["manifest_json"]
+                        }
+                    },
                 ]
             }
         ]
@@ -429,7 +461,7 @@ class GeminiClient:
     def execute_tool(self, name, args):
         import revit_mcp.server as server
         import traceback
-        self.log("Executing Tool: {} with args: {}".format(name, args))
+        # Redundant log removed (already logged in chat loop)
         try:
             func = getattr(server, name)
             return func(**args)
@@ -439,139 +471,105 @@ class GeminiClient:
             return json.dumps({"error": str(e), "traceback": tb})
 
     def chat(self, prompt, history=None):
-        """Tool-enabled chat with multi-step tool execution loop"""
-        url = "https://generativelanguage.googleapis.com/v1beta/models/{}:generateContent?key={}".format(self.model, self.api_key)
-        
-        # Build initial contents
-        contents = []
-        if history:
-            for msg in history:
-                role = "user" if msg["is_user"] else "model"
-                contents.append({"role": role, "parts": [{"text": msg["text"]}]})
-        
-        # System instructions sourced from agent_prompts.py
+        """High-performance chat routing to Orchestrator."""
+        self.log("--- GeminiClient: chat START ---")
         try:
-            from revit_mcp.agent_prompts import SPATIAL_BRAIN_SYSTEM_INSTRUCTION
-            instr = SPATIAL_BRAIN_SYSTEM_INSTRUCTION
-        except Exception:
-            instr = "You are a Revit AI Assistant. Use the provided tools. All lengths in MILLIMETERS."
-        instr += (
-            " IMPORTANT: All lengths are in MILLIMETERS. "
-            "For any building-wide request (create, edit, resize, change storeys), ALWAYS use the 'orchestrate_build' or 'edit_entire_building_dimensions' tools IMMEDIATELY! "
-            "NEVER just reply to the user that you 'have updated it'. You MUST physically execute the tool call! "
-            "NEVER ask for element IDs for massing changes. NEVER say you cannot edit the building."
-        )
-        full_prompt = "SYSTEM: {}\n\nUSER: {}".format(instr, prompt)
-        contents.append({"role": "user", "parts": [{"text": full_prompt}]})
-
-        # --- RE-ACT LOOP ---
-        for _ in range(12): # Max 12 steps per turn
-            data = {
-                "contents": contents,
-                "tools": self.get_tools(),
-                "generationConfig": {"thinkingConfig": {"thinkingBudget": 0}}
-            }
+            from .dispatcher import orchestrator
+            # We need the uiapp - luckily we stored it in the bridge
+            from .bridge import _uiapp
+            if not _uiapp:
+                from .runner import log as server_log
+                server_log("GeminiClient: UIApp missing in bridge, cannot orchestrate.")
+                return "Error: Revit connection lost. Please restart the MCP server."
             
-            self.log("Sending request to Gemini API...")
-            response_json = self._make_request(url, data)
-            self.log("Gemini API responded.")
-
-            if "error" in response_json:
-                return "Error: API Failure - " + str(response_json.get("error"))
-            
-            candidates = response_json.get('candidates', [])
-            if not candidates:
-                return "Error: No candidates returned from AI."
-            
-            candidate = candidates[0]
-            msg_content = candidate.get('content', {})
-            parts = msg_content.get('parts', [])
-            
-            # Add model's response to history
-            contents.append({"role": "model", "parts": parts})
-            
-            # Check for tool calls
-            tool_calls = [p.get('functionCall') for p in parts if 'functionCall' in p]
-            if not tool_calls:
-                # No tools? Return the final text
-                for p in parts:
-                    if 'text' in p: return p['text']
-                return "Done (No text response)."
-
-            # Execute tools
-            tool_results_parts = []
-            for tc in tool_calls:
-                name = tc['name']
-                args = tc.get('args', {})
-                self.log("Executing Tool: {} with args: {}".format(name, str(args)))
-                
-                try:
-                    res_raw = self.execute_tool(name, args)
-                    res_text = str(res_raw)
-                except Exception as e:
-                    res_text = json.dumps({"error": str(e)})
-                
-                tool_results_parts.append({
-                    "functionResponse": {
-                        "name": name,
-                        "response": {"name": name, "content": res_text}
-                    }
-                })
-            
-            # Append tool results to conversation as "user" (or rather "function")
-            # In Gemini API v1beta, function results are sent as a message with role 'user' (or omitted in some contexts, but 'user' works for part-matching)
-            # Actually, Gemini v1beta expects function results in a message following the model's call.
-            contents.append({"role": "user", "parts": tool_results_parts})
-            
-            # Continue the loop for the AI to process results...
-            
-        return "Error: Multi-step limit reached (12 steps)."
+            self.log("GeminiClient: Routing to Orchestrator...")
+            res = orchestrator.run_full_stack(_uiapp, prompt)
+            self.log("GeminiClient: Orchestration complete.")
+            return res
+        except Exception as e:
+            import traceback
+            err = "Chat Error: {}\n{}".format(str(e), traceback.format_exc())
+            self.log(err)
+            return err
 
     def generate_content(self, prompt):
         """Pure text generation for internal agent manifest generation"""
+        self.log("generate_content() entered with model: " + str(self.model))
         url = "https://generativelanguage.googleapis.com/v1beta/models/{}:generateContent?key={}".format(self.model, self.api_key)
         data = {
             "contents": [{"role": "user", "parts": [{"text": prompt}]}],
             "generationConfig": {
                 "temperature": 0.1,
-                "thinkingConfig": {"thinkingBudget": 0}
+                "responseMimeType": "application/json",
             }
         }
         response_json = self._make_request(url, data)
-        if "error" in response_json: return "Error: " + str(response_json["error"])
+        if "error" in response_json:
+            self.log("Error in generate_content response: " + str(response_json["error"]))
+            return "Error: " + str(response_json["error"])
         
         try:
-            return response_json['candidates'][0]['content']['parts'][0]['text']
+            result = response_json['candidates'][0]['content']['parts'][0]['text']
+            self.log("generate_content successful. Result length: {}".format(len(result)))
+            return result
         except (KeyError, IndexError):
+            self.log("Error: Failed to extract text from manifest response.")
             return "Error: Failed to extract text from manifest response."
 
     def _make_request(self, url, data, max_retries=3):
-        import time
+        """Low-level urllib request with simple retry logic"""
+        self.log("_make_request() to " + url)
+        import ssl
+        import urllib.request
+        ctx = ssl._create_unverified_context()
+        self.log("SSL context created.")
+        
         headers = {
             'Content-Type': 'application/json',
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Revit-MCP/1.0'
         }
-        req = urllib.request.Request(url, data=json.dumps(data).encode('utf-8'), headers=headers)
-        ctx = ssl._create_unverified_context()
         
         last_err = None
         for attempt in range(max_retries):
             try:
-                with urllib.request.urlopen(req, context=ctx, timeout=60) as f:
-                    return json.loads(f.read().decode('utf-8'))
+                self.log("Request Attempt {}/{}...".format(attempt + 1, max_retries))
+                req = urllib.request.Request(url, data=json.dumps(data).encode('utf-8'), headers=headers)
+                self.log("Request object created. Starting urlopen (timeout=120s)...")
+                with urllib.request.urlopen(req, context=ctx, timeout=120) as f:
+                    self.log("urlopen returned. Reading binary data...")
+                    raw_data = f.read()
+                    self.log("Data read ({} bytes). Decoding...".format(len(raw_data)))
+                    decoded = raw_data.decode('utf-8')
+                    self.log("Decoded. Parsing JSON...")
+                    return json.loads(decoded)
             except Exception as e:
+                err_msg = str(e)
+                error_body = ""
+                if hasattr(e, 'read'):
+                    try: 
+                        error_body = e.read().decode('utf-8')
+                        err_msg += " (Details: " + error_body + ")"
+                    except: pass
+                
+                # Specific check for SSL EOF error which is common on some Windows environments
+                if "UNEXPECTED_EOF_WHILE_READING" in err_msg or "EOF occurred" in err_msg:
+                    self.log("SSL EOF Error detected. Retrying with fresh connection... (Attempt {}/{})".format(attempt + 1, max_retries))
+                
+                # Check for Timeout
+                if "timeout" in err_msg.lower():
+                    self.log("Gemini API Timeout (120s). This large building requires more processing time. Retrying... (Attempt {}/{})".format(attempt+1, max_retries))
+
                 error_body = ""
                 if hasattr(e, 'read'):
                     try: error_body = e.read().decode('utf-8')
                     except: pass
                 
-                err_msg = str(e)
                 if error_body: err_msg += " | Body: " + error_body
                 last_err = err_msg
                 
                 self.log("Request Error (Attempt {}/{}): {}".format(attempt + 1, max_retries, err_msg))
                 if attempt < max_retries - 1:
-                    time.sleep(2 ** attempt)
+                    time.sleep(1.5 ** attempt) # Slightly faster retries
                     
         return {"error": last_err}
 

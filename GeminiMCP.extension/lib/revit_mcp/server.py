@@ -5,10 +5,14 @@
 # that run via mcp_event_handler.run_on_main_thread() — each function
 # does its own local `import Autodesk.Revit.DB as DB`.
 import json
+import time
 try:
     from mcp.server.fastmcp import FastMCP
 except ImportError:
     from fastmcp import FastMCP
+
+from .state_manager import state_manager
+from .building_generator import BuildingSystem
 
 mcp = FastMCP("Revit2026_MCP", debug=False)
 
@@ -134,6 +138,11 @@ def create_wall_ui(params):
     t = DB.Transaction(doc, "MCP: Create Wall")
     t.Start()
     new_wall = DB.Wall.Create(doc, line, level.Id, False)
+    
+    # NEW: Secure State Tracking via Extensible Storage
+    ai_id = params.get('ai_id') or "AI_Wall_{}".format(new_wall.Id.Value)
+    state_manager.set_ai_metadata(new_wall, ai_id)
+    
     param = new_wall.get_Parameter(DB.BuiltInParameter.WALL_USER_HEIGHT_PARAM)
     if param: param.Set(mm_to_ft(params.get('height_mm', 3000)))
     
@@ -323,6 +332,11 @@ def create_floor_ui(params):
         t = DB.Transaction(doc, "MCP: Create Floor")
         t.Start()
         new_floor = DB.Floor.Create(doc, loops, floor_type.Id, level.Id)
+        
+        # NEW: Secure State Tracking
+        ai_id = params.get('ai_id') or "AI_Floor_{}".format(new_floor.Id.Value)
+        state_manager.set_ai_metadata(new_floor, ai_id)
+        
         t.Commit()
         return {"success": True, "floor_id": str(new_floor.Id.Value)}
     except Exception as e:
@@ -351,6 +365,7 @@ def create_column_ui(params):
         DB.ElementTransformUtils.RotateElement(doc, inst.Id, axis, rotation * (3.14159 / 180.0))
         
     t.Commit()
+    return {"success": True, "id": str(inst.Id.Value)}
 def create_hosted_ui(params):
     import Autodesk.Revit.DB as DB # type: ignore
     uiapp = _get_revit_app(); doc = uiapp.ActiveUIDocument.Document
@@ -1006,8 +1021,9 @@ def edit_type(type_name: str = "", type_id: str = "", parameters: dict = None) -
 
 @mcp.tool()
 def sync_multi_story_building_model(prompt: str) -> str:
-    """COMMAND: MANDATORY tool for building or updating entire MULTI-STORY buildings (e.g. 10 floors, 20 floors). 
-    This tool has been specially optimized to handle massive multi-level assemblies in one turn. USE THIS for any 'build' or 'edit building' request."""
+    import importlib
+    from . import dispatcher
+    importlib.reload(dispatcher)
     from .dispatcher import orchestrator
     uiapp = _get_revit_app()
     return orchestrator.run_full_stack(uiapp, prompt)
@@ -1018,7 +1034,11 @@ def orchestrate_build(prompt: str) -> str:
     return sync_multi_story_building_model(prompt)
 
 @mcp.tool()
-def edit_entire_building_dimensions(width_mm: float, depth_mm: float, height_mm: float) -> str:
+def edit_entire_building_dimensions(**kwargs) -> str:
+    width_mm = kwargs.get('width_mm', 0)
+    depth_mm = kwargs.get('depth_mm', 0)
+    height_mm = kwargs.get('height_mm', 0)
+    advanced_instructions = kwargs.get('advanced_instructions', "")
     """
     COMMAND: USE THIS FOR ALL GLOBAL BUILDING RESIZING. 
     Modify the entire building footprint and height at once. 
@@ -1040,31 +1060,98 @@ def edit_entire_building_dimensions(width_mm: float, depth_mm: float, height_mm:
         levels.sort(key=lambda x: x.Elevation)
         count = len(levels)
         
-        # Calculate floor height from first two levels if possible
+        # Calculate floor height from gaps
         floor_height_mm = 0
+        heights_consistent = True
         if count >= 2:
             elev_diff_ft = levels[1].Elevation - levels[0].Elevation
             floor_height_mm = DB.UnitUtils.ConvertFromInternalUnits(elev_diff_ft, DB.UnitTypeId.Millimeters)
             
-        return count, floor_height_mm
+            for i in range(1, count - 1):
+                diff = levels[i+1].Elevation - levels[i].Elevation
+                h_mm = DB.UnitUtils.ConvertFromInternalUnits(diff, DB.UnitTypeId.Millimeters)
+                if abs(h_mm - floor_height_mm) > 1.0: # Allow 1mm tolerance
+                    heights_consistent = False
+                    break
+            
+        return count, floor_height_mm, heights_consistent
         
     try:
-        level_count, existing_floor_height = mcp_event_handler.run_on_main_thread(get_building_metrics)
+        level_count, existing_floor_height, consistent = mcp_event_handler.run_on_main_thread(get_building_metrics)
     except Exception as e:
-        print(f"Server: Error in get_building_metrics: {e}")
+        client.log("Server: Error in get_building_metrics: {}".format(e))
         level_count = 0
         existing_floor_height = 0
+        consistent = True
         
-    level_instruction = f"Keep the building exactly {level_count - 1} storeys tall." if level_count > 1 else "Maintain the current number of levels."
+    level_instruction = "The building currently has {} storeys.".format(max(1, level_count - 1)) if level_count > 1 else "The building is currently a single level."
     if existing_floor_height > 0:
-        level_instruction += f" Keep the floor height exactly {existing_floor_height:.1f}mm."
+        if consistent:
+            level_instruction += " Current consistent floor height is {:.0f}mm.".format(existing_floor_height)
+        else:
+            level_instruction += " Note: Floor heights vary. Check the BIM State for details."
         
-    print(f"Server: level_instruction -> {level_instruction}")
+    client.log("Server: level_instruction -> {}".format(level_instruction))
     
-    prompt = f"Edit the building to be {width_mm}mm wide, {depth_mm}mm deep, and {height_mm}mm tall. {level_instruction}"
+    prompt_parts = []
+    if width_mm and width_mm > 0: prompt_parts.append("{}mm wide".format(width_mm))
+    if depth_mm and depth_mm > 0: prompt_parts.append("{}mm deep".format(depth_mm))
+    if height_mm and height_mm > 0: prompt_parts.append("{}mm tall".format(height_mm))
+    
+    if prompt_parts:
+        prompt = "Modify building to be " + " and ".join(prompt_parts) + ". " + prompt
+    else:
+        prompt = advanced_instructions + " " + level_instruction
+        
     return orchestrate_build(prompt)
 
 @mcp.tool()
 def generate_building_system(width_mm: float, depth_mm: float, height_mm: float) -> str:
     """Standard building generator alias. Use this to create or update building dimensions."""
     return edit_entire_building_dimensions(width_mm, depth_mm, height_mm)
+@mcp.tool()
+def sync_building_manifest(manifest_json: str) -> str:
+    """
+    The High-Performance Manifest Sync Tool.
+    Takes a JSON string defining levels, walls, and floors.
+    Handles all transactions and state persistence (Extensible Storage) in one pass.
+    """
+    from .bridge import mcp_event_handler
+    
+    def action():
+        import json
+        uiapp = _get_revit_app()
+        doc = uiapp.ActiveUIDocument.Document
+        manifest = json.loads(manifest_json)
+        
+        generator = BuildingSystem(doc)
+        return generator.sync_manifest(manifest)
+        
+    return json.dumps(mcp_event_handler.run_on_main_thread(action))
+
+@mcp.tool()
+def check_bridge_health() -> str:
+    """Check if the Revit Main Thread bridge is initialized and responding."""
+    from .bridge import _external_event, _handler
+    status = {
+        "bridge_initialized": _external_event is not None,
+        "handler_initialized": _handler is not None,
+        "timestamp": time.time()
+    }
+    if _external_event:
+        try:
+            def ping(): return "pong"
+            res = mcp_event_handler.run_on_main_thread(ping)
+            status["ping_response"] = res
+            status["status"] = "HEALTHY"
+        except Exception as e:
+            status["status"] = "ERROR"
+            status["error"] = str(e)
+    else:
+        status["status"] = "UNINITIALIZED"
+    return json.dumps(status)
+
+@mcp.tool()
+def heartbeat() -> str:
+    """Simple tool to verify the MCP server is receiving and processing requests."""
+    return json.dumps({"status": "ALIVE", "timestamp": time.time()})

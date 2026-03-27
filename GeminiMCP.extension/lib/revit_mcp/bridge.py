@@ -1,67 +1,92 @@
-# -*- coding: utf-8 -*-
 import threading
 import queue
-import clr
+import datetime
+import os
 
-# --- NO-INTERFACE IDLING DISPATCHER FOR REVIT 2026 ---
-# Renamed to 'bridge.py' to avoid Revit's module cache.
-
+# --- Bridge State ---
 _work_queue = queue.Queue()
-_is_registered = False
+_uiapp = None
 
-def _idle_callback_v2(sender, args):
-    """Event handler that runs when Revit is idle."""
-    try:
-        while not _work_queue.empty():
-            func, args_list, holder = _work_queue.get_nowait()
+def pump_commands(uiapp):
+    """
+    Drains the bridge work queue. 
+    This MUST be called from the Revit Main Thread (e.g. via DispatcherTimer).
+    """
+    global _uiapp
+    _uiapp = uiapp
+    
+    while not _work_queue.empty():
+        try:
+            # Non-blocking get
+            func, args, kwargs, event, result_wrapper = _work_queue.get_nowait()
+            
             try:
-                holder['result'] = func(*args_list)
+                # Execute the Revit-dependent function on the main thread
+                result = func(*args, **kwargs)
+                result_wrapper['data'] = result
             except Exception as e:
-                holder['error'] = e
+                import traceback
+                # We can't use 'from .runner import log' easily here due to potential circularity
+                # direct write to log file
+                log_path = r"c:\Users\jianxun\Documents\Revit 2026 MCP\revit-MCP\GeminiMCP.extension\lib\revit_mcp\fastmcp_server.log"
+                with open(log_path, "a") as f:
+                    f.write("[{}] Bridge EXECUTION ERROR: {}\n{}\n".format(
+                        datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                        str(e), traceback.format_exc()))
+                result_wrapper['error'] = e
             finally:
-                holder['done'].set()
-    except Exception:
-        pass
+                event.set() # Release the caller thread
+                _work_queue.task_done()
+        except queue.Empty:
+            break
+        except Exception as ex:
+            break
+
+def run_on_main_thread(func, *args, **kwargs):
+    """
+    Submit a function to be executed by the Bridge Pump on the Revit Main Thread.
+    Blocks the caller thread until execution is complete.
+    """
+    event = threading.Event()
+    result_wrapper = {'data': None, 'error': None}
+    
+    _work_queue.put((func, args, kwargs, event, result_wrapper))
+    
+    # Wait for completion (default 300s to avoid infinite hang)
+    if not event.wait(300):
+        # Log timeout
+        log_path = r"c:\Users\jianxun\Documents\Revit 2026 MCP\revit-MCP\GeminiMCP.extension\lib\revit_mcp\fastmcp_server.log"
+        with open(log_path, "a") as f:
+            f.write("[{}] Bridge: TIMEOUT waiting for main thread execution of {}\n".format(
+                datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"), str(func)))
+        raise TimeoutError("Revit main thread did not respond within 300s.")
+        
+    if result_wrapper['error']:
+        raise result_wrapper['error']
+        
+    return result_wrapper['data']
 
 def init_bridge(uiapp):
-    """Subscribes to the Idling event. Must call on Main Thread."""
-    global _is_registered
-    if not _is_registered:
-        try:
-            # UIApplication.Idling += EventHandler<IdlingEventArgs>
-            uiapp.Idling += _idle_callback_v2
-            _is_registered = True
-            return True
-        except Exception as e:
-            # If for some reason Idling isn't accessible, we print to trace
-            print("Gemini Bridge Error: " + str(e))
-            return False
+    """Bridge initialization. Now simpler since it's timer-based."""
+    global _uiapp
+    _uiapp = uiapp
+    log_path = r"c:\Users\jianxun\Documents\Revit 2026 MCP\revit-MCP\GeminiMCP.extension\lib\revit_mcp\fastmcp_server.log"
+    with open(log_path, "a") as f:
+        f.write("[{}] Bridge: Timer-based bridge initialized (v8-STABLE).\n".format(
+            datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
     return True
 
-def run_on_main_thread(func, *args):
-    """Submits work to Revit and waits for completion."""
-    holder = {
-        'result': None,
-        'error': None,
-        'done': threading.Event(),
-    }
-    _work_queue.put((func, args, holder))
-    
-    # Wait up to 300 seconds for Revit to pick it up
-    completed = holder['done'].wait(timeout=300)
-    if not completed:
-        raise RuntimeError("Revit is busy or bridge failed (300s timeout)")
-    
-    if holder['error']:
-        raise holder['error']
-    return holder['result']
+def idling_handler(sender, args):
+    """Event handler for UIApplication.Idling. Provides valid API context."""
+    try:
+        # sender is the UIApplication object
+        pump_commands(sender)
+    except:
+        pass
 
-class BridgeProxy(object):
-    def run_on_main_thread(self, *args, **kwargs):
-        # Handle cases where it might be called with params or multiple args
-        if len(args) > 1:
-            return run_on_main_thread(args[0], *args[1:])
-        return run_on_main_thread(args[0])
+# Mock class for backward compatibility
+class MCPEventHandler:
+    def run_on_main_thread(self, func, *args, **kwargs):
+        return run_on_main_thread(func, *args, **kwargs)
 
-# Global instance for easy importing
-mcp_event_handler = BridgeProxy()
+mcp_event_handler = MCPEventHandler()

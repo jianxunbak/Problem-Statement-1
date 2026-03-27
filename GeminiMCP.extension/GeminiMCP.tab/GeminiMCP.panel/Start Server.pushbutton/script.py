@@ -15,7 +15,25 @@ lib_path = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..', '
 if lib_path not in sys.path:
     sys.path.append(lib_path)
 
-from pyrevit import script, forms, HOST_APP
+# Hard reset of revit_mcp modules to force reload from disk
+import sys
+for m in list(sys.modules.keys()):
+    if 'revit_mcp' in m:
+        del sys.modules[m]
+
+from pyrevit import revit, DB, UI, HOST_APP, forms, script
+from Autodesk.Revit.UI import TaskDialog
+
+try:
+    from revit_mcp.gemini_client import client
+    from revit_mcp.dispatcher import orchestrator
+    import revit_mcp.bridge as bridge
+    client.log("UI: Hard module reset completed. v8-STABLE starting.")
+    TaskDialog.Show("Gemini MCP", "v8-STABLE ENGINE LOADED\n\n1. CLOSE any old chat windows.\n2. Click 'Start Server' if needed.\n3. Type 'ping' in the FRESH window.")
+except Exception as e:
+    import traceback
+    print("Pre-load failed: " + str(e))
+
 import clr
 
 # Import message pump - critical for STA thread compatibility
@@ -36,13 +54,18 @@ import threading
 from System.Windows import Window, HorizontalAlignment, Thickness, CornerRadius, TextWrapping
 from System.Windows.Media import Brushes, Color, SolidColorBrush
 from System.Windows.Controls import Border, TextBox
+from System.Windows.Interop import WindowInteropHelper
+from System.Windows.Threading import DispatcherTimer
 from System.Windows.Markup import XamlReader
 from System.IO import FileStream, FileMode, FileAccess, FileShare
-from System.Windows.Interop import WindowInteropHelper
+from System import TimeSpan, Action
 
 # Add reference for keyboard interop
 clr.AddReference("WindowsFormsIntegration")
 from System.Windows.Forms.Integration import ElementHost
+
+# Persistent reference to prevent garbage collection of the chat window
+_current_chat_window = None
 
 class AIChatWindow(object):
     """AI chat window for Gemini MCP (CPython/XamlReader compatible)."""
@@ -57,6 +80,7 @@ class AIChatWindow(object):
         self.history = []
         self.is_thinking = False
         self.cancelled = False
+        self._uiapp = None
         self.setup_ui()
 
     def setup_ui(self):
@@ -115,28 +139,41 @@ class AIChatWindow(object):
 
     def on_send_click(self, sender, e):
         """Handle the send button click."""
-        if not self.UserInput: return
-        user_text = self.UserInput.Text.strip()
-        if user_text:
-            self.UserInput.Text = ""
-            self.add_message(user_text, is_user=True)
-            
-            # Show thinking state
-            self.is_thinking = True
-            self.cancelled = False
-            if self.StopButton:
-                import System.Windows
-                self.StopButton.Visibility = System.Windows.Visibility.Visible
-            if self.SendButton:
-                self.SendButton.IsEnabled = False
+        try:
+            if not self.UserInput: return
+            user_text = self.UserInput.Text.strip()
+            if user_text:
+                if user_text.lower() == "ping":
+                    self.UserInput.Text = ""
+                    self.add_message("ping", is_user=True)
+                    self.test_bridge()
+                    return
+                
+                self.UserInput.Text = ""
+                self.add_message(user_text, is_user=True)
+                
+                # Show thinking state
+                self.is_thinking = True
+                self.cancelled = False
+                if self.StopButton:
+                    import System.Windows
+                    self.StopButton.Visibility = System.Windows.Visibility.Visible
+                if self.SendButton:
+                    self.SendButton.IsEnabled = False
 
-            thinking_msg = "Thinking..."
-            self.add_message(thinking_msg, is_user=False)
-            
-            # Run Gemini call in separate thread
-            thread = threading.Thread(target=self.get_gemini_response, args=(user_text,))
-            thread.daemon = True
-            thread.start()
+                thinking_msg = "Thinking..."
+                self.add_message(thinking_msg, is_user=False)
+                
+                # Run Gemini call in separate thread
+                client.log("UI Thread: Dispatching prompt: " + user_text[:30])
+                thread = threading.Thread(target=self.get_gemini_response, args=(user_text,))
+                thread.daemon = True
+                thread.start()
+                client.log("UI Thread: Thread.start() called.")
+        except Exception as ex:
+            import traceback
+            from pyrevit import forms
+            forms.alert("UI Error: {}\n\n{}".format(str(ex), traceback.format_exc()))
 
     def on_stop_click(self, sender, e):
         """Handle the stop button click."""
@@ -150,33 +187,38 @@ class AIChatWindow(object):
         self.replace_last_message("Operation cancelled by user.")
 
     def get_gemini_response(self, prompt):
-        """Call Gemini API and update UI with response."""
         responded = False
         try:
-            from revit_mcp.gemini_client import client
-            client.log("Thread: Calling Gemini for prompt: {}".format(prompt[:30]))
-            response = client.chat(prompt, history=self.history[:-1])
-            client.log("Thread: Gemini returned: {}".format(str(response)[:50]))
-            responded = True
-            # Update UI on the UI thread
-            from System import Action
-            self.window.Dispatcher.Invoke(Action(lambda: self.on_response_finished(response)))
-        except Exception as e:
-            if self.cancelled: return
-            err_msg = "Error: " + str(e)
-            try:
-                from revit_mcp.gemini_client import client
-                client.log("Thread Exception: " + err_msg)
-            except: pass
-            responded = True
-            from System import Action
-            self.window.Dispatcher.Invoke(Action(lambda: self.on_response_finished(err_msg)))
-        finally:
-            # Safety net: only fires if no response was dispatched above
-            if not responded and not self.cancelled:
+            # All imports are now pre-loaded at the top of script.py
+            client.log("Background Thread: Starting orchestration...")
+            
+            if not bridge._uiapp:
+                client.log("Background Thread Error: bridge._uiapp is None.")
+                err = "Error: Revit connection lost. Please click 'Start Server' again."
                 from System import Action
-                try: self.window.Dispatcher.Invoke(Action(lambda: self.on_response_finished("Error: Request timed out or failed unexpectedly.")))
-                except: pass
+                self.window.Dispatcher.BeginInvoke(Action(lambda: self.on_response_finished(err)))
+                return
+
+            response = orchestrator.run_full_stack(bridge._uiapp, prompt)
+            responded = True
+            
+            client.log("UI Thread: Response received.")
+            from System import Action
+            self.window.Dispatcher.BeginInvoke(Action(lambda: self.on_response_finished(response)))
+            
+        except Exception as e:
+            import traceback
+            err_msg = "UI Thread CRASH: {}\n{}".format(str(e), traceback.format_exc())
+            try: client.log(err_msg)
+            except: pass
+            print(err_msg)
+            from System import Action
+            self.window.Dispatcher.BeginInvoke(Action(lambda: self.on_response_finished("Error: check log for details.")))
+        finally:
+            if not responded and not self.cancelled:
+                # Fallback for unexpected thread termination
+                from System import Action
+                self.window.Dispatcher.BeginInvoke(Action(lambda: self.on_response_finished("Error: Request failed.")))
 
     def on_response_finished(self, response):
         """Handle finished response (success or error)."""
@@ -211,14 +253,34 @@ class AIChatWindow(object):
         if e.Key == System.Windows.Input.Key.Enter:
             self.on_send_click(sender, e)
 
+    def test_bridge(self):
+        """Diagnostic tool to verify Revit bridge health - run in thread to avoid UI hang."""
+        def run_test():
+            try:
+                client.log("Background Thread: Manual Bridge Ping started.")
+                def ping_action(): return "PONG"
+                # This now waits for the Timer to pick it up
+                res = bridge.mcp_event_handler.run_on_main_thread(ping_action)
+                
+                client.log("Background Thread: Bridge Ping SUCCESS: " + str(res))
+                self.window.Dispatcher.BeginInvoke(Action(lambda: self.add_message("Bridge Status: ACTIVE (PONG received)", is_user=False)))
+            except Exception as e:
+                import traceback
+                err = "Bridge Ping FAILED: {}\n{}".format(str(e), traceback.format_exc())
+                client.log(err)
+                self.window.Dispatcher.BeginInvoke(Action(lambda: self.add_message("Bridge Status: OFFLINE\n" + str(e), is_user=False)))
+        
+        t = threading.Thread(target=run_test)
+        t.daemon = True
+        t.start()
+
     # Proxy methods for the main loop
     def Show(self, uiapp): 
         # Set Revit as the owner of the window to allow keyboard input
+        self._uiapp = uiapp
         helper = WindowInteropHelper(self.window)
         helper.Owner = uiapp.MainWindowHandle
         
-        # FIX: Enable keyboard interop for modeless WPF window in Revit
-        # This allows the window to receive keyboard focus correctly.
         try:
             ElementHost.EnableModelessKeyboardInterop(self.window)
         except:
@@ -226,8 +288,22 @@ class AIChatWindow(object):
             
         self.window.Show()
         self.window.Activate()
+        
+        # START THE IDLING PUMP (Provides valid API context for Transactions)
+        try:
+            self._uiapp.Idling += bridge.idling_handler
+            client.log("UI: Idling Pump subscribed (v9-FINAL).")
+        except Exception as e:
+            client.log("UI: Idling subscription error: " + str(e))
 
-    def Close(self): self.window.Close()
+    def Close(self):
+        try:
+            if self._uiapp:
+                self._uiapp.Idling -= bridge.idling_handler
+                client.log("UI: Idling Pump unsubscribed.")
+        except:
+            pass
+        self.window.Close()
     @property
     def Visibility(self): return self.window.Visibility
 
@@ -268,17 +344,32 @@ def main():
     uiapp = HOST_APP.uiapp
 
     # Initialize and show the chat window
+    # Cleanup OLD windows if they exist
+    global _current_chat_window
+    if _current_chat_window:
+        try:
+            from revit_mcp.gemini_client import client
+            client.log("Closing existing Chat Window...")
+            _current_chat_window.Close()
+        except Exception as e:
+            import traceback
+            from pyrevit import forms
+            forms.alert("Error closing existing chat window: {}\n\n{}".format(str(e), traceback.format_exc()))
+            
     xaml_file = os.path.join(os.path.dirname(__file__), "chat_ui.xaml")
-    chat_window = AIChatWindow(xaml_file)
-    chat_window.Show(uiapp) 
+    _current_chat_window = AIChatWindow(xaml_file)
+    _current_chat_window.Show(uiapp) 
 
     # INITIALIZE BRIDGE (CRITICAL for non-blocking UI)
     from revit_mcp.bridge import init_bridge
     init_bridge(uiapp)
+    
+    from pyrevit import forms
+    forms.alert("🚀 Gemini MCP v8-STABLE Active!\n\n1. CLOSE any old Gemini Chat windows.\n2. Type 'ping' in the new window to test.", title="v8-STABLE Loaded")
 
+    output.print_md("🚀 **UI Active.** (Keep this window open to maintain AI connection)")
     output.print_md("---")
-    output.print_md("🚀 **UI Unblocked.** You can now select elements and edit normally.")
-    output.print_md("The AI Server is running in the background.")
+    output.print_md("> [!TIP]\n> You can now use the Chat Window while Revit is running. The server will process your requests in the background.")
 
 if __name__ == '__main__':
     main()
