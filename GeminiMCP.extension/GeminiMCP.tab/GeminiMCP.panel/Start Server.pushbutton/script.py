@@ -29,7 +29,7 @@ try:
     from revit_mcp.dispatcher import orchestrator
     import revit_mcp.bridge as bridge
     client.log("UI: Hard module reset completed. v8-STABLE starting.")
-    TaskDialog.Show("Gemini MCP", "v8-STABLE ENGINE LOADED\n\n1. CLOSE any old chat windows.\n2. Click 'Start Server' if needed.\n3. Type 'ping' in the FRESH window.")
+    # TaskDialog.Show removed to improve startup UX
 except Exception as e:
     import traceback
     print("Pre-load failed: " + str(e))
@@ -364,8 +364,7 @@ def main():
     from revit_mcp.bridge import init_bridge
     init_bridge(uiapp)
     
-    from pyrevit import forms
-    forms.alert("🚀 Gemini MCP v8-STABLE Active!\n\n1. CLOSE any old Gemini Chat windows.\n2. Type 'ping' in the new window to test.", title="v8-STABLE Loaded")
+    # Alert removed to improve startup UX
 
     output.print_md("🚀 **UI Active.** (Keep this window open to maintain AI connection)")
     output.print_md("---")

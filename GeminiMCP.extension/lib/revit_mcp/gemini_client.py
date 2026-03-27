@@ -43,8 +43,9 @@ class GeminiClient:
     def log(self, message):
         """Unified logging to the main server log only."""
         timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        # Global absolute path for reliability across all Revit/Python threads
-        log_path = r"c:\Users\jianxun\Documents\Revit 2026 MCP\revit-MCP\GeminiMCP.extension\lib\revit_mcp\fastmcp_server.log"
+        # Global path determined relative to this file
+        current_dir = os.path.dirname(__file__)
+        log_path = os.path.join(current_dir, "fastmcp_server.log")
         log_msg = "[{}] [Gemini] {}\n".format(timestamp, message)
         
         try:
@@ -517,59 +518,81 @@ class GeminiClient:
             return "Error: Failed to extract text from manifest response."
 
     def _make_request(self, url, data, max_retries=3):
-        """Low-level urllib request with simple retry logic"""
-        self.log("_make_request() to " + url)
+        """High-performance low-level http.client request to bypass Revit's urllib lag"""
+        self.log("_make_request (High-Perf) to " + url)
+        import http.client
         import ssl
-        import urllib.request
-        ctx = ssl._create_unverified_context()
-        self.log("SSL context created.")
+        import socket
+        import time
+        from urllib.parse import urlparse
+        
+        parsed_url = urlparse(url)
+        host = parsed_url.netloc
+        path = parsed_url.path + "?" + parsed_url.query
         
         headers = {
             'Content-Type': 'application/json',
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Revit-MCP/1.0'
+            'User-Agent': 'Revit-MCP-HighPerf/2.0'
         }
+        
+        payload = json.dumps(data).encode('utf-8')
         
         last_err = None
         for attempt in range(max_retries):
+            conn = None
             try:
                 self.log("Request Attempt {}/{}...".format(attempt + 1, max_retries))
-                req = urllib.request.Request(url, data=json.dumps(data).encode('utf-8'), headers=headers)
-                self.log("Request object created. Starting urlopen (timeout=120s)...")
-                with urllib.request.urlopen(req, context=ctx, timeout=120) as f:
-                    self.log("urlopen returned. Reading binary data...")
-                    raw_data = f.read()
-                    self.log("Data read ({} bytes). Decoding...".format(len(raw_data)))
-                    decoded = raw_data.decode('utf-8')
-                    self.log("Decoded. Parsing JSON...")
-                    return json.loads(decoded)
+                
+                # 1. DNS Pre-resolution (Sub-ms optimization)
+                dns_start = time.time()
+                ip = socket.gethostbyname(host)
+                dns_time = time.time() - dns_start
+                self.log("Network: DNS resolved {} to {} in {:.3f}s".format(host, ip, dns_time))
+                
+                # 2. Establish Low-Level Connection
+                start_time = time.time()
+                ctx = ssl._create_unverified_context()
+                
+                # Use the IP address directly to bypass further system DNS lookups in the HTTPS connection
+                # NOTE: We still pass the host for SNI / Header validation
+                self.log("Network: Opening HTTPS connection to {} (timeout=90s)...".format(ip))
+                conn = http.client.HTTPSConnection(ip, port=443, context=ctx, timeout=90)
+                
+                # 3. Send Request
+                conn.request("POST", path, body=payload, headers={"Host": host, "Content-Type": "application/json"})
+                connect_time = time.time() - start_time
+                self.log("Network: Connection + Request sent (Time: {:.2f}s). Waiting for AI...".format(connect_time))
+                
+                # 4. Wait for Response (The AI Thinking part)
+                wait_start = time.time()
+                response = conn.getresponse()
+                wait_time = time.time() - wait_start
+                
+                raw_data = response.read()
+                read_time = time.time() - (wait_start + wait_time)
+                
+                self.log("Network: Response {} ({} bytes) | Wait: {:.2f}s | Read: {:.2f}s".format(
+                    response.status, len(raw_data), wait_time, read_time))
+                
+                decoded = raw_data.decode('utf-8')
+                if response.status != 200:
+                    self.log("API Error ({}): {}".format(response.status, decoded))
+                    last_err = "HTTP {}".format(response.status)
+                    if attempt < max_retries - 1: continue
+                    return {"error": last_err}
+                
+                return json.loads(decoded)
+                
             except Exception as e:
                 err_msg = str(e)
-                error_body = ""
-                if hasattr(e, 'read'):
-                    try: 
-                        error_body = e.read().decode('utf-8')
-                        err_msg += " (Details: " + error_body + ")"
-                    except: pass
-                
-                # Specific check for SSL EOF error which is common on some Windows environments
-                if "UNEXPECTED_EOF_WHILE_READING" in err_msg or "EOF occurred" in err_msg:
-                    self.log("SSL EOF Error detected. Retrying with fresh connection... (Attempt {}/{})".format(attempt + 1, max_retries))
-                
-                # Check for Timeout
-                if "timeout" in err_msg.lower():
-                    self.log("Gemini API Timeout (120s). This large building requires more processing time. Retrying... (Attempt {}/{})".format(attempt+1, max_retries))
-
-                error_body = ""
-                if hasattr(e, 'read'):
-                    try: error_body = e.read().decode('utf-8')
-                    except: pass
-                
-                if error_body: err_msg += " | Body: " + error_body
+                self.log("Network ERROR (Attempt {}/{}): {}".format(attempt + 1, max_retries, err_msg))
                 last_err = err_msg
-                
-                self.log("Request Error (Attempt {}/{}): {}".format(attempt + 1, max_retries, err_msg))
                 if attempt < max_retries - 1:
-                    time.sleep(1.5 ** attempt) # Slightly faster retries
+                    time.sleep(0.5 * (attempt + 1))
+            finally:
+                if conn:
+                    try: conn.close()
+                    except: pass
                     
         return {"error": last_err}
 

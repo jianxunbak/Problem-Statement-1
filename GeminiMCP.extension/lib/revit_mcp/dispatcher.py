@@ -48,38 +48,57 @@ class Orchestrator:
                 for i in range(count - 1):
                     diff_ft = levels[i+1].Elevation - levels[i].Elevation
                     h_mm = UnitUtils.ConvertFromInternalUnits(diff_ft, UnitTypeId.Millimeters)
-                    height_str += f"Floor {i+1}: {h_mm:.1f}mm. "
+                    height_str += f"L{i+1}:{h_mm:.0f} "
                     
                     # Also detect footprint overrides from walls
-                    w_tag = f"AI_Wall_L{i+1}_S"
-                    l_tag = f"AI_Wall_L{i+1}_W"
+                    w_tag, l_tag = f"AI_Wall_L{i+1}_S", f"AI_Wall_L{i+1}_W"
                     if w_tag in registry and l_tag in registry:
-                        w_wall = doc.GetElement(registry[w_tag])
-                        l_wall = doc.GetElement(registry[l_tag])
+                        w_wall, l_wall = doc.GetElement(registry[w_tag]), doc.GetElement(registry[l_tag])
                         if w_wall and l_wall and hasattr(w_wall.Location, "Curve") and hasattr(l_wall.Location, "Curve"):
                             w_mm = UnitUtils.ConvertFromInternalUnits(w_wall.Location.Curve.Length, UnitTypeId.Millimeters)
                             l_mm = UnitUtils.ConvertFromInternalUnits(l_wall.Location.Curve.Length, UnitTypeId.Millimeters)
-                            overrides_str += f"Floor {i+1} footprint: {w_mm:.0f}x{l_mm:.0f}mm. "
+                            overrides_str += f"L{i+1}:{w_mm:.0f}x{l_mm:.0f} "
             
             return count, height_str, overrides_str
 
-        try:
-            cur_levels, cur_heights, cur_overrides = mcp_event_handler.run_on_main_thread(gather_state)
-            self.log("BIM state gathered: {} levels found.".format(cur_levels))
-            storeys = max(1, cur_levels - 1)
-            state_text = f"CURRENT BIM STATE: {storeys} storeys. "
-            if cur_heights: state_text += f"\nEXISTING HEIGHTS: {cur_heights}"
-            if cur_overrides: state_text += f"\nEXISTING OVERRIDES: {cur_overrides}"
-            state_text += f"\nCRITICAL: If user edits the building, you MUST preserve these individual floor heights and overrides in your JSON output unless the user specifically asks to change them! Keep them as 'height_overrides' and 'floor_overrides'."
-        except Exception as e:
-            self.log(f"Error gathering state: {e}")
-            state_text = ""
+        # OPTIMIZATION: Advanced Cache with 30s TTL
+        import time
+        now = time.time()
+        refresh_needed = True
+        
+        if hasattr(self, "_cached_state") and hasattr(self, "_cache_time"):
+            age = now - self._cache_time
+            # If the state is fresh (<30s), we can reuse it even for minor edits 
+            # to speed up the interaction, unless it's a major "create" or "delete".
+            force_refresh = any(x in user_prompt.lower() for x in ["create", "delete", "clear", "wipe"])
+            if age < 30.0 and not force_refresh:
+                refresh_needed = False
+        
+        if not refresh_needed:
+            self.log("Dispatcher: Using cached BIM state (Age: {:.1f}s)".format(now - self._cache_time))
+            state_text = self._cached_state
+        else:
+            try:
+                self.log("Dispatcher: Gathering fresh BIM state from Revit...")
+                cur_levels, cur_heights, cur_overrides = mcp_event_handler.run_on_main_thread(gather_state)
+                self.log("BIM state gathered: {} levels found.".format(cur_levels))
+                storeys = max(1, cur_levels - 1)
+                state_text = f"CURRENT BIM STATE: {storeys} storeys. "
+                if cur_heights: state_text += f"\nEXISTING HEIGHTS: {cur_heights}"
+                if cur_overrides: state_text += f"\nEXISTING OVERRIDES: {cur_overrides}"
+                state_text += f"\nCRITICAL: Preserve existing heights/overrides unless asked to change."
+                self._cached_state = state_text
+                self._cache_time = now
+            except Exception as e:
+                self.log(f"Error gathering state: {e}")
+                state_text = ""
 
         # 1. Generate Master Manifest (Fast-Track)
-        # self.log(f"Injected State Text -> {state_text}")
-        self.log("Step 2: Requesting building plan from Gemini AI...")
+        self.log("Step 2: Requesting building plan from Gemini AI (model: {})".format(client.model))
+        ai_start = time.time()
         manifest_json = client.generate_content(DISPATCHER_PROMPT + "\n" + state_text + "\nUser Request: " + user_prompt)
-        self.log("Step 3: Manifest received from AI. Parsing...")
+        ai_duration = time.time() - ai_start
+        self.log("Step 3: Manifest received from AI. (Time: {:.2f}s). Parsing...".format(ai_duration))
         self.log(f"Gemini Payload -> {manifest_json}")
         
         try:

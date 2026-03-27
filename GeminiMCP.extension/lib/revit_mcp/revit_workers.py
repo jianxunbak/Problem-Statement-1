@@ -84,41 +84,76 @@ class RevitWorkers:
         tg = DB.TransactionGroup(doc, "AI Build: Fast Manifest")
         tg.Start()
 
-        self.log("Step 2: Processing levels from manifest...")
-        t = DB.Transaction(doc, "AI Build: Levels")
+        # SINGLE BATCH TRANSACTION FOR ALL GEOMETRY
+        t = DB.Transaction(doc, "AI Build: Execute Manifest")
         t.Start()
+
+        self.log("Step 2: Processing levels from manifest...")
         setup = manifest.get("project_setup", {})
         levels_val = setup.get("levels", setup.get("storeys", setup.get("floors", default_levels)))
         height_val = setup.get("level_height", setup.get("floor_height", default_height))
         self.log("Config: {} storeys, {} default height.".format(levels_val, height_val))
         
-        # Parse custom height overrides (e.g., {"1": 5000, "2": 4500})
+        # Parse custom height overrides
         height_overrides = setup.get("height_overrides", {})
         
-        # Handle cases where Gemini returns a list or a single integer
         import random
         if isinstance(levels_val, list):
-            count = len(levels_val)
             elevations = [mm_to_ft(e) for e in levels_val]
         else:
             count = int(safe_num(levels_val, 1))
             elevations = [0.0]
             current_elev = 0.0
-            # N storeys means N floor heights, resulting in N+1 levels
             for i in range(1, count + 1):
                 h_over = height_overrides.get(str(i))
-                # Robust Randomization for Heights
-                if h_over == "random" or height_val == "random":
-                    h_mm = random.uniform(3200, 4200)
-                else:
-                    h_mm = safe_num(h_over) if h_over is not None else safe_num(height_val, 3500)
-                
+                h_mm = random.uniform(3200, 4200) if (h_over == "random" or height_val == "random") else safe_num(h_over if h_over is not None else height_val, 3500)
                 current_elev += mm_to_ft(h_mm)
                 elevations.append(current_elev)
-            # count is now the number of storeys, number of levels is count + 1
             levels_total = len(elevations)
         
-        # 1-A. Extract Column Spacing and Footprint Extents
+        # Pre-scan existing floor plan levels to avoid O(N^2) view check
+        existing_view_levels = {v.GenLevel.Id for v in DB.FilteredElementCollector(doc).OfClass(DB.ViewPlan) if v.ViewType == DB.ViewType.FloorPlan and v.GenLevel}
+        
+        current_levels = []
+        for i in range(levels_total):
+            tag = "AI_Level_" + str(i+1)
+            lvl_name = "AI Level " + str(i+1)
+            lvl_name_alt = "Level " + str(i+1)
+            elev = elevations[i]
+            
+            lvl = doc.GetElement(registry[tag]) if tag in registry else None
+            
+            if not lvl:
+                for l in DB.FilteredElementCollector(doc).OfClass(DB.Level):
+                    if l.Name == lvl_name or l.Name == lvl_name_alt:
+                        lvl = l; break
+            
+            if lvl and isinstance(lvl, DB.Level):
+                if abs(lvl.Elevation - elev) > 0.001: lvl.Elevation = elev
+                safe_set_comment(lvl, tag)
+                try: 
+                    if lvl.Name != lvl_name: lvl.Name = lvl_name
+                except: pass
+                reused_count += 1
+            else:
+                lvl = DB.Level.Create(doc, elev)
+                try: lvl.Name = lvl_name
+                except: pass 
+                safe_set_comment(lvl, tag)
+                created_count += 1
+                
+            current_levels.append(lvl)
+            results["levels"].append(str(lvl.Id.Value))
+            
+            # Ensure Floor Plan view exists
+            if lvl.Id not in existing_view_levels:
+                vt = next((vft for vft in DB.FilteredElementCollector(doc).OfClass(DB.ViewFamilyType) if vft.ViewFamily == DB.ViewFamily.FloorPlan), None)
+                if vt:
+                    DB.ViewPlan.Create(doc, vt.Id, lvl.Id)
+                    existing_view_levels.add(lvl.Id)
+
+        # 2. Grid System (Aligned to Shell)
+        # GRID SPACING & FOOTPRINT DATA
         shell = manifest.get("shell", {})
         column_spacing_mm = shell.get("column_spacing", shell.get("column_span", 6000))
         spacing = mm_to_ft(column_spacing_mm)
@@ -137,75 +172,6 @@ class RevitWorkers:
                     from Autodesk.Revit.DB import UnitUtils, UnitTypeId # type: ignore
                     l_default = UnitUtils.ConvertFromInternalUnits(e_wall.Location.Curve.Length, UnitTypeId.Millimeters)
         except: pass
-        
-        current_levels = []
-        for i in range(levels_total):
-            tag = "AI_Level_" + str(i+1)
-            lvl_name = "AI Level " + str(i+1)
-            lvl_name_alt = "Level " + str(i+1)
-            elev = elevations[i]
-            
-            # 1. Try Registry Tag (State-Aware)
-            lvl = None
-            if tag in registry:
-                lvl = doc.GetElement(registry[tag])
-            
-            # 2. Try Fallback Name (BIM Integrity)
-            if not lvl:
-                for l in DB.FilteredElementCollector(doc).OfClass(DB.Level):
-                    if l.Name == lvl_name or l.Name == lvl_name_alt:
-                        lvl = l; break
-            
-            # 3. Update or Create
-            if lvl and isinstance(lvl, DB.Level):
-                lvl.Elevation = elev
-                safe_set_comment(lvl, tag)
-                # Keep the name consistent
-                try: lvl.Name = lvl_name
-                except: pass
-                reused_count += 1
-            else:
-                lvl = DB.Level.Create(doc, elev)
-                try: lvl.Name = lvl_name
-                except: pass 
-                safe_set_comment(lvl, tag)
-                created_count += 1
-                
-            current_levels.append(lvl)
-            results["levels"].append(str(lvl.Id.Value))
-            
-            # 4. Ensure Floor Plan view exists for every level
-            try:
-                view_exists = False
-                all_views = DB.FilteredElementCollector(doc).OfClass(DB.ViewPlan).ToElements()
-                for v in all_views:
-                    if v.GenLevel and v.GenLevel.Id == lvl.Id and v.ViewType == DB.ViewType.FloorPlan:
-                        view_exists = True
-                        break
-                
-                if not view_exists:
-                    # Find a FloorPlan ViewFamilyType
-                    vt = None
-                    for vft in DB.FilteredElementCollector(doc).OfClass(DB.ViewFamilyType):
-                        if vft.ViewFamily == DB.ViewFamily.FloorPlan:
-                            vt = vft
-                            break
-                    if vt:
-                        DB.ViewPlan.Create(doc, vt.Id, lvl.Id)
-            except: pass
-            
-        # 1-A. Finalize levels so they are hostable
-        doc.Regenerate()
-        t.Commit()
-
-        # 2. Grid System (Aligned to Shell)
-        t = DB.Transaction(doc, "AI Build: Shell")
-        t.Start()
-        w = mm_to_ft(shell.get("width", w_default))
-        l = mm_to_ft(shell.get("length", l_default))
-        
-        # Grids moved to Phase 5.5 to allow alignment with dynamic columns
-        pass
 
         # 1-B. Pre-compute dimensions for all floors
         floor_overrides = shell.get("floor_overrides", {})
@@ -430,12 +396,7 @@ class RevitWorkers:
                 results["elements"].append(str(floor.Id.Value))
                 created_count += 1
 
-        # doc.Regenerate() # Final sync
-        t.Commit()
-        
-        # 5. State-Aware Columns (Structural with Architectural Fallback)
-        t = DB.Transaction(doc, "AI Build: Structural")
-        t.Start()
+        # 5. State-Aware Columns
         symbol = DB.FilteredElementCollector(doc).OfCategory(DB.BuiltInCategory.OST_StructuralColumns).OfClass(DB.FamilySymbol).FirstElement()
         stype = DB.Structure.StructuralType.Column
         
@@ -635,7 +596,7 @@ class RevitWorkers:
         except Exception as e:
             self.log("RevitWorkers: Sectioning failed: {}".format(str(e)))
         
-        # doc.Regenerate() # Final sync
+        # COMMIT THE SINGLE GEOMETRY TRANSACTION
         t.Commit()
         tg.Assimilate()
         
@@ -769,44 +730,69 @@ class RevitWorkers:
         return {"roof_id": str(roof.Id.Value)}
 
     def perform_global_cleanup(self):
-        """Worker for BIM Health: Join Walls/Floors and Wall/Wall corners"""
+        """Worker for BIM Health: Targeted Join for AI elements only"""
         import Autodesk.Revit.DB as DB # type: ignore
         doc = self.doc
-        t = DB.Transaction(doc, "BIM: Global Cleanup")
+        t = DB.Transaction(doc, "BIM: Targeted Global Cleanup")
         t.Start()
         try:
-            elements = DB.FilteredElementCollector(doc).WhereElementIsNotElementType().ToElements()
-            walls = [e for e in elements if isinstance(e, DB.Wall)]
-            floors = [e for e in elements if isinstance(e, DB.Floor)]
+            # OPTIMIZATION: Instead of scanning the entire document, only scan AI elements
+            # This is significantly faster in large projects.
+            from .building_generator import get_model_registry
+            registry = get_model_registry(doc)
+            ai_ids = [eid for eid in registry.values()]
             
-            # 1. Targeted Join: Walls with Floors on same levels
-            from collections import defaultdict
-            walls_by_level = defaultdict(list)
-            for w in walls: walls_by_level[w.LevelId].append(w)
+            if not ai_ids: 
+                t.RollBack()
+                return {"status": "No AI elements to cleanup"}
+                
+            from System.Collections.Generic import List
+            ids_list = List[DB.ElementId]()
+            for eid in ai_ids: ids_list.Add(eid)
             
+            ai_elements = DB.FilteredElementCollector(doc, ids_list).WhereElementIsNotElementType().ToElements()
+            walls = [e for e in ai_elements if isinstance(e, DB.Wall)]
+            floors = [e for e in ai_elements if isinstance(e, DB.Floor)]
+            
+            # 1. Targeted Join: Walls with Floors
             for f in floors:
                 level_id = f.LevelId
-                # Join with walls starting on this level
-                potential_walls = walls_by_level[level_id]
-                for w in potential_walls:
+                # Use a BoundingBox filter instead of a full loop for intersections
+                bb = f.get_BoundingBox(None)
+                if not bb: continue
+                outline = DB.Outline(bb.Min - DB.XYZ(0.01, 0.01, 1.0), bb.Max + DB.XYZ(0.01, 0.01, 1.0))
+                filter = DB.BoundingBoxIntersectsFilter(outline)
+                
+                intersecting_walls = DB.FilteredElementCollector(doc, ids_list).OfClass(DB.Wall).WherePasses(filter).ToElements()
+                for w in intersecting_walls:
                     try:
                         if not DB.JoinGeometryUtils.AreElementsJoined(doc, w, f):
                             DB.JoinGeometryUtils.JoinGeometry(doc, w, f)
                     except: pass
             
-            # 2. Targeted Wall-Wall Joins: Proximity check on same level
-            for lvl_id, lvl_walls in walls_by_level.items():
-                for i in range(len(lvl_walls)):
-                    for j in range(i + 1, len(lvl_walls)):
+            # 2. Optimized Wall-Wall Joins
+            for i, w1 in enumerate(walls):
+                bb = w1.get_BoundingBox(None)
+                if not bb: continue
+                outline = DB.Outline(bb.Min - DB.XYZ(0.1, 0.1, 0.1), bb.Max + DB.XYZ(0.1, 0.1, 0.1))
+                filter = DB.BoundingBoxIntersectsFilter(outline)
+                
+                # Check intersections with other AI walls
+                remaining_ids = List[DB.ElementId]()
+                for w in walls[i+1:]: remaining_ids.Add(w.Id)
+                
+                if remaining_ids.Count > 0:
+                    intersecting = DB.FilteredElementCollector(doc, remaining_ids).WherePasses(filter).ToElements()
+                    for w2 in intersecting:
                         try:
-                            if not DB.JoinGeometryUtils.AreElementsJoined(doc, lvl_walls[i], lvl_walls[j]):
-                                DB.JoinGeometryUtils.JoinGeometry(doc, lvl_walls[i], lvl_walls[j])
+                            if not DB.JoinGeometryUtils.AreElementsJoined(doc, w1, w2):
+                                DB.JoinGeometryUtils.JoinGeometry(doc, w1, w2)
                         except: pass
             t.Commit()
         except Exception as e:
             t.RollBack()
             raise e
-        return {"status": "Global Cleanup completed successfully"}
+        return {"status": "Targeted Cleanup completed successfully"}
 
     def generate_submission_set(self):
         """Worker for Documentation"""
@@ -880,8 +866,8 @@ class RevitWorkers:
         except: pass
         if dim_count > 0: self.log("RevitWorkers: Cleaned up {} old AI dimensions.".format(dim_count))
 
+        # 2. Collect Grids once
         grids = list(DB.FilteredElementCollector(doc, view.Id).OfClass(DB.Grid))
-        self.log("RevitWorkers: Found {} grids in view for dimensioning.".format(len(grids)))
         if len(grids) < 2: return
         
         x_grids = []

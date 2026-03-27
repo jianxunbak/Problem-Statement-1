@@ -4,6 +4,7 @@ import datetime
 import os
 
 # --- Bridge State ---
+LOG_PATH = os.path.join(os.path.dirname(__file__), "fastmcp_server.log")
 _work_queue = queue.Queue()
 _uiapp = None
 
@@ -18,7 +19,13 @@ def pump_commands(uiapp):
     while not _work_queue.empty():
         try:
             # Non-blocking get
-            func, args, kwargs, event, result_wrapper = _work_queue.get_nowait()
+            func, args, kwargs, event, result_wrapper, queued_at = _work_queue.get_nowait()
+            
+            latency = (datetime.datetime.now() - queued_at).total_seconds()
+            if latency > 1.0:
+                with open(LOG_PATH, "a") as f:
+                    f.write("[{}] Bridge: HIGH LATENCY ({:.2f}s) for {}\n".format(
+                        datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"), latency, str(func)))
             
             try:
                 # Execute the Revit-dependent function on the main thread
@@ -28,8 +35,7 @@ def pump_commands(uiapp):
                 import traceback
                 # We can't use 'from .runner import log' easily here due to potential circularity
                 # direct write to log file
-                log_path = r"c:\Users\jianxun\Documents\Revit 2026 MCP\revit-MCP\GeminiMCP.extension\lib\revit_mcp\fastmcp_server.log"
-                with open(log_path, "a") as f:
+                with open(LOG_PATH, "a") as f:
                     f.write("[{}] Bridge EXECUTION ERROR: {}\n{}\n".format(
                         datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                         str(e), traceback.format_exc()))
@@ -49,14 +55,14 @@ def run_on_main_thread(func, *args, **kwargs):
     """
     event = threading.Event()
     result_wrapper = {'data': None, 'error': None}
+    queued_at = datetime.datetime.now()
     
-    _work_queue.put((func, args, kwargs, event, result_wrapper))
+    _work_queue.put((func, args, kwargs, event, result_wrapper, queued_at))
     
     # Wait for completion (default 300s to avoid infinite hang)
     if not event.wait(300):
         # Log timeout
-        log_path = r"c:\Users\jianxun\Documents\Revit 2026 MCP\revit-MCP\GeminiMCP.extension\lib\revit_mcp\fastmcp_server.log"
-        with open(log_path, "a") as f:
+        with open(LOG_PATH, "a") as f:
             f.write("[{}] Bridge: TIMEOUT waiting for main thread execution of {}\n".format(
                 datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"), str(func)))
         raise TimeoutError("Revit main thread did not respond within 300s.")
@@ -70,8 +76,7 @@ def init_bridge(uiapp):
     """Bridge initialization. Now simpler since it's timer-based."""
     global _uiapp
     _uiapp = uiapp
-    log_path = r"c:\Users\jianxun\Documents\Revit 2026 MCP\revit-MCP\GeminiMCP.extension\lib\revit_mcp\fastmcp_server.log"
-    with open(log_path, "a") as f:
+    with open(LOG_PATH, "a") as f:
         f.write("[{}] Bridge: Timer-based bridge initialized (v8-STABLE).\n".format(
             datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
     return True

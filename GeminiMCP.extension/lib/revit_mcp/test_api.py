@@ -42,10 +42,23 @@ def test_gemini_call(api_key, model, prompt, history=None):
         if hasattr(e, 'read'):
             print("Error details:", e.read().decode('utf-8'))
 
-if __name__ == "__main__":
-    # Get key from .env
-    api_key = "AIzaSyB0-OoEZavP2hnc0OB-lPdSzszq3D-wVXE" # From .env
-    model = "gemini-2.0-flash" # FIXED
+def main():
+    # Load key from .env
+    env_path = os.path.join(os.path.dirname(__file__), "..", "..", ".env")
+    api_key = None
+    model = "gemini-2.0-flash" 
+
+    if os.path.exists(env_path):
+        with open(env_path, "r") as f:
+            for line in f:
+                if "=" in line:
+                    k, v = line.strip().split("=", 1)
+                    if k.strip() == "GEMINI_API_KEY": api_key = v.strip()
+                    if k.strip() == "GEMINI_MODEL": model = v.strip()
+    
+    if not api_key:
+        print("ERROR: GEMINI_API_KEY not found in .env at {}".format(os.path.abspath(env_path)))
+        return
     
     print("Test 1: Single message")
     test_gemini_call(api_key, model, "Hello?")
@@ -53,3 +66,6 @@ if __name__ == "__main__":
     print("\nTest 2: Two consecutive user messages (Expected to fail)")
     history = [{"text": "First user message", "is_user": True}]
     test_gemini_call(api_key, model, "Second user message", history)
+
+if __name__ == "__main__":
+    main()

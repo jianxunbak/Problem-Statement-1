@@ -25,39 +25,46 @@ def mm_to_ft(mm):
 
 def get_model_registry(doc, zone_bbox=None):
     """
-    SPATIAL-AWARE SCAN: Search for AI-tagged elements.
-    If zone_bbox is provided, uses BoundingBoxIntersectsFilter for 90% faster lookups.
+    ULTRA-HIGH-SPEED SCAN: Search for AI-managed elements using Extensible Storage filters.
     """
     import Autodesk.Revit.DB as DB # type: ignore
+    from .state_manager import state_manager
     registry = {}
     
-    collector = DB.FilteredElementCollector(doc).WhereElementIsNotElementType()
-    
-    # Optimization: Filter by zone if provided
-    if zone_bbox:
-        outline = DB.Outline(zone_bbox.Min, zone_bbox.Max)
-        # Add a 1000mm buffer to the search outline
-        buffer = mm_to_ft(1000)
-        outline = DB.Outline(
-            DB.XYZ(zone_bbox.Min.X - buffer, zone_bbox.Min.Y - buffer, zone_bbox.Min.Z - buffer),
-            DB.XYZ(zone_bbox.Max.X + buffer, zone_bbox.Max.Y + buffer, zone_bbox.Max.Z + buffer)
-        )
-        collector.WherePasses(DB.BoundingBoxIntersectsFilter(outline))
-    
-    for element in collector:
-        metadata = state_manager.get_ai_metadata(element)
-        if metadata:
-            registry[metadata['ai_id']] = element.Id
-            
-        # Fallback for migration: Check Comments
-        else:
-            p = element.get_Parameter(DB.BuiltInParameter.ALL_MODEL_INSTANCE_COMMENTS)
-            if not p: p = element.LookupParameter("Comments")
-            if p and p.HasValue and p.AsString().startswith("AI_"):
-                tag = p.AsString()
-                registry[tag] = element.Id
-                # Migrate to Extensible Storage on the fly if we were in a transaction
-                # (handled later during actual updates)
+    # 1. Primary Scan: Extensible Storage Filter (Very fast)
+    try:
+        schema = state_manager.get_schema()
+        es_filter = DB.ExtensibleStorage.ExtensibleStorageFilter(schema.GUID)
+        collector = DB.FilteredElementCollector(doc).WherePasses(es_filter)
+        
+        if zone_bbox:
+            buffer = mm_to_ft(1000)
+            outline = DB.Outline(
+                DB.XYZ(zone_bbox.Min.X - buffer, zone_bbox.Min.Y - buffer, zone_bbox.Min.Z - buffer),
+                DB.XYZ(zone_bbox.Max.X + buffer, zone_bbox.Max.Y + buffer, zone_bbox.Max.Z + buffer)
+            )
+            collector.WherePasses(DB.BoundingBoxIntersectsFilter(outline))
+
+        for el in collector:
+            metadata = state_manager.get_ai_metadata(el)
+            if metadata:
+                registry[metadata['ai_id']] = el.Id
+    except Exception:
+        pass
+
+    # 2. Fallback Scan: Legacy Comment Tags
+    # To keep it fast, we only scan specific architectural categories.
+    if len(registry) < 5:
+        categories = [DB.BuiltInCategory.OST_Walls, DB.BuiltInCategory.OST_Floors, DB.BuiltInCategory.OST_Levels, DB.BuiltInCategory.OST_Grids, DB.BuiltInCategory.OST_Columns, DB.BuiltInCategory.OST_StructuralColumns]
+        for cat in categories:
+            col = DB.FilteredElementCollector(doc).OfCategory(cat).WhereElementIsNotElementType()
+            for el in col:
+                p = el.get_Parameter(DB.BuiltInParameter.ALL_MODEL_INSTANCE_COMMENTS)
+                if not p: p = el.LookupParameter("Comments")
+                if p and p.HasValue:
+                    val = p.AsString()
+                    if val.startswith("AI_") and val not in registry:
+                        registry[val] = el.Id
     
     return registry
 
