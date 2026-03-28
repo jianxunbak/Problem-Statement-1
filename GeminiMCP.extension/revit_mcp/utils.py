@@ -2,6 +2,17 @@
 import os
 import math
 import re
+import json
+
+def load_presets():
+    try:
+        preset_path = os.path.join(os.path.dirname(__file__), "building_presets.json")
+        if os.path.exists(preset_path):
+            with open(preset_path, "r") as f:
+                return json.load(f)
+    except Exception:
+        pass
+    return {}
 
 _cached_log_path = None
 

@@ -231,3 +231,7 @@ def check_bridge_health() -> str:
 @mcp.tool()
 def heartbeat() -> str:
     return json.dumps({"status": "ALIVE", "time": time.time()})
+
+@mcp.tool()
+def get_building_presets() -> str:
+    return json.dumps(logic.get_building_presets_ui())

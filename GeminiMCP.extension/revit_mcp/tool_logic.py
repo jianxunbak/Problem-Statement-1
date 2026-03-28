@@ -2,6 +2,7 @@
 import json
 import time
 import math
+import os
 from revit_mcp.state_manager import state_manager
 from revit_mcp.utils import (
     mm_to_ft, ft_to_mm, get_bip, 
@@ -410,3 +411,12 @@ def set_parameter_ui(params):
         elif param.StorageType == DB.StorageType.String: param.Set(str(val))
     t.Commit()
     return {"success": True}
+
+def get_building_presets_ui():
+    try:
+        current_dir = os.path.dirname(__file__)
+        file_path = os.path.join(current_dir, "building_presets.json")
+        with open(file_path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception as e:
+        return {"error": str(e)}

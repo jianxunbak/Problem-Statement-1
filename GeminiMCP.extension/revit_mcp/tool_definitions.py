@@ -401,6 +401,10 @@ TOOL_DECLARATIONS = [
                     "required": ["manifest_json"]
                 }
             },
+            {
+                "name": "get_building_presets",
+                "description": "Query the architectural figures and defaults (floor heights, efficiency, core logic) from building_presets.json."
+            },
         ]
     }
 ]

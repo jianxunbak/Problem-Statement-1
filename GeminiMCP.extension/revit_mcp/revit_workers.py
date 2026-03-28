@@ -6,8 +6,9 @@ from revit_mcp.bridge import mcp_event_handler
 from revit_mcp.utils import (
     safe_num, mm_to_ft, sqmm_to_sqft, 
     safe_set_comment, get_location_line_param,
-    get_random_dim
+    get_random_dim, load_presets, ft_to_mm
 )
+from . import lift_logic
 import math
 
 class RevitWorkers:
@@ -36,6 +37,9 @@ class RevitWorkers:
         
         t = DB.Transaction(doc, "AI Build: Execute Manifest")
         t.Start()
+        
+        # Track elements that actually changed for efficient re-join
+        affected_elements = []
 
         try:
             # 3. Processing Pipeline
@@ -44,30 +48,38 @@ class RevitWorkers:
             
             floor_dims, shell = self._process_shell_dimensions(manifest, current_levels, registry)
             
-            updated_walls = self._process_walls(current_levels, elevations, floor_dims, registry, results, created, reused)
+            # --- EXPAND LIFTS FIRST (to anchor grid) ---
+            self.log("Step 3a: Expanding Vertical Circulation (Lifts)...")
+            core_bounds = self._expand_lifts_in_manifest(manifest, current_levels, elevations, floor_dims, affected_elements)
             
-            expanded_slab_dims = self._process_floors(current_levels, floor_dims, shell, registry, results, created, reused)
+            updated_walls = self._process_walls(current_levels, elevations, floor_dims, registry, results, created, reused, affected_elements)
             
-            self._process_parapets(current_levels, expanded_slab_dims, floor_dims, shell, registry, results, created, reused)
+            expanded_slab_dims = self._process_floors(current_levels, floor_dims, shell, registry, results, created, reused, affected_elements)
+            
+            self._process_parapets(current_levels, expanded_slab_dims, floor_dims, shell, registry, results, created, reused, affected_elements)
             
             max_w = max(d[0] for d in floor_dims)
             max_l = max(d[1] for d in floor_dims)
             
-            self._process_columns_and_grids(current_levels, elevations, floor_dims, expanded_slab_dims, shell, registry, results, created, reused)
+            self.log("Step 3b: Processing Structure with Core Alignment...")
+            self._process_columns_and_grids(current_levels, elevations, floor_dims, expanded_slab_dims, shell, registry, results, created, reused, affected_elements, core_bounds)
             
             # --- GRANULAR OVERRIDES ---
-            self.log("Step 5b: Processing Granular Element Overrides...")
-            self._process_granular_walls(manifest, current_levels, registry, results, created, reused)
-            self._process_granular_floors(manifest, current_levels, registry, results, created, reused)
+            self.log("Step 4: Processing Granular Element Overrides...")
+            self._process_granular_walls(manifest, current_levels, registry, results, created, reused, affected_elements)
+            self._process_granular_floors(manifest, current_levels, registry, results, created, reused, affected_elements)
             self._process_granular_columns(manifest, current_levels, registry, results, created, reused)
             
             # 4. Cleanup & Documentation
             self._cleanup_registry(registry, results, deleted)
             self._generate_documentation(current_levels, elevations, floor_dims, max_w, max_l)
             
-            # 5. Finalize
-            for w in updated_walls:
-                if hasattr(w, "SetAllowAutoJoin"): w.SetAllowAutoJoin(True)
+            # 5. Finalize: Selective Re-Join (DISABLED for Draft Mode speed)
+            # We skip re-enabling AutoJoin here to keep editing nearly instantaneous.
+            # Lifts and Shell walls remain in their 'disjoint' state until a Polish command is run.
+            
+            # Store for potential future cleanup
+            self._affected_elements = [el for el in affected_elements if el and el.IsValidObject]
             
             t.Commit()
             tg.Assimilate()
@@ -189,7 +201,7 @@ class RevitWorkers:
             dims.append((final_w, final_l))
         return dims, shell
 
-    def _process_walls(self, current_levels, elevations, floor_dims, registry, results, created, reused):
+    def _process_walls(self, current_levels, elevations, floor_dims, registry, results, created, reused, affected_elements):
         import Autodesk.Revit.DB as DB # type: ignore
         doc = self.doc
         updated = []
@@ -208,16 +220,28 @@ class RevitWorkers:
                 if p1.DistanceTo(p2) < mm_to_ft(2.0): continue
                 line = DB.Line.CreateBound(p1, p2)
                 
-                wall = doc.GetElement(registry[tag]) if tag in registry else None
+                wall_id = registry.get(tag)
+                wall = doc.GetElement(wall_id) if wall_id else None
+                
+                is_changed = False
                 if wall and isinstance(wall, DB.Wall):
                     if hasattr(wall, "SetAllowAutoJoin"): wall.SetAllowAutoJoin(False)
-                    wall.Location.Curve = line
+                    # Use endpoint comparison since Line doesn't have IsSimilar
+                    w_curve = wall.Location.Curve
+                    if not (w_curve.GetEndPoint(0).IsAlmostEqualTo(line.GetEndPoint(0)) and \
+                            w_curve.GetEndPoint(1).IsAlmostEqualTo(line.GetEndPoint(1))):
+                        wall.Location.Curve = line
+                        is_changed = True
                     reused[0] += 1
                 else:
                     wall = DB.Wall.Create(doc, line, lvl.Id, False)
                     if hasattr(wall, "SetAllowAutoJoin"): wall.SetAllowAutoJoin(False)
                     safe_set_comment(wall, tag)
                     created[0] += 1
+                    is_changed = True
+                
+                if is_changed:
+                    affected_elements.append(wall)
                 
                 # Height & Constraints
                 try:
@@ -234,23 +258,35 @@ class RevitWorkers:
                 results["elements"].append(str(wall.Id.Value))
         return updated
 
-    def _draw_wall(self, doc, p1, p2, lvl, wall_type, height, tag, registry, results, created, reused):
+    def _draw_wall(self, doc, p1, p2, lvl, wall_type, height, tag, registry, results, created, reused, affected_elements=[]):
         import Autodesk.Revit.DB as DB # type: ignore
         line = DB.Line.CreateBound(p1, p2)
-        wall = doc.GetElement(registry[tag]) if tag in registry else None
+        wall_id = registry.get(tag)
+        wall = doc.GetElement(wall_id) if wall_id else None
         
+        is_changed = False
         if wall and isinstance(wall, DB.Wall):
-            wall.Location.Curve = line
+            if hasattr(wall, "SetAllowAutoJoin"): wall.SetAllowAutoJoin(False)
+            w_curve = wall.Location.Curve
+            if not (w_curve.GetEndPoint(0).IsAlmostEqualTo(line.GetEndPoint(0)) and \
+                    w_curve.GetEndPoint(1).IsAlmostEqualTo(line.GetEndPoint(1))):
+                wall.Location.Curve = line
+                is_changed = True
             reused[0] += 1
         else:
             wall = DB.Wall.Create(doc, line, wall_type.Id, lvl.Id, height, 0, False, False)
+            if hasattr(wall, "SetAllowAutoJoin"): wall.SetAllowAutoJoin(False)
             safe_set_comment(wall, tag)
             created[0] += 1
+            is_changed = True
+            
+        if is_changed:
+            affected_elements.append(wall)
         
         results["elements"].append(str(wall.Id.Value))
         return wall
 
-    def _process_parapets(self, current_levels, expanded_slab_dims, floor_dims, shell, registry, results, created, reused):
+    def _process_parapets(self, current_levels, expanded_slab_dims, floor_dims, shell, registry, results, created, reused, affected_elements):
         import Autodesk.Revit.DB as DB # type: ignore
         doc = self.doc
         
@@ -291,9 +327,9 @@ class RevitWorkers:
                     
                     if is_exposed:
                         tag = "AI_Parapet_L{}_{}".format(k+1, i)
-                        self._draw_wall(doc, p1, p2, lvl, wall_type, mm_to_ft(p_h_mm), tag, registry, results, created, reused)
+                        self._draw_wall(doc, p1, p2, lvl, wall_type, mm_to_ft(p_h_mm), tag, registry, results, created, reused, affected_elements)
 
-    def _process_floors(self, current_levels, floor_dims, shell, registry, results, created, reused):
+    def _process_floors(self, current_levels, floor_dims, shell, registry, results, created, reused, affected_elements):
         import Autodesk.Revit.DB as DB # type: ignore
         doc = self.doc
         ftype = DB.FilteredElementCollector(doc).OfClass(DB.FloorType).FirstElement()
@@ -317,7 +353,7 @@ class RevitWorkers:
             # Cantilever Logic: Add extra depth if requested
             lvl_ov = overrides.get(str(k+1), {})
             c_val = lvl_ov.get("cantilever_depth", g_c_depth)
-            # Center it at 1500mm if 'random'
+            # Default to 0 unless 'random' is explicitly requested
             c_depth = get_random_dim(c_val, 1500, variation=0.5) if c_val == "random" else safe_num(c_val, 0)
             
             slab_w = base_slab_w + (c_depth * 2)
@@ -352,6 +388,7 @@ class RevitWorkers:
                     loops.Add(loop)
                     floor.SetBoundary(loops)
                     needs_create = False
+                    affected_elements.append(floor)
                 except Exception:
                     try: doc.Delete(floor.Id)
                     except: pass
@@ -362,19 +399,22 @@ class RevitWorkers:
                 loops.Add(loop)
                 floor = DB.Floor.Create(doc, loops, ftype.Id, lvl.Id)
                 safe_set_comment(floor, tag)
+                affected_elements.append(floor)
+            
             if tag not in registry: created[0] += 1
             else: reused[0] += 1
             results["elements"].append(str(floor.Id.Value))
         
         return expanded_slab_dims
 
-    def _process_columns_and_grids(self, current_levels, elevations, floor_dims, expanded_slab_dims, shell, registry, results, created, reused):
+    def _process_columns_and_grids(self, current_levels, elevations, floor_dims, expanded_slab_dims, shell, registry, results, created, reused, affected_elements=[], core_bounds=None):
+        """Standard high-speed structural layout with stable grid anchoring.
+        If core_bounds is provided, it anchors the grid on the core center and culls columns inside."""
         import Autodesk.Revit.DB as DB # type: ignore
         doc = self.doc
         
-        # 1. SPAN PERSISTENCE: Priority -> manifest -> detect from model -> default 10m
-        m_span = safe_num(shell.get("column_span", shell.get("column_spacing")), None)
-        col_span = m_span
+        # 1. Logic Setup: Span & Phase
+        col_span = safe_num(shell.get("column_span", shell.get("column_spacing")), 10000.0)
         
         # Detect existing span from registry or model
         existing_pts = []
@@ -384,7 +424,7 @@ class RevitWorkers:
                     el = doc.GetElement(eid)
                     if el and hasattr(el.Location, "Point"): existing_pts.append(el.Location.Point)
         
-        if col_span is None:
+        if col_span is None or col_span == 0:
             if len(existing_pts) >= 2:
                 # Infer existing span
                 pts_sorted = sorted(existing_pts, key=lambda p: (round(p.X, 2), round(p.Y, 2)))
@@ -395,13 +435,11 @@ class RevitWorkers:
                         if detected_mm > 2000:
                             col_span = detected_mm
                             break
-            
-            # Final fallback if still None
-            if col_span is None:
-                col_span = 10000.0 # Match new default 10m
+            # Final fallback
+            if not col_span: col_span = 10000.0
 
-        symbol = DB.FilteredElementCollector(doc).OfCategory(DB.BuiltInCategory.OST_StructuralColumns).OfClass(DB.FamilySymbol).FirstElement()
         is_structural = True
+        symbol = self._find_type(DB.BuiltInCategory.OST_StructuralColumns, shell.get("column_type", "Structural Column"))
         if not symbol:
             symbol = DB.FilteredElementCollector(doc).OfCategory(DB.BuiltInCategory.OST_Columns).OfClass(DB.FamilySymbol).FirstElement()
             is_structural = False
@@ -416,33 +454,23 @@ class RevitWorkers:
         max_l = max(d[1] for d in floor_dims)
         center_only = shell.get("columns_center_only", False) or "center area" in str(shell).lower()
 
-        # 2. STABLE GRID LOGIC: Anchor on (0,0) with optional phase shift
-        def get_stable_offsets(dim_mm, span_ft, existing_pts, is_x=True):
-            half_dim_ft = mm_to_ft(dim_mm) / 2.0
-            # Phase Detection: 
-            # If num is odd (e.g. 1), we want a column at 0 (shift=0).
-            # If num is even (e.g. 2), we want columns at +/- span/2 (shift=span/2).
-            num = int(math.ceil(dim_mm / (span_ft * 304.8)))
-            shift = 0.0
-            if num % 2 == 0: shift = span_ft / 2.0
-            
-            if existing_pts:
-                # Check actual model state for phase
-                coords = [p.X if is_x else p.Y for p in existing_pts]
-                near_zero = any(abs(c % span_ft) < 0.05 or abs(c % span_ft - span_ft) < 0.05 for c in coords)
-                near_half = any(abs((c - span_ft/2.0) % span_ft) < 0.05 for c in coords)
-                if near_half: shift = span_ft / 2.0
-                elif near_zero: shift = 0.0
+        # Anchoring: Anchor on Core Center if available, else (0,0)
+        anchor_ft_x = 0.0
+        anchor_ft_y = 0.0
+        if core_bounds:
+            anchor_ft_x = (core_bounds[0] + core_bounds[2]) / 2.0
+            anchor_ft_y = (core_bounds[1] + core_bounds[3]) / 2.0
 
+        # 2. STABLE GRID LOGIC: Anchor on core/center
+        def get_stable_offsets(dim_mm, span_ft, anchor_ft, center_only=False):
+            half_dim_ft = mm_to_ft(dim_mm) / 2.0
             offsets = []
-            curr = shift
-            while curr <= half_dim_ft + 0.01:
+            curr = anchor_ft
+            while curr <= half_dim_ft + 0.1:
                 offsets.append(curr)
-                if abs(curr) > 0.001: offsets.append(-curr)
                 curr += span_ft
-            
-            curr = shift - span_ft
-            while curr >= -half_dim_ft - 0.01:
+            curr = anchor_ft - span_ft
+            while curr >= -half_dim_ft - 0.1:
                 offsets.append(curr)
                 curr -= span_ft
             
@@ -451,16 +479,23 @@ class RevitWorkers:
                 return [o for o in clean_offsets if abs(o) < half_dim_ft - 0.1]
             return clean_offsets
 
-        x_offsets = get_stable_offsets(max_w, span_ft, existing_pts, is_x=True)
-        y_offsets = get_stable_offsets(max_l, span_ft, existing_pts, is_x=False)
+        x_offsets = get_stable_offsets(max_w, span_ft, anchor_ft_x, center_only)
+        y_offsets = get_stable_offsets(max_l, span_ft, anchor_ft_y, center_only)
         
         # 3. PILLAR RULE with Stable Mapping
         max_level_for_grid = {} 
         for ox in x_offsets:
             for oy in y_offsets:
-                # Indices for tagging: normalize to span
-                ix = int(round(ox / span_ft))
-                iy = int(round(oy / span_ft))
+                # 1. CULLING: Don't place columns inside core bounding box
+                if core_bounds:
+                    m = mm_to_ft(500) # margin
+                    if (core_bounds[0] - m <= ox <= core_bounds[2] + m) and \
+                       (core_bounds[1] - m <= oy <= core_bounds[3] + m):
+                        continue
+
+                # Indices for tagging: normalize to span relative to anchor
+                ix = int(round((ox - anchor_ft_x) / span_ft))
+                iy = int(round((oy - anchor_ft_y) / span_ft))
                 
                 k_highest = -1
                 for k in range(len(current_levels)):
@@ -472,7 +507,6 @@ class RevitWorkers:
 
         for (ix, iy, ox, oy), k_max in max_level_for_grid.items():
             for k in range(k_max):
-                # STABLE TAGGING: Use coordinate indices instead of list indices
                 tag = "AI_Col_L{}_GX{}_GY{}".format(k+1, ix, iy)
                 p = DB.XYZ(ox, oy, 0)
                 lvl = current_levels[k]
@@ -493,9 +527,11 @@ class RevitWorkers:
                     param = col.get_Parameter(bip)
                     if param: param.Set(current_levels[k+1].Id)
                 except: pass
+                
                 results["elements"].append(str(col.Id.Value))
+                affected_elements.append(col)
 
-    def _process_granular_walls(self, manifest, current_levels, registry, results, created, reused):
+    def _process_granular_walls(self, manifest, current_levels, registry, results, created, reused, affected_elements=[]):
         import Autodesk.Revit.DB as DB # type: ignore
         doc = self.doc
         level_map = {l.Name: l for l in current_levels}
@@ -503,6 +539,7 @@ class RevitWorkers:
             p = l.get_Parameter(DB.BuiltInParameter.ALL_MODEL_INSTANCE_COMMENTS)
             if p and p.HasValue: level_map[p.AsString()] = l
 
+        granular_walls = []
         for w_data in manifest.get("walls", []):
             ai_id = w_data.get("id")
             if not ai_id: continue
@@ -517,13 +554,24 @@ class RevitWorkers:
             if not lvl: lvl = current_levels[0]
             
             wall = doc.GetElement(registry[ai_id]) if ai_id in registry else None
+            is_changed = False
             if wall and isinstance(wall, DB.Wall):
-                wall.Location.Curve = line
+                if hasattr(wall, "SetAllowAutoJoin"): wall.SetAllowAutoJoin(False)
+                w_curve = wall.Location.Curve
+                if not (w_curve.GetEndPoint(0).IsAlmostEqualTo(line.GetEndPoint(0)) and \
+                        w_curve.GetEndPoint(1).IsAlmostEqualTo(line.GetEndPoint(1))):
+                    wall.Location.Curve = line
+                    is_changed = True
                 reused[0] += 1
             else:
                 wall = DB.Wall.Create(doc, line, lvl.Id, False)
+                if hasattr(wall, "SetAllowAutoJoin"): wall.SetAllowAutoJoin(False)
                 safe_set_comment(wall, ai_id)
                 created[0] += 1
+                is_changed = True
+            
+            if is_changed:
+                affected_elements.append(wall)
             
             h = w_data.get("height")
             if h:
@@ -531,8 +579,10 @@ class RevitWorkers:
                 if p: p.Set(mm_to_ft(h))
             
             results["elements"].append(str(wall.Id.Value))
+            granular_walls.append(wall)
+        return granular_walls
 
-    def _process_granular_floors(self, manifest, current_levels, registry, results, created, reused):
+    def _process_granular_floors(self, manifest, current_levels, registry, results, created, reused, affected_elements=[]):
         import Autodesk.Revit.DB as DB # type: ignore
         import System.Collections.Generic as Generic # type: ignore
         doc = self.doc
@@ -558,8 +608,16 @@ class RevitWorkers:
                 p2 = DB.XYZ(mm_to_ft(p2_raw[0]), mm_to_ft(p2_raw[1]), 0)
                 loop.Append(DB.Line.CreateBound(p1, p2))
             
-            lvl = level_map.get(f_data.get("level_id"))
+            lvl_name = f_data.get("level_id")
+            lvl = level_map.get(lvl_name)
             if not lvl: lvl = current_levels[0]
+            
+            # Elevation Logic
+            target_elev_mm = f_data.get("elevation")
+            offset_ft = 0.0
+            if target_elev_mm is not None:
+                lvl_base_elev_mm = lvl.ProjectElevation * 304.8
+                offset_ft = mm_to_ft(target_elev_mm - lvl_base_elev_mm)
             
             floor = doc.GetElement(registry[ai_id]) if ai_id in registry else None
             if floor and isinstance(floor, DB.Floor):
@@ -569,6 +627,12 @@ class RevitWorkers:
             loops.Add(loop)
             floor = DB.Floor.Create(doc, loops, ftype.Id, lvl.Id)
             safe_set_comment(floor, ai_id)
+            
+            # Set Height Offset if needed
+            if abs(offset_ft) > 0.001:
+                p_offset = floor.get_Parameter(DB.BuiltInParameter.FLOOR_HEIGHTABOVELEVEL_PARAM)
+                if p_offset: p_offset.Set(offset_ft)
+                
             created[0] += 1
             results["elements"].append(str(floor.Id.Value))
 
@@ -624,8 +688,14 @@ class RevitWorkers:
         # CRITICAL: Convert to list of IDs/Elements to avoid "Iterator Cannot Proceed" exception
         all_ai_elements = DB.FilteredElementCollector(doc).WherePasses(filter).WhereElementIsNotElementType().ToElements()
         
-        # Collect all views for association check
+        # Collect all views for association check (Pre-Index by Level for speed)
         all_views = DB.FilteredElementCollector(doc).OfClass(DB.ViewPlan).ToElements()
+        views_by_level = {}
+        for v in all_views:
+            if v.GenLevel:
+                l_id = v.GenLevel.Id
+                if l_id not in views_by_level: views_by_level[l_id] = []
+                views_by_level[l_id].append(v)
         
         for el in list(all_ai_elements):
             if not el.IsValidObject: continue
@@ -646,12 +716,11 @@ class RevitWorkers:
 
             if is_ai:
                 # If it's a level, delete associated floor plans first
-                if isinstance(el, DB.Level):
-                    for v in list(all_views):
+                if isinstance(el, DB.Level) and el.Id in views_by_level:
+                    for v in views_by_level[el.Id]:
                         try:
-                            if v.GenLevel and v.GenLevel.Id == el.Id:
-                                if v.Pinned: v.Pinned = False
-                                doc.Delete(v.Id)
+                            if v.Pinned: v.Pinned = False
+                            doc.Delete(v.Id)
                         except: pass
                 
                 try:
@@ -667,6 +736,102 @@ class RevitWorkers:
         doc = self.doc
         # Grids and Sections (Placeholder for full implementation in doc worker)
         pass
+
+    def _expand_lifts_in_manifest(self, manifest, current_levels, elevations, floor_dims, affected_elements=[]):
+        """Calculates needed lifts using efficiency/load factors and expands into modular cores.
+        Returns core_bounds in FT for column culling."""
+        import Autodesk.Revit.DB as DB # type: ignore
+        lifts_config = manifest.get("lifts", {})
+        shell = manifest.get("shell", {})
+        num_storeys = len(current_levels) - 1
+        
+        # Rule: Auto-trigger if explicitly asked OR if building is 3+ storeys
+        if not lifts_config and not shell.get("include_lifts") and num_storeys < 3:
+            return None
+
+        # 1. Load Presets for Efficiency & Load Factor
+        presets = load_presets()
+        setup = manifest.get("project_setup", {})
+        typology = setup.get("typology", "commercial_office").lower().replace(" ", "_")
+        preset = presets.get(typology, presets.get("commercial_office", {}))
+        
+        efficiency = preset.get("building_identity", {}).get("target_efficiency", 0.82)
+        load_factor = preset.get("program_requirements", {}).get("occupancy_load_factor", 10.0)
+
+        # 2. Calculate Occupancy & Floor Centroid
+        total_occ = 0
+        min_x, min_y = float('inf'), float('inf')
+        max_x, max_y = float('-inf'), float('-inf')
+        
+        for w, l in floor_dims:
+            usable_area = (w * l) * efficiency
+            total_occ += (usable_area / 1000000.0) / load_factor
+            # Assuming floor_dims are local (centered on 0,0) in RevitWorkers
+            # but if they were parsed from real floors, we calculate bounds.
+            min_x = min(min_x, -w/2.0); max_x = max(max_x, w/2.0)
+            min_y = min(min_y, -l/2.0); max_y = max(max_y, l/2.0)
+            
+        f_center_x = (min_x + max_x) / 2.0
+        f_center_y = (min_y + max_y) / 2.0
+
+        num_lifts = lifts_config.get("count")
+        if num_lifts is None or num_lifts == "random":
+            avg_h = (elevations[-1] / num_storeys * 304.8) if num_storeys > 0 else 4000
+            num_lifts = lift_logic.calculate_lift_requirements(num_storeys, avg_h, total_occ)
+        
+        # 3. Handle Multi-Block Layout
+        num_lifts_val = int(num_lifts)
+        lift_size = lifts_config.get("size", preset.get("core_logic", {}).get("lift_shaft_size", [2500, 2500]))
+        lobby_w = lifts_config.get("lobby_width", 3000)
+        
+        layout = lift_logic.get_total_core_layout(num_lifts_val, lift_size, lobby_w)
+        num_lifts_val = layout['total_lifts']
+        
+        # Centering target
+        center_pos = lifts_config.get("position")
+        if not center_pos:
+            center_pos = [f_center_x, f_center_y]
+            
+        levels_data = []
+        for i, lvl in enumerate(current_levels):
+            levels_data.append({"id": lvl.Name, "elevation": elevations[i] * 304.8})
+            
+        lift_walls = []
+        remaining_lifts = num_lifts_val
+        for b_idx in range(layout['num_blocks']):
+            b_lifts = min(remaining_lifts, layout['lifts_per_block'])
+            remaining_lifts -= b_lifts
+            
+            # Use centered b_y_offset to keep entire core cluster balanced around building center
+            b_y_offset = (b_idx - (layout['num_blocks']-1)/2.0) * layout['block_d']
+            b_center_pos = [center_pos[0], center_pos[1] + b_y_offset]
+            
+            b_manifest = lift_logic.generate_lift_shaft_manifest(
+                b_lifts, levels_data, 
+                center_pos=b_center_pos,
+                internal_size=lift_size,
+                lobby_width=lobby_w
+            )
+            for w in b_manifest.get("walls", []):
+                w['id'] = f"{w['id']}_B{b_idx+1}"
+                lift_walls.append(w)
+            
+            for f in b_manifest.get("floors", []):
+                f['id'] = f"{f['id']}_B{b_idx+1}"
+                # Inject into manifest["floors"] for processing
+                if "floors" not in manifest: manifest["floors"] = []
+                manifest["floors"].append(f)
+        
+        # 4. Inject into manifest for granular processing
+        if "walls" not in manifest: manifest["walls"] = []
+        manifest["walls"].extend(lift_walls)
+        
+        # Return Core Bounds in FEET for culling logic
+        if lift_walls:
+            xs = [mm_to_ft(w['start'][0]) for w in lift_walls] + [mm_to_ft(w['end'][0]) for w in lift_walls]
+            ys = [mm_to_ft(w['start'][1]) for w in lift_walls] + [mm_to_ft(w['end'][1]) for w in lift_walls]
+            return (min(xs), min(ys), max(xs), max(ys))
+        return None
 
     def _auto_array_windows(self, wall, spacing_mm):
         """Math Delegation: LLM doesn't need to calculate window positions"""
@@ -688,6 +853,13 @@ class RevitWorkers:
         for i in range(1, count):
             p = line.GetEndPoint(0) + direction * (i * spacing)
             doc.Create.NewFamilyInstance(p, symbol, wall, doc.GetElement(wall.LevelId), DB.Structure.StructuralType.NonStructural)
+
+    def _find_type(self, category_bip, name):
+        import Autodesk.Revit.DB as DB # type: ignore
+        cl = DB.FilteredElementCollector(self.doc).OfCategory(category_bip).OfClass(DB.ElementType)
+        for t in cl:
+            if name.lower() in t.Name.lower(): return t
+        return None
 
     def build_standard_stair(self, data, state):
         """Worker for Vertical Circulation"""
@@ -814,19 +986,31 @@ class RevitWorkers:
             ids_list = List[DB.ElementId]()
             for eid in ai_ids: ids_list.Add(eid)
             
-            ai_elements = DB.FilteredElementCollector(doc, ids_list).WhereElementIsNotElementType().ToElements()
-            walls = [e for e in ai_elements if isinstance(e, DB.Wall)]
+            if hasattr(self, "_affected_elements") and self._affected_elements:
+                ai_elements = self._affected_elements
+            else:
+                ai_elements = DB.FilteredElementCollector(doc, ids_list).WhereElementIsNotElementType().ToElements()
+            
+            # ONLY cleanup shell elements (Walls/Floors). Skip Lifts for speed.
+            walls = []
+            for e in ai_elements:
+                if isinstance(e, DB.Wall):
+                    p = e.get_Parameter(DB.BuiltInParameter.ALL_MODEL_INSTANCE_COMMENTS)
+                    if p and p.HasValue and "Lift" in p.AsString(): continue 
+                    walls.append(e)
+            
             floors = [e for e in ai_elements if isinstance(e, DB.Floor)]
             
             # 1. Targeted Join: Walls with Floors
+            # Only join walls/floors that were part of the current build action
             for f in floors:
-                level_id = f.LevelId
-                # Use a BoundingBox filter instead of a full loop for intersections
+                if not f.IsValidObject: continue
                 bb = f.get_BoundingBox(None)
                 if not bb: continue
                 outline = DB.Outline(bb.Min - DB.XYZ(0.01, 0.01, 1.0), bb.Max + DB.XYZ(0.01, 0.01, 1.0))
                 filter = DB.BoundingBoxIntersectsFilter(outline)
                 
+                # We limit the join candidates to AI walls only
                 intersecting_walls = DB.FilteredElementCollector(doc, ids_list).OfClass(DB.Wall).WherePasses(filter).ToElements()
                 for w in intersecting_walls:
                     try:
@@ -834,24 +1018,10 @@ class RevitWorkers:
                             DB.JoinGeometryUtils.JoinGeometry(doc, w, f)
                     except: pass
             
-            # 2. Optimized Wall-Wall Joins
-            for i, w1 in enumerate(walls):
-                bb = w1.get_BoundingBox(None)
-                if not bb: continue
-                outline = DB.Outline(bb.Min - DB.XYZ(0.1, 0.1, 0.1), bb.Max + DB.XYZ(0.1, 0.1, 0.1))
-                filter = DB.BoundingBoxIntersectsFilter(outline)
-                
-                # Check intersections with other AI walls
-                remaining_ids = List[DB.ElementId]()
-                for w in walls[i+1:]: remaining_ids.Add(w.Id)
-                
-                if remaining_ids.Count > 0:
-                    intersecting = DB.FilteredElementCollector(doc, remaining_ids).WherePasses(filter).ToElements()
-                    for w2 in intersecting:
-                        try:
-                            if not DB.JoinGeometryUtils.AreElementsJoined(doc, w1, w2):
-                                DB.JoinGeometryUtils.JoinGeometry(doc, w1, w2)
-                        except: pass
+            # 2. Wall-Wall joins: REMOVED O(N^2) Manual Join
+            # Revit's native AutoJoin handles this much more efficiently during Transaction.Commit
+            # when SetAllowAutoJoin(True) is called.
+            
             t.Commit()
         except Exception as e:
             t.RollBack()

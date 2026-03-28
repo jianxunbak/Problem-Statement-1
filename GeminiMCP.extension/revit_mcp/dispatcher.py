@@ -8,6 +8,7 @@ from revit_mcp.agent_prompts import *
 from revit_mcp.revit_workers import RevitWorkers, execute_in_transaction_group
 from revit_mcp.bridge import mcp_event_handler
 from revit_mcp.building_generator import BuildingSystem
+from revit_mcp.utils import load_presets
 
 class Orchestrator:
     def __init__(self):
@@ -26,6 +27,13 @@ class Orchestrator:
     def _orchestrate(self, uiapp, user_prompt):
         # All imports moved to top of module
         self.log("Dispatcher: Gathering current BIM state...")
+
+        # Load Building Presets
+        presets = load_presets()
+        presets_text = ""
+        if presets:
+            presets_text = "\nBUILDING PRESETS (DNA):\n" + json.dumps(presets, indent=2)
+
         def gather_state():
             import Autodesk.Revit.DB as DB # type: ignore
             doc = uiapp.ActiveUIDocument.Document
@@ -164,7 +172,8 @@ class Orchestrator:
         # 1. Generate Master Manifest (Fast-Track)
         self.log("Step 2: Requesting building plan from Gemini AI (model: {})".format(client.model))
         ai_start = time.time()
-        manifest_json = client.generate_content(DISPATCHER_PROMPT + "\n" + state_text + "\nUser Request: " + user_prompt)
+        full_prompt = DISPATCHER_PROMPT + presets_text + "\n" + state_text + "\nUser Request: " + user_prompt
+        manifest_json = client.generate_content(full_prompt)
         ai_duration = time.time() - ai_start
         self.log("Step 3: Manifest received from AI. (Time: {:.2f}s). Parsing...".format(ai_duration))
         self.log(f"Gemini Payload -> {manifest_json}")
@@ -206,11 +215,11 @@ class Orchestrator:
                 results = workers.execute_fast_manifest(manifest)
                 self.log("Manifest execution summary: {}".format(results.get('summary', 'Success')))
                 
-                # Global cleanup for premium geometry joins
-                workers.perform_global_cleanup()
-                workers.generate_submission_set()
+                # Global cleanup and documentation DISABLED for speed during rapid editing.
+                # Use 'BIM Polish' command if perfect joins are required.
+                self.log("BIM Health: Optimized Build complete (Draft Mode).")
                 
-                return "Build Completed successfully via RevitWorkers."
+                return "Build Completed successfully."
             except Exception as e:
                 import traceback
                 error_trace = traceback.format_exc()

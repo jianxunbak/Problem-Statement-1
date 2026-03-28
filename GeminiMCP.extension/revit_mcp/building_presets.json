@@ -1,0 +1,46 @@
+{
+  "commercial_office": {
+    "building_identity": {
+      "typology": "Commercial Office",
+      "target_efficiency": 0.82,
+      "typical_floor_area": 2500
+    },
+    "building_defaults": {
+      "typical_floor_height": 4200,
+      "first_storey_floor_height": 8400,
+      "last_floor_height": 4500,
+      "clear_ceiling_height": 3000,
+      "core_position": "Central"
+    },
+    "column_logic": {
+      "span": [
+        12000,
+        15000
+      ],
+      "offset_from_edge": 1000
+    },
+    "program_requirements": {
+      "occupancy_load_factor": 10.0,
+      "minimum_distance_facade_to_core": 12000,
+      "core_area_ratio": [
+        0.20,
+        0.25
+      ]
+    },
+    "core_logic": {
+      "lift_waiting_time": 25,
+      "lift_shaft_size": [
+        2700,
+        2700
+      ],
+      "fire_safety": {
+        "fire_escape_staircases": 2,
+        "fire_fighting_lifts": 2,
+        "fire_fighting_lift_lobby": [
+          2000,
+          3000
+        ]
+      }
+    }
+  }
+}
