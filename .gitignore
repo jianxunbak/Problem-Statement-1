@@ -1,8 +1,24 @@
 .env
 *.log
+latest_log_dump.txt
+latest_log_dump_utf8.txt
 __pycache__/
-*.pyc
+*.py[cod]
+*$py.class
+.pytest_cache/
+.venv/
+env/
+venv/
 .vs/
 .vscode/
 bin/
 obj/
+
+# Revit backups and recovery
+*.recovery.rvt
+*.backup.*
+*.000*.rvt
+
+# OS specific
+.DS_Store
+Thumbs.db

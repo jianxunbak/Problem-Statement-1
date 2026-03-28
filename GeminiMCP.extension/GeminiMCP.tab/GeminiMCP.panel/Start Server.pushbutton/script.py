@@ -11,12 +11,22 @@ import sys
 import os
 import time
 
-lib_path = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..', '..', 'lib'))
-if lib_path not in sys.path:
-    sys.path.append(lib_path)
+# Robust path discovery
+try:
+    _cur_dir = os.path.dirname(os.path.abspath(__file__))
+    # script.py is in .extension/.tab/.panel/.pushbutton/script.py
+    # We need .extension/ level
+    ext_root = os.path.dirname(os.path.dirname(os.path.dirname(_cur_dir)))
+    lib_path = os.path.join(ext_root, 'lib')
+    
+    if ext_root not in sys.path:
+        sys.path.append(ext_root)
+    if lib_path not in sys.path:
+        sys.path.append(lib_path)
+except Exception as e:
+    print("Path initialization failed: " + str(e))
 
 # Hard reset of revit_mcp modules to force reload from disk
-import sys
 for m in list(sys.modules.keys()):
     if 'revit_mcp' in m:
         del sys.modules[m]
@@ -24,15 +34,23 @@ for m in list(sys.modules.keys()):
 from pyrevit import revit, DB, UI, HOST_APP, forms, script
 from Autodesk.Revit.UI import TaskDialog
 
+# Track initialization status
+_init_success = False
 try:
     from revit_mcp.gemini_client import client
     from revit_mcp.dispatcher import orchestrator
-    import revit_mcp.bridge as bridge
-    client.log("UI: Hard module reset completed. v8-STABLE starting.")
-    # TaskDialog.Show removed to improve startup UX
+    from revit_mcp import bridge
+    client.log("UI: Hard module reset completed. v9-STABLE starting.")
+    _init_success = True
 except Exception as e:
     import traceback
-    print("Pre-load failed: " + str(e))
+    _init_error = "Pre-load failed: {}\n\nTraceback:\n{}".format(str(e), traceback.format_exc())
+    print(_init_error)
+    
+    # Dummy client to prevent NameError crashes later
+    class DummyClient:
+        def log(self, *args, **kwargs): pass
+    client = DummyClient()
 
 import clr
 
@@ -342,6 +360,14 @@ def main():
     output.print_md("⚠️ **Minimize** this window — do NOT close it (it keeps the server alive).")
 
     uiapp = HOST_APP.uiapp
+
+    if not _init_success:
+        output.print_md("## ❌ Plugin components failed to load.")
+        output.print_md("Check your installation and try clicking 'Start Server' again.")
+        output.print_md("---")
+        output.print_md("### Error Details:")
+        output.print_md("```\n{}\n```".format(_init_error))
+        return
 
     # Initialize and show the chat window
     # Cleanup OLD windows if they exist

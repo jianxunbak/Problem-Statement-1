@@ -4,7 +4,8 @@ import datetime
 import os
 
 # --- Bridge State ---
-LOG_PATH = os.path.join(os.path.dirname(__file__), "fastmcp_server.log")
+from .utils import get_log_path
+LOG_PATH = get_log_path()
 _work_queue = queue.Queue()
 _uiapp = None
 

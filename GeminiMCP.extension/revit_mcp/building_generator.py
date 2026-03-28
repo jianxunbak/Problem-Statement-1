@@ -3,25 +3,14 @@ try:
     import clr
     clr.AddReference('RevitAPI')
     from Autodesk.Revit.DB import * # type: ignore
+    import System
 except:
     pass
 
 import math
-from .state_manager import state_manager
+from revit_mcp.state_manager import state_manager
 
-def safe_num(val, default=0):
-    try:
-        if isinstance(val, (int, float)): return float(val)
-        if isinstance(val, str):
-            import re
-            m = re.findall(r"[-+]?\d*\.\d+|\d+", val)
-            return float(m[0]) if m else float(default)
-        return float(default)
-    except: return float(default)
-
-def mm_to_ft(mm):
-    import Autodesk.Revit.DB as DB # type: ignore
-    return DB.UnitUtils.ConvertToInternalUnits(safe_num(mm), DB.UnitTypeId.Millimeters)
+from revit_mcp.utils import safe_num, mm_to_ft
 
 def get_model_registry(doc, zone_bbox=None):
     """
@@ -53,18 +42,21 @@ def get_model_registry(doc, zone_bbox=None):
         pass
 
     # 2. Fallback Scan: Legacy Comment Tags
-    # To keep it fast, we only scan specific architectural categories.
+    # Optimization: Scan all likely categories in one pass
     if len(registry) < 5:
-        categories = [DB.BuiltInCategory.OST_Walls, DB.BuiltInCategory.OST_Floors, DB.BuiltInCategory.OST_Levels, DB.BuiltInCategory.OST_Grids, DB.BuiltInCategory.OST_Columns, DB.BuiltInCategory.OST_StructuralColumns]
-        for cat in categories:
-            col = DB.FilteredElementCollector(doc).OfCategory(cat).WhereElementIsNotElementType()
-            for el in col:
-                p = el.get_Parameter(DB.BuiltInParameter.ALL_MODEL_INSTANCE_COMMENTS)
-                if not p: p = el.LookupParameter("Comments")
-                if p and p.HasValue:
-                    val = p.AsString()
-                    if val.startswith("AI_") and val not in registry:
-                        registry[val] = el.Id
+        cats = [DB.BuiltInCategory.OST_Walls, DB.BuiltInCategory.OST_Floors, DB.BuiltInCategory.OST_Levels, 
+                DB.BuiltInCategory.OST_Grids, DB.BuiltInCategory.OST_Columns, DB.BuiltInCategory.OST_StructuralColumns]
+        net_cats = System.Collections.Generic.List[DB.BuiltInCategory]()
+        for c in cats: net_cats.Add(c)
+        filter = DB.ElementMulticategoryFilter(net_cats)
+        col = DB.FilteredElementCollector(doc).WherePasses(filter).WhereElementIsNotElementType()
+        for el in col:
+            p = el.get_Parameter(DB.BuiltInParameter.ALL_MODEL_INSTANCE_COMMENTS)
+            if not p: p = el.LookupParameter("Comments")
+            if p and p.HasValue:
+                val = p.AsString()
+                if val.startswith("AI_") and val not in registry:
+                    registry[val] = el.Id
     
     return registry
 
@@ -121,8 +113,19 @@ class BuildingSystem:
                 floor = self._sync_floor(f_data, level_map)
                 results.append({"type": "floor", "id": f_data['id'], "revit_id": str(floor.Id.Value)})
                 floors_count += 1
+            
+            # --- PHASE 3: COLUMNS ---
+            worker_log("PHASE 3: Syncing Columns...")
+            t = DB.Transaction(self.doc, "AI Sync: Columns")
+            t.Start()
+            cols_count = 0
+            for c_data in manifest.get('columns', []):
+                col = self._sync_column(c_data, level_map)
+                if col:
+                    results.append({"type": "column", "id": c_data['id'], "revit_id": str(col.Id.Value)})
+                    cols_count += 1
             t.Commit()
-            worker_log("Shell synced: {} walls, {} floors.".format(walls_count, floors_count))
+            worker_log("Columns synced: {}.".format(cols_count))
             
             tg.Assimilate()
             worker_log("sync_manifest SUCCESS.")
@@ -223,17 +226,51 @@ class BuildingSystem:
         state_manager.set_ai_metadata(floor, ai_id)
         return floor
 
+    def _sync_column(self, data, level_map):
+        import Autodesk.Revit.DB as DB # type: ignore
+        ai_id = data['id']
+        loc_raw = data['location'] # [x, y, z]
+        p = DB.XYZ(mm_to_ft(loc_raw[0]), mm_to_ft(loc_raw[1]), mm_to_ft(loc_raw[2]))
+        
+        level = level_map.get(data.get('level_id'))
+        top_level = level_map.get(data.get('top_level_id'))
+        
+        # Find structural column symbol
+        symbol = self._find_type(DB.BuiltInCategory.OST_StructuralColumns, data.get('type', "Column"))
+        if not symbol:
+            symbol = DB.FilteredElementCollector(self.doc).OfCategory(DB.BuiltInCategory.OST_StructuralColumns).OfClass(DB.FamilySymbol).FirstElement()
+        
+        if not symbol: return None
+        if not symbol.IsActive: symbol.Activate()
+        
+        col = None
+        if ai_id in self.registry:
+            col = self.doc.GetElement(self.registry[ai_id])
+            
+        if col and isinstance(col, DB.FamilyInstance):
+            col.Location.Point = p
+        else:
+            col = self.doc.Create.NewFamilyInstance(p, symbol, level, DB.Structure.StructuralType.Column)
+            state_manager.set_ai_metadata(col, ai_id)
+            
+        # Set Top Level
+        if top_level:
+            p_top = col.get_Parameter(DB.BuiltInParameter.FAMILY_TOP_LEVEL_PARAM)
+            if p_top: p_top.Set(top_level.Id)
+            
+        return col
+
     def _expand_high_level_manifest(self, manifest):
         """Converts Architectural Intent (Storeys/Shell) into concrete element lists."""
         setup = manifest.get("project_setup", {})
         shell = manifest.get("shell", {})
         
-        num_storeys = int(setup.get("levels", 1))
-        base_height = float(setup.get("level_height", 3000))
+        num_storeys = int(safe_num(setup.get("levels", 1), 1))
+        base_height = safe_num(setup.get("level_height", 3000), 3000.0)
         height_overrides = setup.get("height_overrides", {})
         
-        width = float(shell.get("width", 10000))
-        length = float(shell.get("length", 15000))
+        width = safe_num(shell.get("width", 10000), 10000.0)
+        length = safe_num(shell.get("length", 15000), 15000.0)
         floor_overrides = shell.get("floor_overrides", {})
         
         new_levels = []
@@ -254,8 +291,8 @@ class BuildingSystem:
                 f_l = length
                 if str(level_idx) in floor_overrides:
                     ovr = floor_overrides[str(level_idx)]
-                    f_w = float(ovr.get("width", f_w))
-                    f_l = float(ovr.get("length", f_l))
+                    f_w = safe_num(ovr.get("width", f_w), f_w)
+                    f_l = safe_num(ovr.get("length", f_l), f_l)
                 
                 h_w = f_w / 2.0
                 h_l = f_l / 2.0
@@ -282,13 +319,103 @@ class BuildingSystem:
                         "level_id": lvl_id,
                         "start": [p1[0], p1[1], 0],
                         "end": [p2[0], p2[1], 0],
-                        "height": float(height_overrides.get(str(level_idx), base_height))
+                        "height": safe_num(height_overrides.get(str(level_idx), base_height), base_height)
                     })
             
             # Increment elevation
-            current_elev += float(height_overrides.get(str(level_idx), base_height))
+            current_elev += safe_num(height_overrides.get(str(level_idx), base_height), base_height)
             
-        return {"levels": new_levels, "walls": new_walls, "floors": new_floors}
+        # --- COLUMN GENERATION ---
+        new_columns = []
+        # Determine Span and Rules: Priority -> shell.column_span -> detect from existing -> default 10m
+        col_span = safe_num(shell.get("column_span", shell.get("column_spacing")), None)
+        
+        # 0. INFERENCE: If manifest doesn't specify, try to detect from existing model
+        if col_span is None:
+            existing_pts = []
+            for tag, eid in self.registry.items():
+                if tag.startswith("AI_Col_L1_"):
+                    el = self.doc.GetElement(eid)
+                    if el and hasattr(el.Location, "Point"):
+                        existing_pts.append(el.Location.Point)
+            
+            if len(existing_pts) >= 2:
+                pts_sorted = sorted(existing_pts, key=lambda p: (round(p.X, 2), round(p.Y, 2)))
+                for i in range(len(pts_sorted)-1):
+                    d = pts_sorted[i].DistanceTo(pts_sorted[i+1])
+                    if d > 1.0: # at least ~300mm
+                        detected_mm = round(d * 304.8 / 100.0) * 100.0
+                        if detected_mm > 2000:
+                            col_span = detected_mm
+                            break
+        
+        if col_span is None:
+            col_span = 10000.0 # Default to 10m if completely unknown (premium standard)
+            
+        if col_span % 300 != 0: 
+            col_span = round(col_span / 300.0) * 300.0
+        
+        # 1. DYNAMIC GRID: Cover the maximum extent of ANY floor in the manifest
+        # This ensures columns exist for expanded floors.
+        all_w = [width]
+        all_l = [length]
+        for v in floor_overrides.values():
+            all_w.append(safe_num(v.get("width", width), width))
+            all_l.append(safe_num(v.get("length", length), length))
+            
+        base_w = max(all_w)
+        base_l = max(all_l)
+        center_only = shell.get("columns_center_only", False) or "center area" in str(shell).lower()
+
+        def get_grid_offsets(dim_mm, span_mm, center_only=False):
+            span_ft = mm_to_ft(span_mm)
+            half_dim_ft = mm_to_ft(dim_mm) / 2.0
+            # Phase Detection (Symmetric centering default)
+            # Odd num -> column at 0 (shift 0)
+            # Even num -> columns at +/- span/2 (shift span/2)
+            num = int(math.ceil(dim_mm / span_mm))
+            shift = 0.0
+            if num % 2 == 0: shift = span_ft / 2.0
+            
+            offsets = []
+            curr = shift
+            while curr <= half_dim_ft + 0.1:
+                offsets.append(curr)
+                if abs(curr) > 0.001: offsets.append(-curr)
+                curr += span_ft
+            curr = shift - span_ft
+            while curr >= -half_dim_ft - 0.1:
+                offsets.append(curr)
+                curr -= span_ft
+            
+            clean_offsets_ft = sorted(list(set(round(o, 4) for o in offsets)))
+            if center_only and len(clean_offsets_ft) >= 3:
+                clean_offsets_ft = [o for o in clean_offsets_ft if abs(o) < half_dim_ft - 0.1]
+                
+            return [ft_to_mm(o) for o in clean_offsets_ft]
+
+        from revit_mcp.utils import ft_to_mm
+        x_offsets = get_grid_offsets(base_w, col_span, center_only)
+        y_offsets = get_grid_offsets(base_l, col_span, center_only)
+        
+        for i in range(num_storeys):
+            lvl_id = "AI_Level_{}".format(i+1)
+            top_lvl_id = "AI_Level_{}".format(i+2)
+            
+            for ox_mm in x_offsets:
+                for oy_mm in y_offsets:
+                    ix = int(round(ox_mm / col_span))
+                    iy = int(round(oy_mm / col_span))
+                    col_id = "AI_Col_L{}_GX{}_GY{}".format(i+1, ix, iy)
+                    new_columns.append({
+                        "id": col_id,
+                        "level_id": lvl_id,
+                        "top_level_id": top_lvl_id,
+                        "location": [ox_mm, oy_mm, 0],
+                        "type": shell.get("column_type", "")
+                    })
+
+        return {"levels": new_levels, "walls": new_walls, "floors": new_floors, "columns": new_columns}
 
     def _find_type(self, category_bip, name):
         import Autodesk.Revit.DB as DB # type: ignore

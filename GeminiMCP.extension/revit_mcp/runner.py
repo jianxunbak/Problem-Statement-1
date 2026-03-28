@@ -9,17 +9,16 @@ import time
 import socket
 
 # --- LOGGING ---
-LOG_FILE = os.path.join(os.path.dirname(__file__), "fastmcp_server.log")
+from .utils import get_log_path
+LOG_FILE = get_log_path()
 
 def log(msg):
     try:
-        # Use a more robust timestamp and ensure we don't crash the caller
+        path = get_log_path()
         timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
         formatted = "[{}] {}\n".format(timestamp, str(msg))
-        with open(LOG_FILE, "a") as f:
+        with open(path, "a") as f:
             f.write(formatted)
-            # Flushes but doesn't necessarily fsync every time for performance, 
-            # unless it's critical. Actually, let's keep it safe.
             f.flush()
     except:
         pass

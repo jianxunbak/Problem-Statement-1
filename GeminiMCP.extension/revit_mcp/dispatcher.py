@@ -3,11 +3,11 @@
 # This module is loaded on the background Uvicorn thread. All DB access
 # must stay INSIDE closures that run via mcp_event_handler (Revit main thread).
 import json
-from .gemini_client import client
-from .agent_prompts import *
-from .revit_workers import RevitWorkers, execute_in_transaction_group
-from .bridge import mcp_event_handler
-from .building_generator import BuildingSystem
+from revit_mcp.gemini_client import client
+from revit_mcp.agent_prompts import *
+from revit_mcp.revit_workers import RevitWorkers, execute_in_transaction_group
+from revit_mcp.bridge import mcp_event_handler
+from revit_mcp.building_generator import BuildingSystem
 
 class Orchestrator:
     def __init__(self):
@@ -29,7 +29,7 @@ class Orchestrator:
         def gather_state():
             import Autodesk.Revit.DB as DB # type: ignore
             doc = uiapp.ActiveUIDocument.Document
-            from .building_generator import get_model_registry # type: ignore
+            from revit_mcp.building_generator import get_model_registry # type: ignore
             registry = get_model_registry(doc)
             
             levels = []
@@ -59,7 +59,71 @@ class Orchestrator:
                             l_mm = UnitUtils.ConvertFromInternalUnits(l_wall.Location.Curve.Length, UnitTypeId.Millimeters)
                             overrides_str += f"L{i+1}:{w_mm:.0f}x{l_mm:.0f} "
             
-            return count, height_str, overrides_str
+            # Comprehensive Stats per Level
+            per_floor_stats = {}
+            for lvl in levels:
+                l_id = lvl.Id
+                level_filter = DB.ElementLevelFilter(l_id)
+                
+                def count_cat(category_bit):
+                    return DB.FilteredElementCollector(doc).OfCategory(category_bit).WhereElementIsNotElementType().WherePasses(level_filter).GetElementCount()
+                
+                per_floor_stats[lvl.Name] = {
+                    "walls": DB.FilteredElementCollector(doc).OfClass(DB.Wall).WherePasses(level_filter).GetElementCount(),
+                    "floors": DB.FilteredElementCollector(doc).OfClass(DB.Floor).WherePasses(level_filter).GetElementCount(),
+                    "doors": count_cat(DB.BuiltInCategory.OST_Doors),
+                    "windows": count_cat(DB.BuiltInCategory.OST_Windows),
+                    "columns": count_cat(DB.BuiltInCategory.OST_Columns) + count_cat(DB.BuiltInCategory.OST_StructuralColumns),
+                }
+
+            # Global Totals
+            wall_count = DB.FilteredElementCollector(doc).OfClass(DB.Wall).GetElementCount()
+            floor_count = DB.FilteredElementCollector(doc).OfClass(DB.Floor).GetElementCount()
+            door_count = DB.FilteredElementCollector(doc).OfCategory(DB.BuiltInCategory.OST_Doors).WhereElementIsNotElementType().GetElementCount()
+            win_count = DB.FilteredElementCollector(doc).OfCategory(DB.BuiltInCategory.OST_Windows).WhereElementIsNotElementType().GetElementCount()
+            col_count = DB.FilteredElementCollector(doc).OfCategory(DB.BuiltInCategory.OST_Columns).WhereElementIsNotElementType().GetElementCount()
+            scol_count = DB.FilteredElementCollector(doc).OfCategory(DB.BuiltInCategory.OST_StructuralColumns).WhereElementIsNotElementType().GetElementCount()
+            
+            # Measure Column Span (preserving existing fix)
+            col_span_mm = 10000 # Default fallback (10m)
+            ai_cols = []
+            col_collector = DB.FilteredElementCollector(doc).WhereElementIsNotElementType()
+            from System.Collections.Generic import List
+            cat_list = List[DB.BuiltInCategory]()
+            cat_list.Add(DB.BuiltInCategory.OST_Columns)
+            cat_list.Add(DB.BuiltInCategory.OST_StructuralColumns)
+            col_collector.WherePasses(DB.ElementMulticategoryFilter(cat_list))
+            
+            for el in col_collector:
+                p = el.get_Parameter(DB.BuiltInParameter.ALL_MODEL_INSTANCE_COMMENTS)
+                if not p: p = el.LookupParameter("Comments")
+                if p and p.HasValue and p.AsString() and "AI_Col_L1_" in p.AsString():
+                    ai_cols.append(el)
+            
+            if len(ai_cols) >= 2:
+                pts = [c.Location.Point for c in ai_cols]
+                pts.sort(key=lambda p: (round(p.X, 2), round(p.Y, 2)))
+                for i in range(len(pts)-1):
+                    p1, p2 = pts[i], pts[i+1]
+                    dist_ft = p1.DistanceTo(p2)
+                    if (abs(p1.X - p2.X) < 0.1 or abs(p1.Y - p2.Y) < 0.1) and dist_ft > 1.0:
+                        col_span_mm = round(dist_ft * 304.8 / 100.0) * 100.0
+                        break
+
+            stats = {
+                "levels": count,
+                "total_stats": {
+                    "walls": wall_count,
+                    "floors": floor_count,
+                    "doors": door_count,
+                    "windows": win_count,
+                    "columns": col_count + scol_count
+                },
+                "per_floor_breakdown": per_floor_stats,
+                "current_column_span": col_span_mm
+            }
+            
+            return count, height_str, overrides_str, stats
 
         # OPTIMIZATION: Advanced Cache with 30s TTL
         import time
@@ -75,18 +139,22 @@ class Orchestrator:
                 refresh_needed = False
         
         if not refresh_needed:
-            self.log("Dispatcher: Using cached BIM state (Age: {:.1f}s)".format(now - self._cache_time))
+            self.log("[{}] Dispatcher: Using cached BIM state (Age: {:.1f}s)".format(time.time(), now - self._cache_time))
             state_text = self._cached_state
         else:
             try:
-                self.log("Dispatcher: Gathering fresh BIM state from Revit...")
-                cur_levels, cur_heights, cur_overrides = mcp_event_handler.run_on_main_thread(gather_state)
+                self.log("[{}] Dispatcher: Gathering fresh BIM state from Revit...".format(time.time()))
+                cur_levels, cur_heights, cur_overrides, cur_stats = mcp_event_handler.run_on_main_thread(gather_state)
                 self.log("BIM state gathered: {} levels found.".format(cur_levels))
                 storeys = max(1, cur_levels - 1)
                 state_text = f"CURRENT BIM STATE: {storeys} storeys. "
                 if cur_heights: state_text += f"\nEXISTING HEIGHTS: {cur_heights}"
                 if cur_overrides: state_text += f"\nEXISTING OVERRIDES: {cur_overrides}"
-                state_text += f"\nCRITICAL: Preserve existing heights/overrides unless asked to change."
+                if cur_stats: 
+                    state_text += f"\nPROJECT TOTALS: {json.dumps(cur_stats['total_stats'])}"
+                    state_text += f"\nPER-FLOOR BREAKDOWN: {json.dumps(cur_stats['per_floor_breakdown'])}"
+                    state_text += f"\nDETECTED COLUMN SPAN: {cur_stats['current_column_span']}mm"
+                state_text += f"\nCRITICAL: Refer to PER-FLOOR BREAKDOWN for detailed queries. Preserve existing state unless asked to change."
                 self._cached_state = state_text
                 self._cache_time = now
             except Exception as e:
@@ -105,6 +173,18 @@ class Orchestrator:
             manifest_str = self._extract_json(manifest_json)
             manifest = json.loads(manifest_str)
             self.log("Manifest parsed successfully.")
+            
+            # UNWRAP AI TOOL-CALL-STYLE WRAPPERS
+            for wrapper in ["orchestrate_build", "edit_entire_building_dimensions"]:
+                if wrapper in manifest and len(manifest) == 1:
+                    self.log(f"Dispatcher: Unwrapping manifest from '{wrapper}' key.")
+                    manifest = manifest[wrapper]
+                    break
+            
+            # CHECK FOR QUERY RESPONSE
+            if "response" in manifest and not any(k in manifest for k in ["project_setup", "levels", "shell"]):
+                self.log("Dispatcher: AI detected a QUESTION. Returning natural language response.")
+                return str(manifest["response"])
         except Exception as e:
             import traceback
             err = "Manifest Parsing Error: {}\n{}".format(str(e), traceback.format_exc())
