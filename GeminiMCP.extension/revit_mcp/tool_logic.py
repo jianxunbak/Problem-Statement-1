@@ -55,10 +55,18 @@ def create_wall_ui(params):
     
     level = find_level(doc, params.get('level_name') or params.get('level_id'))
     
+    from revit_mcp.utils import nuclear_lockdown
+    nuclear_lockdown(doc)
+    
     t = DB.Transaction(doc, "MCP: Create Wall")
     t.Start()
+    from revit_mcp.utils import setup_failure_handling
+    setup_failure_handling(t, use_nuclear=True)
     new_wall = DB.Wall.Create(doc, line, level.Id, False)
     state_manager.set_ai_metadata(new_wall, params.get('ai_id') or "AI_Wall_{}".format(new_wall.Id.Value))
+    from revit_mcp.utils import disallow_joins
+    # POST-CREATION LOCK
+    disallow_joins(new_wall)
     
     param = new_wall.get_Parameter(DB.BuiltInParameter.WALL_USER_HEIGHT_PARAM)
     if param: param.Set(mm_to_ft(params.get('height_mm', 3000)))
@@ -171,6 +179,8 @@ def create_floor_ui(params):
         lvl = find_level(doc, params.get('level_name') or params.get('level_id'))
         ftype = DB.FilteredElementCollector(doc).OfClass(DB.FloorType).FirstElement()
         t = DB.Transaction(doc, "MCP: Create Floor"); t.Start()
+        from revit_mcp.utils import setup_failure_handling
+        setup_failure_handling(t, use_nuclear=True)
         new_floor = DB.Floor.Create(doc, loops, ftype.Id, lvl.Id)
         state_manager.set_ai_metadata(new_floor, params.get('ai_id') or "AI_Floor_{}".format(new_floor.Id.Value))
         t.Commit()
@@ -361,7 +371,10 @@ def create_polygon_floor_ui(params):
     loops = Generic.List[DB.CurveLoop](); loops.Add(loop)
     lvl = find_level(doc, params.get('level_name') or params.get('level_id'))
     ftype = DB.FilteredElementCollector(doc).OfClass(DB.FloorType).FirstElement()
-    t = DB.Transaction(doc, "MCP: Poly Floor"); t.Start(); nf = DB.Floor.Create(doc, loops, ftype.Id, lvl.Id); t.Commit()
+    t = DB.Transaction(doc, "MCP: Poly Floor"); t.Start()
+    from revit_mcp.utils import setup_failure_handling
+    setup_failure_handling(t, use_nuclear=True)
+    nf = DB.Floor.Create(doc, loops, ftype.Id, lvl.Id); t.Commit()
     return {"success": True, "id": str(nf.Id.Value)}
 
 def create_level_ui(elevation_mm):

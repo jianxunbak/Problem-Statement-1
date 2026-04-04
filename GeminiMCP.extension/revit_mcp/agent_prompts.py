@@ -20,14 +20,15 @@ Architectural Logic:
 - **Deletions**: When asked to "delete" or "remove" storeys, identify the storeys by their current index or height and EXCLUDE them from the manifest. Ensure all other storeys remain with their original metadata.
 - **Cantilevers**: Achieve these by setting different `width`/`length` in `floor_overrides`, OR by using `cantilever_depth` (in mm). Use "random" ONLY if the user explicitly asks for random or varied cantilevers.
 - **Parapets**: Use `"parapet_height": 1000` (mm) in `shell` or `floor_overrides` to add safety walls to slab edges.
-- **Vertical Circulation**: Use the `"lifts"` object for stair/lift cores. It automatically calculates the number of lifts required based on occupancy load (default 10sqm/person).
+- **Vertical Circulation**: Use the `"lifts"` object for lift cores. Staircases are **auto-generated** at both Y-ends of the lift core as a compact rectangular assembly. They adapt to floor height and count changes automatically.
 - **Lifts Configuration**: `"lifts": { "count": 4, "position": [0,0], "occupancy_density": 0.1 }`. If count is omitted, it's calculated using RTT formula. It handles shared walls and lobbies.
+- **Staircases**: Auto-generated with min 2 per building. Positioned at Y-ends of the lift core, aligned to core width. Additional staircases added automatically if any floor-plate point exceeds 60m travel distance to 2 staircases. Floor slabs are voided at staircase locations. No columns placed inside staircase footprint.
 - **Building Presets**: If the user asks for a specific building type (e.g. "Office Tower"), check the "BUILDING PRESETS" section in the prompt. Apply that DNA immediately (first floor height, typical floor height, occupancy, etc.) even if the user didn't specify those details.
-- **Architectural Organization**: 
-    - **Core**: Aim for a "Central" core that occupies **20-25%** of the typical floor area. include at least **2 fire escape staircases**.
+- **Architectural Organization**:
+    - **Core**: Aim for a "Central" core that occupies **20-25%** of the typical floor area. The core includes lift shafts + staircases as one compact rectangle.
     - **Office Area**: Surround the core with open office space at the **building perimeter**.
     - **Efficiency**: Maintain a target depth of **10-12m minimum** from the facade to the core wall to ensure daylight access and premium office space.
-    - **Columns**: Offset perimeter columns by **1000mm** from the floor edge for architectural recessed effects.
+    - **Columns**: Offset perimeter columns by **1000mm** from the floor edge for architectural recessed effects. No columns inside the core (lifts + staircases) footprint.
 - **Granular Control**: For precise additions or edits, use the root keys `walls`, `floors`, or `columns` for individual elements. Use stable IDs like `AI_Wall_Custom_1` to ensure they persist across edits.
 
 
@@ -46,6 +47,9 @@ JSON TEMPLATE:
       "count": "random",
       "position": [0, 0],
       "occupancy_density": 0.1
+  },
+  "staircases": {
+      "count": 2
   },
   "walls": [
       { "id": "AI_Wall_Manual_1", "level_id": "AI_Level_7", "start": [0,0,0], "end": [5000,0,0], "height": 1000 }

@@ -17,7 +17,7 @@
         12000,
         15000
       ],
-      "offset_from_edge": 1000
+      "offset_from_edge": 500
     },
     "program_requirements": {
       "occupancy_load_factor": 10.0,
@@ -35,6 +35,13 @@
       ],
       "fire_safety": {
         "fire_escape_staircases": 2,
+        "max_travel_distance": 60000,
+        "staircase_spec": {
+          "riser": 150,
+          "tread": 275,
+          "width_of_flight": 1500,
+          "landing_width": 1800
+        },
         "fire_fighting_lifts": 2,
         "fire_fighting_lift_lobby": [
           2000,

@@ -3,35 +3,43 @@ import math
 
 def calculate_lift_requirements(num_floors, avg_floor_height_mm, total_building_occupancy, target_interval=25.0):
     """
-    Calculate the number of lifts required based on Round Trip Time (RTT).
+    Calculate the number of lifts using Round Trip Time (RTT) analysis.
+    Uses the RTT method from BS EN 81-20 / CIBSE Guide D.
+    Result is capped at realistic architectural norms to prevent absurd counts.
     """
     total_height_m = (num_floors * avg_floor_height_mm) / 1000.0
-    H = total_height_m * 0.8 # Highest reversal floor
-    
-    # V (Rated Velocity) based on building height
-    if total_height_m < 30: V = 1.6
+    H = total_height_m * 0.8  # Average highest reversal floor
+
+    # Lift speed by building height
+    if total_height_m < 30:   V = 1.6
     elif total_height_m < 60: V = 2.5
     elif total_height_m < 120: V = 5.0
-    else: V = 7.0
-        
-    P = 10 # Average passengers per trip
+    else:                      V = 7.0
+
+    P = 10    # Average passengers per trip
     n = float(num_floors)
-    if n > 1:
-        S = n * (1 - math.pow(1 - 1/n, P))
-    else:
-        S = 1
-        
-    t_d = 4.0   
-    t_p = 1.1   
-    
+    S = n * (1 - math.pow(1 - 1.0 / n, P)) if n > 1 else 1.0
+
+    t_d = 4.0   # Door open+close time per stop (s)
+    t_p = 1.1   # Passenger transfer time per person (s)
+
     RTT = (2 * H / V) + (S + 1) * t_d + (2 * P * t_p)
-    num_lifts = math.ceil(RTT / target_interval)
-    
-    # Minimum lifts by population coverage (Standard: ~1 lift per 350-400 people for office)
-    # Raising to 400 to avoid excessive counts in mid-rise towers
-    min_lifts_by_pop = math.ceil(total_building_occupancy / 400.0)
-    
-    return int(max(num_lifts, min_lifts_by_pop))
+
+    # 5-minute peak demand: typically 12% of occupancy tries to travel in 5 min
+    # Each lift carries P passengers per RTT seconds.
+    # Lifts needed = peak_demand / (P * 300 / RTT)
+    peak_demand = total_building_occupancy * 0.12   # 12% in 5 min
+    handling_capacity_per_lift = P * (300.0 / RTT)   # persons per 5 min per lift
+    lifts_by_demand = math.ceil(peak_demand / handling_capacity_per_lift) if handling_capacity_per_lift > 0 else 2
+
+    # Both approaches give a number; take the max but hard-cap at realistic values.
+    # Real office towers: roughly 1 lift per 35-50k m² NLA or per ~2000 occupants.
+    # Hard cap: 1 lift per 1500 occupants (generous), minimum 2.
+    max_from_pop = max(2, int(math.ceil(total_building_occupancy / 1500.0)))
+    num_lifts = max(lifts_by_demand, 2)
+    num_lifts = min(num_lifts, max_from_pop)  # Never exceed population-based cap
+
+    return int(num_lifts)
 
 def get_core_dimensions(num_lifts, internal_size=(2500, 2500), lobby_width=3000):
     """Calculates the total width and depth of a SINGLE lift core block (max 12)."""
@@ -80,15 +88,79 @@ def get_total_core_layout(num_lifts, internal_size=(2500, 2500), lobby_width=300
         "total_d": total_d
     }
 
+def get_block_y_offset(b_idx, num_blocks, block_d):
+    """
+    STABLE LAYOUT: Block 0 is always at center (0 offset).
+    Subsequent blocks alternate around it.
+    This prevents Scenario 2 'Broken Pieces' by keeping B1 stationary.
+    """
+    if b_idx == 0: return 0.0
+    # Alternating offsets: 1 -> +d, 2 -> -d, 3 -> +2d, 4 -> -2d
+    magnitude = ((b_idx + 1) // 2) * block_d
+    direction = 1 if b_idx % 2 != 0 else -1
+    return magnitude * direction
+
+
+def get_shaft_void_rectangles_mm(num_lifts, center_pos=(0, 0), internal_size=(2500, 2500), lobby_width=3000):
+    """
+    Returns a list of (x1, y1, x2, y2) mm rectangles for the INNER CLEAR SPACE of each
+    individual lift shaft.  These are used to cut floor-slab openings.
+    The rectangles are aligned to the inner faces of the shaft walls (offset by wall
+    thickness t = 200 mm inward from the outer wall face).
+    One rectangle per lift car — e.g. 4 lifts → 4 rectangles.
+    Multi-block layouts (>12 lifts) are handled by the caller, which calls this function
+    once per block with the per-block center_pos.
+    """
+    w, l = internal_size
+    t = 200  # wall thickness (same as in generate_lift_shaft_manifest)
+
+    total_in_block = min(12, num_lifts)
+    if total_in_block >= 4:
+        n1 = int(math.ceil(total_in_block / 2.0))
+        n2 = int(math.floor(total_in_block / 2.0))
+    else:
+        n1 = total_in_block
+        n2 = 0
+
+    row1_w = (n1 * w) + ((n1 + 1) * t)
+    row2_w = (n2 * w) + ((n2 + 1) * t) if n2 > 0 else 0
+    max_block_w = max(row1_w, row2_w)
+    shaft_depth = l + (2 * t)
+
+    voids = []
+
+    def _row_voids(n_lifts, row_y_offset):
+        this_row_w = (n_lifts * w) + ((n_lifts + 1) * t)
+        # Centre the row relative to max_block_w (same logic as generate_lift_shaft_manifest)
+        row_base_x = center_pos[0] - (max_block_w / 2.0) + (max_block_w - this_row_w) / 2.0
+        base_y = center_pos[1] + row_y_offset
+        for j in range(n_lifts):
+            x1 = row_base_x + j * (w + t) + (t / 2.0)
+            x2 = x1 + w
+            y1 = base_y + (t / 2.0)
+            y2 = y1 + l + t
+            voids.append((x1, y1, x2, y2))
+
+    if n1 > 0:
+        if n2 > 0:
+            _row_voids(n1, -(shaft_depth + lobby_width / 2.0))
+            _row_voids(n2, lobby_width / 2.0)
+        else:
+            _row_voids(n1, -(shaft_depth / 2.0))
+
+    return voids
+
+
 def generate_lift_shaft_manifest(num_lifts, levels_data, center_pos=(0, 0), internal_size=(2500, 2500), lobby_width=3000):
     """
     Generates manifest data for lift shafts centered around center_pos.
-    Each row is independently centered for visual symmetry.
+    Both rows are aligned to the same max_block_width for correct visual symmetry.
+    Wall IDs use the level name (e.g. AI Level 3) for stable re-identification.
     """
     walls = []
-    w, l = internal_size # 2500x2500
-    t = 200 # wall thickness
-    
+    w, l = internal_size
+    t = 200  # wall thickness
+
     # Symmetry: Split into two rows if >= 4 lifts
     if num_lifts >= 4:
         total_in_block = min(12, num_lifts)
@@ -97,76 +169,85 @@ def generate_lift_shaft_manifest(num_lifts, levels_data, center_pos=(0, 0), inte
     else:
         lifts_in_row1 = int(num_lifts)
         lifts_in_row2 = 0
-    
+
+    # PRE-COMPUTE max block width so BOTH rows are centered relative to it.
+    # This prevents the visual off-centre look when rows have unequal lift counts.
+    row1_width = (lifts_in_row1 * w) + ((lifts_in_row1 + 1) * t)
+    row2_width = (lifts_in_row2 * w) + ((lifts_in_row2 + 1) * t) if lifts_in_row2 > 0 else 0
+    max_block_width = max(row1_width, row2_width)
+
     def create_row_manifest(n_lifts, row_y_offset, row_tag_prefix):
         row_walls = []
         row_floors = []
-        # Calculate width of THIS specific row
         this_row_width = (n_lifts * w) + ((n_lifts + 1) * t)
         block_depth = l + (2 * t)
-        
-        # Center this row's X-coordinate relative to center_pos
-        row_base_x = center_pos[0] - (this_row_width / 2.0)
-        
+
+        # FIX: Center relative to max_block_width, not this_row_width.
+        # This keeps both rows visually aligned to the same X boundary.
+        row_base_x = center_pos[0] - (max_block_width / 2.0) + (max_block_width - this_row_width) / 2.0
+
         for i, lvl in enumerate(levels_data):
             lvl_id = lvl['id']
             is_last = (i == len(levels_data) - 1)
-            
+
             base_y = center_pos[1] + row_y_offset
-            
-            # 1. Outer Frame
-            # Front
+
+            # Wall height from elevation delta
+            wall_h = 4000.0
+            if not is_last and i + 1 < len(levels_data):
+                wall_h = levels_data[i + 1].get('elevation', 0) - lvl.get('elevation', 0)
+
+            # FIX: Use level NAME as ID tag component (not loop index) for stable re-identification.
+            # The level name is always deterministic: "AI Level 1", "AI Level 2" etc.
+            safe_lvl_tag = lvl_id.replace(" ", "_")  # e.g. "AI_Level_3"
+            common_props = {"level_id": lvl_id, "height": wall_h}
+
             row_walls.append({
-                "id": f"AI_{row_tag_prefix}_L{i+1}_W_Front",
-                "level_id": lvl_id,
+                "id": "AI_{}__{}_W_Front".format(row_tag_prefix, safe_lvl_tag),
                 "start": [row_base_x, base_y, 0],
-                "end": [row_base_x + this_row_width, base_y, 0]
+                "end": [row_base_x + this_row_width, base_y, 0],
+                **common_props
             })
-            # Back
             row_walls.append({
-                "id": f"AI_{row_tag_prefix}_L{i+1}_W_Back",
-                "level_id": lvl_id,
+                "id": "AI_{}__{}_W_Back".format(row_tag_prefix, safe_lvl_tag),
                 "start": [row_base_x, base_y + block_depth, 0],
-                "end": [row_base_x + this_row_width, base_y + block_depth, 0]
+                "end": [row_base_x + this_row_width, base_y + block_depth, 0],
+                **common_props
             })
-            # Left
             row_walls.append({
-                "id": f"AI_{row_tag_prefix}_L{i+1}_W_Left",
-                "level_id": lvl_id,
+                "id": "AI_{}__{}_W_Left".format(row_tag_prefix, safe_lvl_tag),
                 "start": [row_base_x, base_y, 0],
-                "end": [row_base_x, base_y + block_depth, 0]
+                "end": [row_base_x, base_y + block_depth, 0],
+                **common_props
             })
-            # Right
             row_walls.append({
-                "id": f"AI_{row_tag_prefix}_L{i+1}_W_Right",
-                "level_id": lvl_id,
+                "id": "AI_{}__{}_W_Right".format(row_tag_prefix, safe_lvl_tag),
                 "start": [row_base_x + this_row_width, base_y, 0],
-                "end": [row_base_x + this_row_width, base_y + block_depth, 0]
+                "end": [row_base_x + this_row_width, base_y + block_depth, 0],
+                **common_props
             })
-            
-            # 2. Internal Dividers (Shared Walls)
+
+            # Internal Dividers
             for j in range(1, n_lifts):
                 div_x = row_base_x + (j * (w + t))
                 row_walls.append({
-                    "id": f"AI_{row_tag_prefix}_L{i+1}_Div{j}",
-                    "level_id": lvl_id,
+                    "id": "AI_{}__{}__Div{}".format(row_tag_prefix, safe_lvl_tag, j),
                     "start": [div_x, base_y, 0],
-                    "end": [div_x, base_y + block_depth, 0]
+                    "end": [div_x, base_y + block_depth, 0],
+                    **common_props
                 })
 
-            # 3. Handle Overrun and TOP CAP Slab on Last Floor
+            # TOP CAP on last level (overrun walls + closing slab)
             if is_last:
                 for wall in row_walls:
                     if wall['level_id'] == lvl_id:
-                        wall['height'] = 5000 
-                
-                # Add a slab to close the top of this row
-                # Bounds: row_base_x -> row_base_x + this_row_width, base_y -> base_y + block_depth
+                        wall['height'] = 5000
+
                 ov_elevation = lvl.get('elevation', 0) + 5000
                 row_floors.append({
-                    "id": f"AI_{row_tag_prefix}_TOPCAP",
+                    "id": "AI_{}__TOPCAP".format(row_tag_prefix),
                     "level_id": lvl_id,
-                    "elevation": ov_elevation, 
+                    "elevation": ov_elevation,
                     "points": [
                         [row_base_x, base_y],
                         [row_base_x + this_row_width, base_y],
@@ -174,26 +255,29 @@ def generate_lift_shaft_manifest(num_lifts, levels_data, center_pos=(0, 0), inte
                         [row_base_x, base_y + block_depth]
                     ]
                 })
-        
+
         return row_walls, row_floors
 
-    # Calculate Y-offsets relative to center_pos
+    # Y-offsets
     shaft_depth = l + (2 * t)
     all_walls = []
     all_floors = []
-    
+
     if lifts_in_row1 > 0:
         if lifts_in_row2 > 0:
-            r1_y_start = -(shaft_depth + lobby_width/2.0)
-            r2_y_start = (lobby_width/2.0)
+            r1_y_start = -(shaft_depth + lobby_width / 2.0)
+            r2_y_start = (lobby_width / 2.0)
             w1, f1 = create_row_manifest(lifts_in_row1, r1_y_start, "LiftR1")
             w2, f2 = create_row_manifest(lifts_in_row2, r2_y_start, "LiftR2")
-            all_walls.extend(w1); all_walls.extend(w2)
-            all_floors.extend(f1); all_floors.extend(f2)
+            all_walls.extend(w1)
+            all_walls.extend(w2)
+            all_floors.extend(f1)
+            all_floors.extend(f2)
         else:
             r1_y_start = -(shaft_depth / 2.0)
             w1, f1 = create_row_manifest(lifts_in_row1, r1_y_start, "LiftR1")
             all_walls.extend(w1)
             all_floors.extend(f1)
-        
+
     return {"walls": all_walls, "floors": all_floors}
+

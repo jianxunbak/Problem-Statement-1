@@ -12,6 +12,7 @@ from revit_mcp.state_manager import state_manager
 
 from revit_mcp.utils import safe_num, mm_to_ft, load_presets
 from . import lift_logic
+from . import staircase_logic
 
 def get_model_registry(doc, zone_bbox=None):
     """
@@ -74,6 +75,12 @@ class BuildingSystem:
             
         worker_log("Starting sync_manifest execution...")
         import Autodesk.Revit.DB as DB # type: ignore
+        from revit_mcp.building_generator import get_model_registry
+        from revit_mcp.utils import mm_to_ft, safe_num, setup_failure_handling, nuclear_lockdown
+        
+        # 0. NUCLEAR LOCKDOWN: Forcefully disjoint all walls before any sync moves
+        nuclear_lockdown(self.doc)
+        
         results = []
         self.registry = get_model_registry(self.doc)
         
@@ -90,6 +97,8 @@ class BuildingSystem:
             worker_log("PHASE 1: Syncing Levels...")
             t = DB.Transaction(self.doc, "AI Sync: Levels")
             t.Start()
+            from revit_mcp.utils import setup_failure_handling
+            setup_failure_handling(t, use_nuclear=True)
             level_map = {} # AI_ID -> Revit Level
             levels_data = manifest.get('levels', [])
             for l_data in levels_data:
@@ -103,6 +112,8 @@ class BuildingSystem:
             worker_log("PHASE 2: Syncing Shell (Walls & Floors)...")
             t = DB.Transaction(self.doc, "AI Sync: Shell")
             t.Start()
+            from revit_mcp.utils import setup_failure_handling
+            setup_failure_handling(t, use_nuclear=True)
             walls_count = 0
             for w_data in manifest.get('walls', []):
                 wall = self._sync_wall(w_data, level_map)
@@ -114,11 +125,16 @@ class BuildingSystem:
                 floor = self._sync_floor(f_data, level_map)
                 results.append({"type": "floor", "id": f_data['id'], "revit_id": str(floor.Id.Value)})
                 floors_count += 1
+                
+            t.Commit()
+            worker_log("Shell synced: {} walls, {} floors.".format(walls_count, floors_count))
             
             # --- PHASE 3: COLUMNS ---
             worker_log("PHASE 3: Syncing Columns...")
             t = DB.Transaction(self.doc, "AI Sync: Columns")
             t.Start()
+            from revit_mcp.utils import setup_failure_handling
+            setup_failure_handling(t, use_nuclear=True)
             cols_count = 0
             for c_data in manifest.get('columns', []):
                 col = self._sync_column(c_data, level_map)
@@ -178,12 +194,19 @@ class BuildingSystem:
         if ai_id in self.registry:
             wall = self.doc.GetElement(self.registry[ai_id])
             
-        if wall and isinstance(wall, DB.Wall):
             # Update existing
+            from revit_mcp.utils import disallow_joins
+            # PRE-MOVE LOCK
+            disallow_joins(wall)
             wall.Location.Curve = line
+            # POST-MOVE RE-ENFORCE
+            disallow_joins(wall)
         else:
             # Create new
             wall = DB.Wall.Create(self.doc, line, level.Id, False)
+            from revit_mcp.utils import disallow_joins
+            # POST-CREATION LOCK
+            disallow_joins(wall)
             state_manager.set_ai_metadata(wall, ai_id)
             
         # Set Type if specified
@@ -420,6 +443,9 @@ class BuildingSystem:
         lift_walls = []
         core_bounds = None # (xmin, ymin, xmax, ymax)
         
+        # Default Centroid
+        f_center_x, f_center_y = 0.0, 0.0
+        
         if lifts_config or num_storeys >= 3 or shell.get("include_lifts"):
             from . import lift_logic
             
@@ -428,27 +454,17 @@ class BuildingSystem:
             efficiency = preset.get("building_identity", {}).get("target_efficiency", 0.82)
             load_factor = preset.get("program_requirements", {}).get("occupancy_load_factor", 10.0)
             
-            # Floor Centroid Detection
-            min_x, min_y = float('inf'), float('inf')
-            max_x, max_y = float('-inf'), float('-inf')
-            
-            for f in new_floors:
-                pts = f.get("points", [])
-                if len(pts) >= 3:
-                    xs = [p[0] for p in pts]
-                    ys = [p[1] for p in pts]
-                    min_x = min(min_x, min(xs))
-                    max_x = max(max_x, max(xs))
-                    min_y = min(min_y, min(ys))
-                    max_y = max(max_y, max(ys))
-                    
-                    raw_area = (max(xs) - min(xs)) * (max(ys) - min(ys))
-                    usable_area = raw_area * efficiency
-                    total_occ += (usable_area / 1000000.0) / load_factor
-            
-            # Geometric Center of the building
-            f_center_x = (min_x + max_x) / 2.0 if max_x > min_x else 0.0
-            f_center_y = (min_y + max_y) / 2.0 if max_y > min_y else 0.0
+            # STABLE ANCHORING: Use Level 1 Centroid for core placement.
+            # This prevents core 'shivering' when upper floor plate sizes are modified.
+            l1_floor = next((f for f in new_floors if f.get("level_id") == "AI_Level_1"), new_floors[0])
+            l1_pts = l1_floor.get("points", [])
+            if len(l1_pts) >= 3:
+                l1_xs = [p[0] for p in l1_pts]
+                l1_ys = [p[1] for p in l1_pts]
+                f_center_x = (min(l1_xs) + max(l1_xs)) / 2.0
+                f_center_y = (min(l1_ys) + max(l1_ys)) / 2.0
+            else:
+                f_center_x, f_center_y = 0.0, 0.0
             
             num_lifts = lifts_config.get("count")
             if num_lifts is None or num_lifts == "random":
@@ -481,7 +497,8 @@ class BuildingSystem:
                 # Since layout['total_d'] is based on (0,0), we offset from building center
                 # Each block has its own internal lobby. 
                 # For multiple blocks, we stack them relative to the building center.
-                b_y_offset = (b_idx - (layout['num_blocks']-1)/2.0) * layout['block_d']
+                # STABLE OFFSET: Block 1 is always at center (0 offset).
+                b_y_offset = lift_logic.get_block_y_offset(b_idx, layout['num_blocks'], layout['block_d'])
                 b_center_pos = [center_pos[0], center_pos[1] + b_y_offset]
                 
                 b_manifest = lift_logic.generate_lift_shaft_manifest(
@@ -491,84 +508,145 @@ class BuildingSystem:
                     lobby_width=lobby_w
                 )
                 # Tag elements with block index to avoid ID collision
-                for w in b_walls:
-                    w['id'] = f"{w['id']}_B{b_idx+1}"
+                for w in b_manifest.get("walls", []):
+                    w['id'] = "{}_B{}".format(w['id'], b_idx + 1)
                     lift_walls.append(w)
                 
                 for f in b_manifest.get("floors", []):
-                    f['id'] = f"{f['id']}_B{b_idx+1}"
+                    f['id'] = "{}_B{}".format(f['id'], b_idx + 1)
                     new_floors.append(f)
             
-            new_walls.extend(lift_walls)
-            
-            # Calculate Core Bounds for Column Culling
             if lift_walls:
+                new_walls.extend(lift_walls)
                 xs = [w['start'][0] for w in lift_walls] + [w['end'][0] for w in lift_walls]
                 ys = [w['start'][1] for w in lift_walls] + [w['end'][1] for w in lift_walls]
-                core_bounds = (min(xs), min(ys), max(xs), max(ys))
+                l_bounds = (min(xs), min(ys), max(xs), max(ys))
+                if core_bounds:
+                    core_bounds = (
+                        min(core_bounds[0], l_bounds[0]),
+                        min(core_bounds[1], l_bounds[1]),
+                        max(core_bounds[2], l_bounds[2]),
+                        max(core_bounds[3], l_bounds[3])
+                    )
+                else:
+                    core_bounds = l_bounds
+
+        # --- STAIRCASE GENERATION ---
+        preset_fs = preset.get("core_logic", {}).get("fire_safety", {})
+        p_num_stairs = preset_fs.get("fire_escape_staircases", 2)
+        p_stair_spec = preset_fs.get("staircase_spec", {})
+        max_travel = safe_num(preset_fs.get("max_travel_distance", 60000), 60000)
+
+        m_stair_config = manifest.get("staircases", {})
+        num_stairs = int(safe_num(m_stair_config.get("count", p_num_stairs), p_num_stairs))
+        if num_storeys >= 2:
+            num_stairs = max(num_stairs, 2)
+
+        stair_spec = p_stair_spec.copy()
+        m_spec = m_stair_config.get("spec", {})
+        for k in ["riser", "tread", "width_of_flight", "landing_width"]:
+            if k in m_spec:
+                stair_spec[k] = safe_num(m_spec[k], stair_spec.get(k))
+
+        if num_stairs > 0 and num_storeys >= 2:
+            # Floor dims for 60 m rule check (use base envelope)
+            floor_dims_for_stairs = [(width, length)]
+
+            # Calculate positions: at Y-ends of lift core, with 60 m check
+            positions = staircase_logic.calculate_staircase_positions(
+                floor_dims_for_stairs,
+                (f_center_x, f_center_y),
+                core_bounds,  # already mm in this path
+                base_height,
+                stair_spec,
+                max_travel
+            )
+
+            # Enclosure width = lift core width for alignment (rule c)
+            lift_core_w = (core_bounds[2] - core_bounds[0]) if core_bounds else 0
+            shaft_w_nat, shaft_d = staircase_logic.get_shaft_dimensions(base_height, stair_spec)
+            enc_w = max(lift_core_w, shaft_w_nat)
+
+            stair_manifest = staircase_logic.generate_staircase_manifest(
+                positions, new_levels, enc_w, stair_spec
+            )
+
+            new_walls.extend(stair_manifest.get("walls", []))
+            new_floors.extend(stair_manifest.get("floors", []))
+
+            # Update Core Bounds for Column Culling
+            if stair_manifest.get("walls"):
+                s_xs = [w['start'][0] for w in stair_manifest['walls']] + [w['end'][0] for w in stair_manifest['walls']]
+                s_ys = [w['start'][1] for w in stair_manifest['walls']] + [w['end'][1] for w in stair_manifest['walls']]
+                if core_bounds:
+                    core_bounds = (
+                        min(core_bounds[0], min(s_xs)),
+                        min(core_bounds[1], min(s_ys)),
+                        max(core_bounds[2], max(s_xs)),
+                        max(core_bounds[3], max(s_ys))
+                    )
+                else:
+                    core_bounds = (min(s_xs), min(s_ys), max(s_xs), max(s_ys))
 
         # --- COLUMN GENERATION ---
+        # Uniform grid from center + edge columns always at offset_from_edge.
+        # Core is structural — no columns inside core footprint.
         new_columns = []
-        col_span = safe_num(shell.get("column_span", shell.get("column_spacing")), None)
-        
-        # Synthesis Result fallback if no explicit override
-        if col_span is None: 
-            col_span = synth_col_span
-        
+        # Use synthesis span (already optimized for building dimensions)
+        col_span = synth_col_span
         if col_span % 300 != 0: col_span = round(col_span / 300.0) * 300.0
-        
-        base_w = width
-        base_l = length
-        col_offset = dna_offset
-        if col_offset > 0:
-            base_w -= (2 * col_offset)
-            base_l -= (2 * col_offset)
-            
+
+        col_offset = dna_offset  # offset_from_edge in mm
+
         center_only = shell.get("columns_center_only", False) or "center area" in str(shell).lower()
 
-        def get_grid_offsets(dim_mm, span_mm, center_only=False, anchor_x=0.0):
-            span_ft = mm_to_ft(span_mm)
-            half_dim_ft = mm_to_ft(dim_mm) / 2.0
-            anchor_ft = mm_to_ft(anchor_x)
-            
-            offsets = []
-            # Start from anchor and go both ways
-            curr = anchor_ft
-            while curr <= half_dim_ft + 0.1:
-                offsets.append(curr)
-                curr += span_ft
-            curr = anchor_ft - span_ft
-            while curr >= -half_dim_ft - 0.1:
-                offsets.append(curr)
-                curr -= span_ft
-            
-            clean_offsets_ft = sorted(list(set(round(o, 4) for o in offsets)))
-            if center_only and len(clean_offsets_ft) >= 3:
-                clean_offsets_ft = [o for o in clean_offsets_ft if abs(o) < half_dim_ft - 0.1]
-                
-            from revit_mcp.utils import ft_to_mm
-            return [ft_to_mm(o) for o in clean_offsets_ft]
+        def get_grid_offsets_mm(dim_mm, span_mm, anchor_mm=0.0):
+            """Uniform grid from anchor + edge columns always at offset_from_edge (all mm)."""
+            half_dim = dim_mm / 2.0
+            limit = half_dim - col_offset
+            offsets = set()
+            # Always include edge columns
+            offsets.add(round(limit, 1))
+            offsets.add(round(-limit, 1))
+            # Regular grid from anchor
+            curr = anchor_mm
+            while curr <= limit + 1.0:
+                offsets.add(round(curr, 1))
+                curr += span_mm
+            curr = anchor_mm - span_mm
+            while curr >= -limit - 1.0:
+                offsets.add(round(curr, 1))
+                curr -= span_mm
+            return sorted(offsets)
 
-        # Use Building Centroid as Anchor
-        anchor_x = f_center_x
-        anchor_y = f_center_y
-            
-        x_offsets = get_grid_offsets(base_w, synth_span_w, center_only, anchor_x)
-        y_offsets = get_grid_offsets(base_l, synth_span_l, center_only, anchor_y)
-        
+        x_offsets = get_grid_offsets_mm(width, synth_span_w, f_center_x)
+        y_offsets = get_grid_offsets_mm(length, synth_span_l, f_center_y)
+
+        if core_bounds:
+            anchor_x = (core_bounds[0] + core_bounds[2]) / 2.0
+            anchor_y = (core_bounds[1] + core_bounds[3]) / 2.0
+        else:
+            anchor_x = f_center_x
+            anchor_y = f_center_y
+
+        if center_only:
+            half_w = width / 2.0
+            half_l = length / 2.0
+            x_offsets = [o for o in x_offsets if abs(o) < half_w - 1.0]
+            y_offsets = [o for o in y_offsets if abs(o) < half_l - 1.0]
+
         for k in range(num_storeys):
             lvl_id = "AI_Level_{}".format(k+1)
             top_lvl_id = "AI_Level_{}".format(k+2)
-            
+
             for ox_mm in x_offsets:
                 for oy_mm in y_offsets:
-                    # 1. CULLING: Don't place columns inside core bounding box
+                    # Cull columns strictly inside core footprint (core is structural)
                     if core_bounds:
-                        m = 500 
-                        if (core_bounds[0] - m <= ox_mm <= core_bounds[2] + m) and \
-                           (core_bounds[1] - m <= oy_mm <= core_bounds[3] + m):
+                        if (core_bounds[0] < ox_mm < core_bounds[2]) and \
+                           (core_bounds[1] < oy_mm < core_bounds[3]):
                             continue
-                            
+
                     # Calculate IX/IY relative to anchor
                     ix = int(round((ox_mm - anchor_x) / synth_span_w))
                     iy = int(round((oy_mm - anchor_y) / synth_span_l))
