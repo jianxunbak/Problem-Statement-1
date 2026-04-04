@@ -9,27 +9,36 @@ import time
 import socket
 
 # --- LOGGING ---
-LOG_FILE = os.path.join(os.path.dirname(__file__), "fastmcp_server.log")
+from .utils import get_log_path
+LOG_FILE = get_log_path()
 
 def log(msg):
     try:
+        path = get_log_path()
         timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
-        with open(LOG_FILE, "a") as f:
-            f.write("[{}] {}\n".format(timestamp, msg))
+        formatted = "[{}] {}\n".format(timestamp, str(msg))
+        with open(path, "a") as f:
+            f.write(formatted)
             f.flush()
-            os.fsync(f.fileno())
     except:
         pass
 
 class SilentIO(object):
     """Replaces Revit's ScriptIO - routes all output to our log file."""
     def write(self, s):
+        # Background threads MUST NOT touch the original sys.stdout (WPF console)
         if s and s.strip():
-            log(s.rstrip())
+            try:
+                log(s.rstrip())
+            except:
+                pass
     def flush(self): pass
     def isatty(self): return False
     @property
     def encoding(self): return "utf-8"
+    def writelines(self, lines):
+        for line in lines:
+            self.write(line)
 
 # --- GLOBALS ---
 _server_thread = None
@@ -128,30 +137,38 @@ def start_mcp_server():
         log("Main: Port 8001 in use. Re-linking existing server context.")
         try:
             from revit_mcp.server import set_revit_app
-            set_revit_app(__revit__)
-            log("Main: Existing server context re-linked.")
-            return True # Tell script.py to proceed as if started
+            uiapp = __revit__
+            set_revit_app(uiapp)
+            from revit_mcp.gemini_client import client # Pre-cache to avoid background thread import hangs
+            from revit_mcp.bridge import init_bridge
+            init_bridge(uiapp)
+            log("Main: Existing server context re-linked and bridge re-initialized.")
+            return True 
         except Exception as e:
             log("Main: Re-link failed: " + str(e))
             return False
 
     try:
         import asyncio
-        import uvicorn  # Pre-load into sys.modules
+        import importlib
         if sys.platform == 'win32':
             asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
+        from revit_mcp.gemini_client import client # Pre-import on main thread
         from revit_mcp.server import mcp, set_revit_app
-        from revit_mcp.bridge import mcp_event_handler  # noqa
-
+        from revit_mcp.bridge import init_bridge
+        
         try:
-            set_revit_app(__revit__)
+            from pyrevit import HOST_APP
+            uiapp = HOST_APP.uiapp
+            set_revit_app(uiapp)
             log("Main: UIApplication stored via set_revit_app.")
+            init_bridge(uiapp)
         except Exception as e:
-            log("Main: set_revit_app failed: " + str(e))
+            log("Main: init_bridge failed: " + str(e))
 
         log("Main: All components pre-loaded.")
-    except BaseException as e:
+    except Exception as e:
         log("Main Init ERROR: " + str(e))
         log(traceback.format_exc())
         return False
