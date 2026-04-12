@@ -60,13 +60,13 @@ def run_on_main_thread(func, *args, **kwargs):
     
     _work_queue.put((func, args, kwargs, event, result_wrapper, queued_at))
     
-    # Wait for completion (default 300s to avoid infinite hang)
-    if not event.wait(300):
+    # Wait for completion (default 1200s to avoid infinite hang on massive generations)
+    if not event.wait(1200):
         # Log timeout
         with open(LOG_PATH, "a") as f:
             f.write("[{}] Bridge: TIMEOUT waiting for main thread execution of {}\n".format(
                 datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"), str(func)))
-        raise TimeoutError("Revit main thread did not respond within 300s.")
+        raise TimeoutError("Revit main thread did not respond within 1200s.")
         
     if result_wrapper['error']:
         raise result_wrapper['error']

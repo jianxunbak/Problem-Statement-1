@@ -217,7 +217,9 @@ class AIChatWindow(object):
                 self.window.Dispatcher.BeginInvoke(Action(lambda: self.on_response_finished(err)))
                 return
 
-            response = orchestrator.run_full_stack(bridge._uiapp, prompt)
+            from revit_mcp.progress_tracker import BuildProgressTracker
+            tracker = BuildProgressTracker(callback=self.update_progress)
+            response = orchestrator.run_full_stack(bridge._uiapp, prompt, tracker=tracker)
             responded = True
             
             client.log("UI Thread: Response received.")
@@ -265,6 +267,34 @@ class AIChatWindow(object):
                 # Update history too
                 if len(self.history) > 0:
                     self.history[len(self.history)-1]["text"] = new_text
+
+    def update_progress(self, msg):
+        """Thread-safe progress update -- replaces the 'Thinking...' bubble text.
+        Uses Invoke (not BeginInvoke) so the UI actually repaints during the build.
+        """
+        from System import Action
+        if self.window.Dispatcher.CheckAccess():
+            # Already on the WPF/Revit thread — update directly and pump messages
+            self._apply_progress(msg)
+            if _has_doevents:
+                try:
+                    WinForms.DoEvents()
+                except:
+                    pass
+        else:
+            # Background thread — marshal synchronously
+            self.window.Dispatcher.Invoke(Action(lambda: self._apply_progress(msg)))
+
+    def _apply_progress(self, msg):
+        """Must run on WPF dispatcher thread."""
+        if self.cancelled or not self.is_thinking:
+            return
+        if self.ChatHistory and self.ChatHistory.Children.Count > 0:
+            last_border = self.ChatHistory.Children[self.ChatHistory.Children.Count - 1]
+            if isinstance(last_border.Child, TextBox):
+                last_border.Child.Text = msg
+        if self.ChatScroller:
+            self.ChatScroller.ScrollToBottom()
 
     def on_key_down(self, sender, e):
         """Handle Enter key press to send message."""

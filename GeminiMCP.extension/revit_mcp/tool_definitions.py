@@ -93,6 +93,19 @@ TOOL_DECLARATIONS = [
                 }
             },
             {
+                "name": "move_staircase",
+                "description": "Move a specific staircore (all its walls, floors) to a new location, checking the 60m travel rule first. If the new location fails the 60m rule, it suggests a nearby valid location.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "stair_idx": {"type": "integer", "description": "The sequential index of the staircore (e.g. 1, 2, 3)."},
+                        "target_x_mm": {"type": "number", "description": "Target center X coordinate in mm."},
+                        "target_y_mm": {"type": "number", "description": "Target center Y coordinate in mm."}
+                    },
+                    "required": ["stair_idx", "target_x_mm", "target_y_mm"]
+                }
+            },
+            {
                 "name": "create_floor",
                 "description": "Create a rectangular floor.",
                 "parameters": {
@@ -399,6 +412,14 @@ TOOL_DECLARATIONS = [
                         "manifest_json": {"type": "string", "description": "JSON string defining levels, walls, floors, and columns."}
                     },
                     "required": ["manifest_json"]
+                }
+            },
+            {
+                "name": "regenerate_staircases",
+                "description": "DYNAMIC HEALING: Regenerate ONLY the staircase runs based on the current Revit level heights. Uses existing core walls. Fixes staircases that have extended over multiple floors after manual height edits.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {}
                 }
             },
             {

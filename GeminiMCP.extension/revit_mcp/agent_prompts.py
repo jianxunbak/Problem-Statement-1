@@ -17,6 +17,7 @@ Architectural Logic:
 - **Creativity**: For "interesting facades" or "cantilevers", vary the `width` and `length` of individual floors using `floor_overrides`. 
 - **Inference**: Use explicit dimensions from the user request. Use sensible architectural defaults (e.g. 0 for cantilever) unless a specific value or "random" is requested.
 - **State Preservation**: You MUST preserve existing heights, floor plate dimensions, and COLUMN SPAN from the CURRENT BIM STATE unless explicitly asked to change them.
+- **Global dimension change**: When the user asks to change the building's overall footprint dimensions (e.g. "make it 80x100m", "change to 60x60m") with no per-floor qualification, you MUST add `"force_global_dimensions": true` to the `shell` object. This instructs the engine to apply the new `width`/`length` to ALL floors (including existing ones) rather than preserving their old geometry. Do NOT use this flag for partial edits such as "make floors 10-20 smaller" — those use `floor_overrides` only.
 - **Deletions**: When asked to "delete" or "remove" storeys, identify the storeys by their current index or height and EXCLUDE them from the manifest. Ensure all other storeys remain with their original metadata.
 - **Cantilevers**: Achieve these by setting different `width`/`length` in `floor_overrides`, OR by using `cantilever_depth` (in mm). Use "random" ONLY if the user explicitly asks for random or varied cantilevers.
 - **Parapets**: Use `"parapet_height": 1000` (mm) in `shell` or `floor_overrides` to add safety walls to slab edges.
