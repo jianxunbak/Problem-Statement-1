@@ -21,6 +21,9 @@ Rules implemented:
 """
 import math
 
+# BUILD_VERSION is read by _create_stair_runs to verify fresh code is loaded
+_BUILD_VERSION = "v2026-04-11-FLOORRISER-FIX"
+
 _WALL_THICKNESS = 200  # mm
 _OVERRUN_HEIGHT = 5000  # mm — staircase overrun above roof (matches lift core)
 
@@ -32,11 +35,12 @@ _OVERRUN_HEIGHT = 5000  # mm — staircase overrun above roof (matches lift core
 def _snap_risers(floor_height_mm, riser=150):
     """Return the number of risers for a given floor height.
 
-    Uses round() to snap the height to the nearest mm first,
-    avoiding float precision errors from feet↔mm conversion
-    (e.g. 4200mm stored as 13.7795…ft * 304.8 = 4199.9999…mm).
+    Uses floor() so the risers ALWAYS FIT within the floor height.
+    The actual riser height will be floor_height / num_risers
+    (usually within ±5mm of the target riser, which is code-compliant).
+    Using ceil() caused stairs to OVERSHOOT the floor level.
     """
-    return int(math.ceil(round(floor_height_mm) / float(riser)))
+    return max(int(math.floor(round(floor_height_mm) / float(riser))), 1)
 
 
 def _risers_per_flight_typical(typical_floor_height_mm, riser=150):
@@ -45,29 +49,69 @@ def _risers_per_flight_typical(typical_floor_height_mm, riser=150):
     return max(int(math.ceil(typical_risers / 2.0)), 1)
 
 
-def _calc_num_flights(floor_height_mm, typical_floor_height_mm, riser=150):
-    """Return the number of flights (always even) for a given storey height.
-
-    Every flight has the **same number of risers** as a typical-floor
-    flight.  Taller storeys simply get more flights (4, 6, 8 …).
-
-    Example: typical floor = 3500 mm → 24 risers → 12 per flight.
-    Ground floor = 7000 mm → 47 risers → needs 4 flights of 12 = 48 slots.
-    """
+def _calc_num_flights(floor_height_mm, typical_floor_height_mm, riser=150, is_top_floor=False):
+    """Return the number of flights (always even) for a given storey height."""
     if typical_floor_height_mm <= 0 or floor_height_mm <= 0:
+        return 2
+
+    # Roof level uses exactly 2 flights (1 wrap) even if very long,
+    # because there are no bounding headroom floors above it.
+    if is_top_floor:
         return 2
 
     rpf = _risers_per_flight_typical(typical_floor_height_mm, riser)
     actual_risers = _snap_risers(floor_height_mm, riser)
 
-    # Number of flights needed (round up), then round up to even
+    # Number of flights needed so each flight has <= rpf risers
     num_flights = int(math.ceil(actual_risers / float(rpf)))
     if num_flights < 2:
         num_flights = 2
     if num_flights % 2 != 0:
         num_flights += 1
 
-    return min(num_flights, 16)  # safety cap
+    return num_flights
+
+
+def adjust_storey_height(floor_height_mm, typical_floor_height_mm, riser=150, is_top_floor=False):
+    """Adjust a floor height so it produces an even number of risers (even flights)
+    AND respects the 2400mm vertical headroom requirement for multi-wrap stairs.
+    """
+    if riser <= 0 or floor_height_mm <= 0:
+        return floor_height_mm
+
+    # Helper to check if a riser count violates the 2400mm headroom rule 
+    def get_violation(test_risers):
+        import math
+        rpf_local = _risers_per_flight_typical(typical_floor_height_mm, riser)
+        nf = int(math.ceil(test_risers / float(rpf_local)))
+        if nf < 2: nf = 2
+        if nf % 2 != 0: nf += 1
+        clearance = (test_risers * riser) / (nf / 2.0)
+        return clearance < 2400
+
+    n_risers = int(round(floor_height_mm / float(riser)))
+    if n_risers % 2 != 0:
+        below = n_risers - 1
+        above = n_risers + 1
+        h_below = abs(floor_height_mm - below * riser)
+        h_above = abs(floor_height_mm - above * riser)
+        n_risers = below if h_below <= h_above else above
+
+    if not is_top_floor and get_violation(n_risers):
+        offset = 2
+        while True:
+            # Favor shorter if both equidistant, as it guarantees fitting inside shaft better
+            if not get_violation(n_risers - offset):
+                n_risers = n_risers - offset
+                break
+            if not get_violation(n_risers + offset):
+                n_risers = n_risers + offset
+                break
+            offset += 2
+
+    # Minimum 2 risers
+    n_risers = max(2, n_risers)
+    return n_risers * riser
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -88,7 +132,7 @@ def get_shaft_dimensions(floor_height_mm, spec=None):
     """
     spec = spec or {}
     riser = spec.get("riser", 150)
-    tread = spec.get("tread", 275)
+    tread = spec.get("tread", 300)
     w_flight = spec.get("width_of_flight", 1500)
     w_landing = spec.get("landing_width", 1500)
     t = _WALL_THICKNESS
@@ -108,25 +152,16 @@ def get_shaft_dimensions(floor_height_mm, spec=None):
 def get_max_shaft_depth(levels_data, spec=None, typical_floor_height_mm=None):
     """Return the shaft depth for the staircase enclosure.
 
-    When *typical_floor_height_mm* is provided the shaft is sized for
-    that height (2 flights).  Taller storeys use more flights instead
-    of a deeper shaft — see ``_calc_num_flights``.
+    The shaft depth is FIXED at the typical floor's depth.  This ensures
+    a constant vertical staircase core from ground to roof — the same
+    rectangular footprint on every level.
 
-    Falls back to scanning all levels (legacy behaviour) when the
-    typical height is not supplied.
+    Taller storeys fit within this fixed shaft by using more flight pairs
+    (each pair has the same run length as a typical floor).
     """
-    if typical_floor_height_mm and typical_floor_height_mm > 0:
-        _, d = get_shaft_dimensions(typical_floor_height_mm, spec)
-        return d
-
-    max_d = 0.0
-    for i in range(len(levels_data) - 1):
-        fh = levels_data[i + 1]['elevation'] - levels_data[i]['elevation']
-        if fh > 0:
-            _, d = get_shaft_dimensions(fh, spec)
-            if d > max_d:
-                max_d = d
-    return max_d
+    typ_h = typical_floor_height_mm if typical_floor_height_mm and typical_floor_height_mm > 0 else 4000.0
+    _, d = get_shaft_dimensions(typ_h, spec)
+    return d
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -174,17 +209,66 @@ def calculate_staircase_positions(floor_dims_mm, core_center_mm,
         return positions
 
     # Need additional staircases — add at perimeter, minimising count.
-    edge_x = max_w / 2.0 - 3000   # 3 m inset from slab edge
+    t = 200
+    w_flight = spec.get("width_of_flight", 1500) if spec else 1500
+    enc_w = 2 * w_flight + 3 * t
+    _, enc_d = get_shaft_dimensions(typical_floor_height_mm, spec)
+
+    # Perimeter positions at edges of the LARGEST floor plate.
+    # Smaller floors may not need these cores — the per-floor skip
+    # in get_stair_run_data handles that based on travel distance.
+    edge_x = max_w / 2.0 - enc_w / 2.0
+    edge_y = max_l / 2.0 - enc_d / 2.0
+
+    # 1/3 diagonal spacing rule for the largest floor plate
+    diagonal_mm = math.sqrt(max_w**2 + max_l**2)
+    min_spacing_mm = diagonal_mm / 3.0
+
+    # Generate perimeter candidate points
     candidates = [
-        (-edge_x, cy),                # west
-        ( edge_x, cy),                # east
-        (-edge_x, -max_l / 4.0),     # south-west quarter
-        ( edge_x, -max_l / 4.0),     # south-east quarter
-        (-edge_x,  max_l / 4.0),     # north-west quarter
-        ( edge_x,  max_l / 4.0),     # north-east quarter
+        # Corners (furthest from core)
+        (-edge_x, -edge_y),
+        ( edge_x, -edge_y),
+        (-edge_x,  edge_y),
+        ( edge_x,  edge_y),
+        # Mid-edges
+        (-edge_x, cy),
+        ( edge_x, cy),
+        ( cx, -edge_y),
+        ( cx,  edge_y),
+        # Quarter points along long edges
+        (-edge_x, -max_l / 4.0),
+        ( edge_x, -max_l / 4.0),
+        (-edge_x,  max_l / 4.0),
+        ( edge_x,  max_l / 4.0),
     ]
-    for cand in candidates:
-        positions.append(cand)
+
+    # Iteratively add the candidate that is furthest from all existing staircases
+    while candidates:
+        best_cand = None
+        best_min_dist = -1
+
+        for cand in candidates:
+            # Distance from this candidate to the closest existing staircase
+            min_dist_to_existing = min(
+                math.sqrt((cand[0] - sx)**2 + (cand[1] - sy)**2)
+                for sx, sy in positions
+            )
+            if min_dist_to_existing > best_min_dist:
+                best_min_dist = min_dist_to_existing
+                best_cand = cand
+
+        # Remove the evaluated best candidate
+        candidates.remove(best_cand)
+
+        # Apply the 1/3 diagonal spacing rule
+        if best_min_dist < min_spacing_mm:
+            continue
+
+        # Add the best candidate if it satisfies spacing
+        positions.append(best_cand)
+
+        # Stop early if travel distance rule is satisfied
         if _check_travel_distance(positions, max_w, max_l, max_travel_mm):
             break
 
@@ -225,9 +309,10 @@ def get_void_rectangles_mm(positions, enclosure_width_mm, enclosure_depth_mm):
     """Return (x1, y1, x2, y2) rectangles for floor-slab openings.
     One rectangle per staircase enclosure."""
     voids = []
+    t = _WALL_THICKNESS
     for cx, cy in positions:
-        hw = enclosure_width_mm / 2.0
-        hd = enclosure_depth_mm / 2.0
+        hw = enclosure_width_mm / 2.0 - t / 2.0
+        hd = enclosure_depth_mm / 2.0 - t / 2.0
         voids.append((cx - hw, cy - hd, cx + hw, cy + hd))
     return voids
 
@@ -236,8 +321,81 @@ def get_void_rectangles_mm(positions, enclosure_width_mm, enclosure_depth_mm):
 #  Manifest generation  [rules a–k]
 # ─────────────────────────────────────────────────────────────────────
 
+def wall_overlaps_box(wall_start, wall_end, box_bounds, tol=100):
+    """Check if a wall segment lies on a bounding box edge.
+
+    Returns:
+        None  — wall does NOT overlap, emit it as-is.
+        []    — wall is FULLY covered by the box, skip it entirely.
+        list  — gap-filler wall segments [(start, end), ...] for
+                portions NOT covered by the box.
+    """
+    if box_bounds is None:
+        return None
+    lx_min, ly_min, lx_max, ly_max = box_bounds
+    sx, sy = wall_start[0], wall_start[1]
+    ex, ey = wall_end[0], wall_end[1]
+
+    # Horizontal wall (constant Y)?
+    if abs(sy - ey) < 1:
+        y = sy
+        w_xmin, w_xmax = min(sx, ex), max(sx, ex)
+        # Check if this Y matches a box core horizontal boundary
+        on_core_y = (abs(y - ly_min) < tol or abs(y - ly_max) < tol)
+        if not on_core_y:
+            return None
+        # How much of the wall is covered by the box?
+        overlap_xmin = max(w_xmin, lx_min)
+        overlap_xmax = min(w_xmax, lx_max)
+        if overlap_xmin >= overlap_xmax - 5: # 5mm minimum overlap to trigger split
+            return None 
+            
+        gaps = []
+        if w_xmin < overlap_xmin - 5:
+            gaps.append(([w_xmin, y, 0], [overlap_xmin, y, 0]))
+        if w_xmax > overlap_xmax + 5:
+            gaps.append(([overlap_xmax, y, 0], [w_xmax, y, 0]))
+        return gaps
+
+    # Vertical wall (constant X)?
+    elif abs(sx - ex) < 1:
+        x = sx
+        w_ymin, w_ymax = min(sy, ey), max(sy, ey)
+        on_core_x = (abs(x - lx_min) < tol or abs(x - lx_max) < tol)
+        if not on_core_x:
+            return None
+        overlap_ymin = max(w_ymin, ly_min)
+        overlap_ymax = min(w_ymax, ly_max)
+        if overlap_ymin >= overlap_ymax - 5:
+            return None
+            
+        gaps = []
+        if w_ymin < overlap_ymin - 5:
+            gaps.append(([x, w_ymin, 0], [x, overlap_ymin, 0]))
+        if w_ymax > overlap_ymax + 5:
+            gaps.append(([x, overlap_ymax, 0], [x, w_ymax, 0]))
+        return gaps
+
+    return None
+
+def _calc_base_y(s_idx, s_cy, enc_d, lift_core_bounds_mm=None):
+    """Internal helper to calculate stable base_y based on core proximity."""
+    if s_idx == 0 and lift_core_bounds_mm:
+        # South staircase: Back wall (base_y + enc_d) must be at core_ymin
+        _, core_ymin, _, _ = lift_core_bounds_mm
+        return core_ymin - enc_d
+    elif s_idx == 1 and lift_core_bounds_mm:
+        # North staircase: Front wall (base_y) must be at core_ymax
+        _, _, _, core_ymax = lift_core_bounds_mm
+        return core_ymax
+    else:
+        # Perimeter staircases: use the calculated centre (s_cy)
+        return s_cy - enc_d / 2.0
+
+
 def generate_staircase_manifest(positions, levels_data, _enclosure_width_mm=None,
-                                spec=None, typical_floor_height_mm=None):
+                                spec=None, typical_floor_height_mm=None,
+                                lift_core_bounds_mm=None, floor_dims_mm=None):
     """Generate wall and floor manifest entries for all staircases.
 
     The enclosure footprint (plan size) is **fixed** for every level,
@@ -257,13 +415,20 @@ def generate_staircase_manifest(positions, levels_data, _enclosure_width_mm=None
                             alignment).  Falls back to natural shaft width.
         spec: staircase specification dict.
         typical_floor_height_mm: storey height used to size the shaft.
+        lift_core_bounds_mm: (xmin, ymin, xmax, ymax) of lift core in mm,
+                             or None.  When provided, staircase enclosure
+                             walls that overlap with the lift core boundary
+                             are omitted (the lift core wall already serves
+                             as enclosure).  Gap-filling walls are created
+                             if the lift core wall is shorter than the
+                             staircase wall it replaces.
 
     Returns:
         ``{"walls": [...], "floors": [...]}``
     """
     spec = spec or {}
     riser = spec.get("riser", 150)
-    tread = spec.get("tread", 275)
+    tread = spec.get("tread", 300)
     w_flight = spec.get("width_of_flight", 1500)
     w_landing = spec.get("landing_width", 1500)
     t = _WALL_THICKNESS
@@ -288,22 +453,24 @@ def generate_staircase_manifest(positions, levels_data, _enclosure_width_mm=None
     #
     # Each entry: (left_ext_mm, right_ext_mm) — extra depth beyond w_landing.
     typ_h = typical_floor_height_mm or 4000.0
-    rpf = _risers_per_flight_typical(typ_h, riser)
     landing_ext_for_next = {}  # level_idx -> (right_ext, y_shift)
     for li in range(len(levels_data) - 1):
-        fh = levels_data[li + 1]['elevation'] - levels_data[li]['elevation']
-        if fh <= 0:
+        floor_height_mm = levels_data[li + 1]['elevation'] - levels_data[li]['elevation']
+        if floor_height_mm <= 0:
             continue
-        total_r = _snap_risers(fh, riser)
-        nf = _calc_num_flights(fh, typ_h, riser)
-        rem = total_r
-        flight_list = []
-        for _ in range(nf):
-            give = min(rpf, rem)
-            if give <= 0:
-                break
-            flight_list.append(give)
-            rem -= give
+            
+        is_top_floor = (li == len(levels_data) - 2)
+
+        total_r = _snap_risers(floor_height_mm, riser)
+        nf = _calc_num_flights(floor_height_mm, typ_h, riser, is_top_floor=is_top_floor)
+        
+        # Simple floor-division: distribute risers evenly across flights
+        if nf > 0:
+            per_flight = total_r // nf
+            remainder = total_r % nf
+            flight_list = [per_flight + (1 if i < remainder else 0) for i in range(nf)]
+        else:
+            flight_list = [total_r]
         # Group flights into actual dogleg pairs
         flight_pairs = []
         for fi in range(0, len(flight_list), 2):
@@ -339,12 +506,86 @@ def generate_staircase_manifest(positions, levels_data, _enclosure_width_mm=None
     walls = []
     floors = []
 
+    # --- Lift-core overlap detection ---
+    # Tolerance for "same coordinate" comparison (mm).
+    _TOL = 50  # 50mm — walls within this distance are considered overlapping
+
+    def _wall_overlaps_lift_core(wall_start, wall_end, lift_bounds):
+        """Check if a wall segment lies on a lift-core boundary.
+
+        Returns:
+            None  — wall does NOT overlap, emit it as-is.
+            []    — wall is FULLY covered by lift core, skip it entirely.
+            list  — gap-filler wall segments [(start, end), ...] for
+                    portions NOT covered by the lift core.
+        """
+        if lift_bounds is None:
+            return None
+        lx_min, ly_min, lx_max, ly_max = lift_bounds
+        sx, sy = wall_start[0], wall_start[1]
+        ex, ey = wall_end[0], wall_end[1]
+
+        # Horizontal wall (constant Y)?
+        if abs(sy - ey) < 1:
+            y = sy
+            w_xmin, w_xmax = min(sx, ex), max(sx, ex)
+            # Check if this Y matches a lift-core horizontal boundary
+            on_core_y = (abs(y - ly_min) < _TOL or abs(y - ly_max) < _TOL)
+            if not on_core_y:
+                return None
+            # Lift core horizontal extent
+            # How much of the staircase wall is covered by the lift core?
+            overlap_min = max(w_xmin, lx_min)
+            overlap_max = min(w_xmax, lx_max)
+            if overlap_max - overlap_min < _TOL:
+                return None  # No meaningful overlap
+            # Fully covered?
+            if lx_min <= w_xmin + _TOL and lx_max >= w_xmax - _TOL:
+                return []  # Fully covered — skip wall
+            # Partially covered — return gap segments
+            gaps = []
+            if w_xmin < lx_min - _TOL:
+                gaps.append(([w_xmin, y, 0], [lx_min, y, 0]))
+            if w_xmax > lx_max + _TOL:
+                gaps.append(([lx_max, y, 0], [w_xmax, y, 0]))
+            return gaps
+
+        # Vertical wall (constant X)?
+        if abs(sx - ex) < 1:
+            x = sx
+            w_ymin, w_ymax = min(sy, ey), max(sy, ey)
+            on_core_x = (abs(x - lx_min) < _TOL or abs(x - lx_max) < _TOL)
+            if not on_core_x:
+                return None
+            overlap_min = max(w_ymin, ly_min)
+            overlap_max = min(w_ymax, ly_max)
+            if overlap_max - overlap_min < _TOL:
+                return None
+            if ly_min <= w_ymin + _TOL and ly_max >= w_ymax - _TOL:
+                return []
+            gaps = []
+            if w_ymin < ly_min - _TOL:
+                gaps.append(([x, w_ymin, 0], [x, ly_min, 0]))
+            if w_ymax > ly_max + _TOL:
+                gaps.append(([x, ly_max, 0], [x, w_ymax, 0]))
+            return gaps
+
+        return None  # Diagonal wall — never overlaps
+
+    def _emit_wall(wall_id, start, end, common_dict):
+        """Create a wall dict, filtering out zero-length segments."""
+        dx = abs(start[0] - end[0])
+        dy = abs(start[1] - end[1])
+        if dx < 2 and dy < 2:
+            return None  # Too short
+        return {"id": wall_id, "start": start, "end": end, **common_dict}
+
     for s_idx, (s_cx, s_cy) in enumerate(positions):
         s_tag = "Stair_{}".format(s_idx + 1)
 
-        # Fixed base coordinates — same for every level
+        # --- Stable base coordinates [Alignment Fix] ---
         base_x = s_cx - enc_w / 2.0
-        base_y = s_cy - enc_d / 2.0
+        base_y = _calc_base_y(s_idx, s_cy, enc_d, lift_core_bounds_mm)
 
         for i, lvl in enumerate(levels_data):
             lvl_id = lvl['id']
@@ -362,151 +603,112 @@ def generate_staircase_manifest(positions, levels_data, _enclosure_width_mm=None
             common = {"level_id": lvl_id, "height": wall_height}
 
             # — 4 enclosure walls (fixed plan, every level including roof) —
-            walls.append({
-                "id": "AI_{}_L{}_W_Front".format(s_tag, i + 1),
-                "start": [base_x, base_y, 0],
-                "end": [base_x + enc_w, base_y, 0],
-                **common
-            })
-            walls.append({
-                "id": "AI_{}_L{}_W_Back".format(s_tag, i + 1),
-                "start": [base_x, base_y + enc_d, 0],
-                "end": [base_x + enc_w, base_y + enc_d, 0],
-                **common
-            })
-            walls.append({
-                "id": "AI_{}_L{}_W_Left".format(s_tag, i + 1),
-                "start": [base_x, base_y, 0],
-                "end": [base_x, base_y + enc_d, 0],
-                **common
-            })
-            walls.append({
-                "id": "AI_{}_L{}_W_Right".format(s_tag, i + 1),
-                "start": [base_x + enc_w, base_y, 0],
-                "end": [base_x + enc_w, base_y + enc_d, 0],
-                **common
-            })
+            # Each wall is checked against the lift core boundary.  If the
+            # lift core already provides enclosure at that location the
+            # staircase wall is omitted (or replaced with gap-fillers).
+            left_y_start = base_y
+            left_y_end = base_y + enc_d
+            right_y_start = base_y
+            right_y_end = base_y + enc_d
+
+            # Apply T-junction geometric pullback to prevent volume overlap
+            # with the lift core walls when joins are disallowed.
+            if lift_core_bounds_mm:
+                _, core_ymin, _, core_ymax = lift_core_bounds_mm
+                core_cy = (core_ymin + core_ymax) / 2.0
+                if s_cy < core_cy - 100:
+                    left_y_end -= t / 2.0
+                    right_y_end -= t / 2.0
+                elif s_cy > core_cy + 100:
+                    left_y_start += t / 2.0
+                    right_y_start += t / 2.0
+
+            candidate_walls = [
+                ("AI_{}_L{}_W_Front".format(s_tag, i + 1),
+                 [base_x, base_y, 0],
+                 [base_x + enc_w, base_y, 0]),
+                ("AI_{}_L{}_W_Back".format(s_tag, i + 1),
+                 [base_x, base_y + enc_d, 0],
+                 [base_x + enc_w, base_y + enc_d, 0]),
+                ("AI_{}_L{}_W_Left".format(s_tag, i + 1),
+                 [base_x, left_y_start, 0],
+                 [base_x, left_y_end, 0]),
+                ("AI_{}_L{}_W_Right".format(s_tag, i + 1),
+                 [base_x + enc_w, right_y_start, 0],
+                 [base_x + enc_w, right_y_end, 0]),
+            ]
+
+            for w_id, w_start, w_end in candidate_walls:
+                result = wall_overlaps_box(w_start, w_end, lift_core_bounds_mm, _TOL)
+                if result is None:
+                    walls.append({"id": w_id, "start": w_start, "end": w_end, **common})
+                elif len(result) == 0:
+                    pass
+                else:
+                    for gi, (gs, ge) in enumerate(result):
+                        w = _emit_wall("{}_Gap{}".format(w_id, gi + 1), gs, ge, common)
+                        if w: walls.append(w)
 
             # --- Main landing floor slab [rule j] ---
-            # Skip on 1st floor (i==0): the building floor slab already
-            # serves as the ground-level landing.
-            # DO generate on the roof level: stairs arrive there and
-            # need a landing to step off onto.
-            #
-            # The landing starts where the LAST STEP ends:
-            #   Standard:  at front of shaft (flight_y_start edge)
-            #   Solo (a,0): shifted deeper — starts where Run A ends
-            #   Short B:   front of shaft + L-shape extension on RIGHT
             if i > 0:
+                lvl = levels_data[i]
+                lvl_id = lvl.get('id', 'AI_Level_{}'.format(i+1))
                 stair_base_x = s_cx - shaft_width_nat / 2.0
                 div_x = stair_base_x + w_flight + t
-                _ext_data = landing_ext_for_next.get(i, (0, 0))
-                right_ext = _ext_data[0] if isinstance(_ext_data, tuple) else _ext_data
-                y_shift = _ext_data[1] if isinstance(_ext_data, tuple) and len(_ext_data) > 1 else 0
+                
+                def _get_flight_arr(li):
+                    # Returns (f_y_start, arr_left, arr_right) for level li+1
+                    f_h = levels_data[li+1]['elevation'] - levels_data[li]['elevation']
+                    if f_h <= 0: return base_y + t + w_landing, base_y + t + w_landing, base_y + t + w_landing
+                    tot_r = _snap_risers(f_h, riser)
+                    nf = _calc_num_flights(f_h, typical_floor_height_mm or 4000.0, riser)
+                    if nf > 0:
+                        p_f = tot_r // nf
+                        rem = tot_r % nf
+                        f_list = [p_f + (1 if k < rem else 0) for k in range(nf)]
+                    else: f_list = [tot_r]
+                    
+                    trd = spec.get("tread", 300)
+                    r_len = max(f_list[0] - 1, 1) * trd
+                    dyn_w = max(w_landing, (enc_d - 2*t - r_len) / 2.0)
+                    fy_s = base_y + t + dyn_w
+                    
+                    l_a = f_list[-2] if len(f_list) >= 2 else f_list[-1]
+                    l_b = f_list[-1] if len(f_list) >= 2 and len(f_list) % 2 == 0 else 0
+                    la_len = max(l_a - 1, 1) * trd
+                    lb_len = max(l_b - 1, 1) * trd
+                    
+                    if len(f_list) % 2 != 0 or l_b == 0:
+                        return fy_s, fy_s + la_len, fy_s
+                    else:
+                        # Safety: pull landing depth back 50mm from calculated arrival to avoid angled clashes
+                        return fy_s, fy_s, fy_s + (la_len - lb_len) - 50
 
-                # Landing Y range
-                # y_shift is measured from flight_y_start (= base_y + t + w_landing),
-                # NOT from base_y + t.  The landing starts after the last step.
-                if y_shift > 0:
-                    land_y_start = base_y + t + w_landing + y_shift
-                else:
-                    land_y_start = base_y + t
-                land_y_end = land_y_start + w_landing
-                # Debug: log landing position
-                try:
-                    from revit_mcp.runner import log as _slog
-                    _slog("  Landing L{} s{}: y_shift={:.0f} right_ext={:.0f} "
-                          "y=[{:.0f},{:.0f}] flight_y_start={:.0f} is_roof={}".format(
-                        i + 1, s_idx + 1, y_shift, right_ext,
-                        land_y_start, land_y_end,
-                        base_y + t + w_landing, is_roof))
-                except Exception:
-                    pass
-
-                std_y_start = base_y + t
-                std_y_end = base_y + t + w_landing
-
-                if y_shift > 0:
-                    # Solo Run A (a, 0): Run A ends on the LEFT side
-                    # past flight_y_start.  The landing covers the entire
-                    # remaining LEFT half of the shaft — from where Run A
-                    # ends all the way to the back wall.
-                    #
-                    #   div_x
-                    #   ├────┐
-                    #   │LEFT│  from land_y_start (Run A end)
-                    #   │half│  to back_wall (base_y + enc_d - t)
-                    #   │    │  covers flight area + mid-landing area
-                    #   └────┘
-                    #   base_x
-                    back_wall_y = base_y + enc_d - t
+                # Landing at level i: 
+                # Left side matches departing flight (i) or standard if roof
+                # Right side matches arriving flight (i-1)
+                fy_s_dep, _, _ = _get_flight_arr(i) if not is_roof else (base_y + t + w_landing, 0, 0)
+                _, arr_l, arr_r = _get_flight_arr(i-1)
+                
+                req_l = max(fy_s_dep, arr_l)
+                req_r = arr_r
+                front_y = base_y + t
+                
+                if abs(req_l - req_r) < 1.0:
                     floors.append({
                         "id": "AI_{}_L{}_MainLanding".format(s_tag, i + 1),
-                        "level_id": lvl_id,
-                        "elevation": lvl['elevation'],
-                        "points": [
-                            [base_x, land_y_start],
-                            [div_x, land_y_start],
-                            [div_x, back_wall_y],
-                            [base_x, back_wall_y]
-                        ]
-                    })
-                elif right_ext > 0:
-                    # L-shape for short Run B (a, b<a):
-                    # RIGHT side (Run B side): deep — bridges the gap
-                    # LEFT side: standard position at front
-                    #
-                    #   base_x        div_x
-                    #   ┌─────┬────┐
-                    #   │LEFT │RIGH│  standard [std_y_start, std_y_end]
-                    #   │side │T   │
-                    #   └─────┤ext │  deep [std_y_end, ext_y_end]
-                    #         │    │
-                    #         └────┘  base_x+enc_w
-                    ext_y_end = std_y_end + right_ext
-                    floors.append({
-                        "id": "AI_{}_L{}_MainLanding".format(s_tag, i + 1),
-                        "level_id": lvl_id,
-                        "elevation": lvl['elevation'],
-                        "points": [
-                            [base_x, std_y_start],
-                            [base_x + enc_w, std_y_start],
-                            [base_x + enc_w, ext_y_end],
-                            [div_x, ext_y_end],
-                            [div_x, std_y_end],
-                            [base_x, std_y_end]
-                        ]
+                        "level_id": lvl_id, "elevation": lvl['elevation'],
+                        "points": [[base_x, front_y], [base_x + enc_w, front_y], [base_x + enc_w, req_r], [base_x, req_l]]
                     })
                 else:
-                    # Standard rectangular landing
                     floors.append({
                         "id": "AI_{}_L{}_MainLanding".format(s_tag, i + 1),
-                        "level_id": lvl_id,
-                        "elevation": lvl['elevation'],
-                        "points": [
-                            [base_x, std_y_start],
-                            [base_x + enc_w, std_y_start],
-                            [base_x + enc_w, std_y_end],
-                            [base_x, std_y_end]
-                        ]
+                        "level_id": lvl_id, "elevation": lvl['elevation'],
+                        "points": [[base_x, front_y], [base_x + enc_w, front_y], [base_x + enc_w, req_r], [div_x, req_r], [div_x, req_l], [base_x, req_l]]
                     })
 
-            # --- Divider wall (separates the two flight halves) ---
-            # Only spans the flight area between landings, so the
-            # landing areas remain clear for people to pass through.
-            # Generated on ALL levels including roof overrun so the
-            # central wall extends to the staircase roof.
-            stair_base_x = s_cx - shaft_width_nat / 2.0
-            div_x = stair_base_x + w_flight + t
-            div_y_start = base_y + t + w_landing
-            div_y_end = base_y + enc_d - t - w_landing
-            if div_y_end > div_y_start + 1:
-                walls.append({
-                    "id": "AI_{}_L{}_Div".format(s_tag, i + 1),
-                    "start": [div_x, div_y_start, 0],
-                    "end": [div_x, div_y_end, 0],
-                    **common
-                })
+            # Center divider wall removed per user request — not necessary
+            # for the dogleg stair layout.
 
             if is_roof:
                 # — TOPCAP: closing slab above overrun (matches lift core) —
@@ -532,7 +734,8 @@ def generate_staircase_manifest(positions, levels_data, _enclosure_width_mm=None
 # ─────────────────────────────────────────────────────────────────────
 
 def get_stair_run_data(positions, levels_data, _enclosure_width_mm=None, spec=None,
-                       typical_floor_height_mm=None):
+                       typical_floor_height_mm=None, lift_core_bounds_mm=None,
+                       floor_dims_mm=None):
     """Return geometry data for creating Revit stair runs.
 
     For typical-height storeys: standard 2-flight dogleg (1 pair).
@@ -553,12 +756,24 @@ def get_stair_run_data(positions, levels_data, _enclosure_width_mm=None, spec=No
                 "flight_1": {"start": [x, y], "end": [x, y]},
                 "flight_2": {"start": [x, y], "end": [x, y]},
                 "main_landing": {
-                    "y_start": ..., "y_end": ...,
                     "x_left": ..., "x_right": ...
                 },
-                "width_mm": 1500
+                "width_mm": 1500,
+                "fingerprint": "HASH_OR_STRING"
             }
     """
+    import hashlib
+    def calc_fingerprint(data):
+        # A unique string representing the geometry of this specific stair instance
+        raw = "{}:{}:{}:{}:{}".format(
+            data['tag'], 
+            round(data['base_elev'], 1), 
+            round(data['top_elev'], 1),
+            data['num_flight_pairs'],
+            data['width_mm']
+        )
+        return hashlib.md5(raw.encode('utf-8')).hexdigest()[:12]
+
     spec = spec or {}
     riser = spec.get("riser", 150)
     w_flight = spec.get("width_of_flight", 1500)
@@ -573,19 +788,22 @@ def get_stair_run_data(positions, levels_data, _enclosure_width_mm=None, spec=No
     # Determine typical floor height for flight-count calculation
     typ_h = typical_floor_height_mm
     if not typ_h or typ_h <= 0:
+        heights = []
         for i in range(len(levels_data) - 1):
             fh = levels_data[i + 1]['elevation'] - levels_data[i]['elevation']
             if fh > 0:
-                typ_h = fh
-                break
+                heights.append(fh)
+        if heights:
+            typ_h = min(heights)  # Grab the minimum height to identify the true typical floor
         if not typ_h or typ_h <= 0:
             typ_h = 4000.0
+            
 
     runs = []
 
     for s_idx, (s_cx, s_cy) in enumerate(positions):
         s_tag = "Stair_{}".format(s_idx + 1)
-        base_y = s_cy - enc_d / 2.0
+        base_y = _calc_base_y(s_idx, s_cy, enc_d, lift_core_bounds_mm)
         stair_base_x = s_cx - shaft_width_nat / 2.0
 
         # Flight centre X positions (inside the two halves of the shaft)
@@ -604,39 +822,98 @@ def get_stair_run_data(positions, levels_data, _enclosure_width_mm=None, spec=No
         ml_y_start = base_y + t
         ml_y_end = base_y + t + w_landing
 
-        # Risers per flight — identical for every floor, derived from typical
-        rpf = _risers_per_flight_typical(typ_h, riser)
-
         # Create stairs for all level pairs including up to the roof.
         for i in range(len(levels_data) - 1):
             floor_height = levels_data[i + 1]['elevation'] - levels_data[i]['elevation']
             if floor_height <= 0:
                 continue
+            is_top_floor = (i == len(levels_data) - 2)
+            num_flights = _calc_num_flights(floor_height, typ_h, riser, is_top_floor=is_top_floor)
+            floor_risers = _snap_risers(floor_height, riser)
+            
+            # Ensure even distribution across flights without rounding up
+            # SPECIAL CASE: For the top floor leading to roof, force the 1st flight
+            # to match typical floor riser count so mid-landings ALIGN vertically.
+            if is_top_floor and num_flights == 2 and typical_floor_height_mm > 0:
+                rpf_typical = _risers_per_flight_typical(typical_floor_height_mm, riser)
+                if 0 < rpf_typical < floor_risers:
+                    flight_list = [rpf_typical, floor_risers - rpf_typical]
+                else:
+                    per_flight = floor_risers // num_flights
+                    remainder = floor_risers % num_flights
+                    flight_list = [per_flight + (1 if j < remainder else 0) for j in range(num_flights)]
+            elif num_flights > 0:
+                # floor_risers is already the right count (floor-based)
+                # Just ensure it's evenly split across flights
+                per_flight = floor_risers // num_flights
+                # If not perfectly divisible, keep current split (some floors may have one extra)
+                remainder = floor_risers % num_flights
+                flight_list = [per_flight + (1 if j < remainder else 0) for j in range(num_flights)]
+            else:
+                flight_list = [floor_risers]
+            
+            # Compute actual riser height for use in Revit
+            actual_riser_h = floor_height / float(floor_risers) if floor_risers else float(riser)
+            
+            num_pairs = len(flight_list) // 2
 
-            num_flights = _calc_num_flights(floor_height, typ_h, riser)
-            num_pairs = num_flights // 2
+            intermediate_heights_mm = []
+            curr_h = 0
+            for pi in range(num_pairs - 1):
+                pair_risers = flight_list[2*pi] + (flight_list[2*pi + 1] if 2*pi + 1 < len(flight_list) else 0)
+                curr_h += pair_risers * riser
+                intermediate_heights_mm.append(curr_h)
 
-            runs.append({
+            tread = spec.get("tread", 300)
+            target_risers = flight_list[0] if flight_list else 1
+            run_len = max(target_risers - 1, 1) * tread
+            shaft_inner_d = enc_d - 2 * t
+            # Remaining space is split equally between main and mid landing
+            dyn_landing_w = max(w_landing, (shaft_inner_d - run_len) / 2.0)
+            
+            flight_y_start = base_y + t + dyn_landing_w
+            flight_y_end = base_y + enc_d - t - dyn_landing_w
+
+
+            # Adjust main landing depth if f2 is longer than f1 (Problem 1)
+            # This ensures Flight 2 terminates exactly at the landing edge without intersections.
+            ml_y_bot = base_y + t
+            ml_depth = w_landing
+            if len(flight_list) >= 2 and flight_list[1] > flight_list[0]:
+                extra_treads = flight_list[1] - flight_list[0]
+                ml_depth += extra_treads * tread
+            ml_y_top = ml_y_bot + ml_depth
+
+            run_data = {
                 "tag": "AI_{}_L{}_Run".format(s_tag, i + 1),
                 "base_level_idx": i,
                 "top_level_idx": i + 1,
+                "base_elev": levels_data[i]['elevation'],
+                "top_elev": levels_data[i+1]['elevation'],
                 "num_flight_pairs": num_pairs,
-                "risers_per_flight": rpf,
+                "_intermediate_count": max(0, num_pairs - 1),
+                "intermediate_heights_mm": intermediate_heights_mm,
+                "flight_list": flight_list,
+                "risers_per_flight": flight_list[0] if flight_list else 1,
+                "actual_riser_height_mm": actual_riser_h if 'actual_riser_h' in dir() else float(riser),
                 "flight_1": {
                     "start": [f1_cx, flight_y_start],
                     "end":   [f1_cx, flight_y_end],
                 },
                 "flight_2": {
-                    "start": [f2_cx, flight_y_start],
-                    "end":   [f2_cx, flight_y_end],
+                    "start": [f2_cx, flight_y_end],
+                    "end":   [f2_cx, flight_y_start],
                 },
                 "main_landing": {
-                    "y_start": ml_y_start,
-                    "y_end": ml_y_end,
+                    "y_start": ml_y_bot,
+                    "y_end": ml_y_top,
                     "x_left": land_x_left,
                     "x_right": land_x_right,
                 },
                 "width_mm": w_flight,
-            })
+                "dyn_landing_w_mm": dyn_landing_w,
+            }
+            run_data["fingerprint"] = calc_fingerprint(run_data)
+            runs.append(run_data)
 
     return runs

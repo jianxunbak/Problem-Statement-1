@@ -128,6 +128,260 @@ def delete_walls_ui():
     t = DB.Transaction(doc, "MCP: Delete Walls"); t.Start(); doc.Delete(walls); t.Commit()
     return {"success": True}
 
+def delete_all_elements_ui():
+    """Delete all AI-generated elements from the model, or all model elements if requested."""
+    import Autodesk.Revit.DB as DB # type: ignore
+    from revit_mcp.utils import setup_failure_handling
+    uiapp = _get_revit_app()
+    doc = uiapp.ActiveUIDocument.Document
+
+    deleted_count = 0
+    errors = []
+
+    # Collect all deletable model element categories
+    categories = [
+        DB.BuiltInCategory.OST_Walls,
+        DB.BuiltInCategory.OST_Floors,
+        DB.BuiltInCategory.OST_Columns,
+        DB.BuiltInCategory.OST_StructuralColumns,
+        DB.BuiltInCategory.OST_Doors,
+        DB.BuiltInCategory.OST_Windows,
+        DB.BuiltInCategory.OST_Roofs,
+        DB.BuiltInCategory.OST_Stairs,
+        DB.BuiltInCategory.OST_StairsRailing,
+        DB.BuiltInCategory.OST_Grids,
+    ]
+
+    tg = DB.TransactionGroup(doc, "MCP: Delete All Elements")
+    tg.Start()
+
+    # Phase 1: Delete all model elements by category
+    t = DB.Transaction(doc, "MCP: Delete Model Elements")
+    t.Start()
+    setup_failure_handling(t, use_nuclear=True)
+
+    for cat in categories:
+        try:
+            ids = DB.FilteredElementCollector(doc).OfCategory(cat).WhereElementIsNotElementType().ToElementIds()
+            if ids.Count > 0:
+                doc.Delete(ids)
+                deleted_count += ids.Count
+        except Exception as e:
+            errors.append("Category {}: {}".format(cat, str(e)))
+
+    t.Commit()
+    t.Dispose()
+
+    # Phase 2: Delete AI levels and their associated views
+    t = DB.Transaction(doc, "MCP: Delete AI Levels")
+    t.Start()
+    setup_failure_handling(t, use_nuclear=True)
+
+    ai_levels = []
+    for lvl in DB.FilteredElementCollector(doc).OfClass(DB.Level):
+        name = lvl.Name
+        if name.startswith("AI Level") or name.startswith("AI_Level") or name.startswith("AI "):
+            ai_levels.append(lvl)
+
+    # Delete associated floor plan views first
+    all_views = DB.FilteredElementCollector(doc).OfClass(DB.View).ToElements()
+    for lvl in ai_levels:
+        for v in all_views:
+            try:
+                if hasattr(v, "GenLevel") and v.GenLevel and v.GenLevel.Id == lvl.Id:
+                    if v.Pinned: v.Pinned = False
+                    doc.Delete(v.Id)
+            except: pass
+
+    # Delete the levels themselves
+    for lvl in ai_levels:
+        try:
+            if lvl.Pinned: lvl.Pinned = False
+            doc.Delete(lvl.Id)
+            deleted_count += 1
+        except Exception as e:
+            errors.append("Level {}: {}".format(lvl.Name, str(e)))
+
+    t.Commit()
+    t.Dispose()
+    tg.Assimilate()
+
+    result = {"success": True, "deleted_count": deleted_count}
+    if errors:
+        result["warnings"] = errors
+    return result
+
+def delete_elements_by_filter_ui(params):
+    """Delete elements filtered by category and/or level range."""
+    import Autodesk.Revit.DB as DB # type: ignore
+    from revit_mcp.utils import setup_failure_handling
+    uiapp = _get_revit_app()
+    doc = uiapp.ActiveUIDocument.Document
+
+    category = (params.get("category") or "").lower().strip()
+    level_start = params.get("level_start")  # int or None
+    level_end = params.get("level_end")      # int or None (defaults to level_start if not set)
+
+    if level_start is not None and level_end is None:
+        level_end = level_start
+
+    # Map user-friendly category names to Revit BuiltInCategory values
+    CATEGORY_MAP = {
+        "walls":              [DB.BuiltInCategory.OST_Walls],
+        "wall":               [DB.BuiltInCategory.OST_Walls],
+        "floors":             [DB.BuiltInCategory.OST_Floors],
+        "floor":              [DB.BuiltInCategory.OST_Floors],
+        "slabs":              [DB.BuiltInCategory.OST_Floors],
+        "columns":            [DB.BuiltInCategory.OST_Columns, DB.BuiltInCategory.OST_StructuralColumns],
+        "column":             [DB.BuiltInCategory.OST_Columns, DB.BuiltInCategory.OST_StructuralColumns],
+        "doors":              [DB.BuiltInCategory.OST_Doors],
+        "door":               [DB.BuiltInCategory.OST_Doors],
+        "windows":            [DB.BuiltInCategory.OST_Windows],
+        "window":             [DB.BuiltInCategory.OST_Windows],
+        "roofs":              [DB.BuiltInCategory.OST_Roofs],
+        "roof":               [DB.BuiltInCategory.OST_Roofs],
+        "stairs":             [DB.BuiltInCategory.OST_Stairs, DB.BuiltInCategory.OST_StairsRailing],
+        "stair":              [DB.BuiltInCategory.OST_Stairs, DB.BuiltInCategory.OST_StairsRailing],
+        "staircases":         [DB.BuiltInCategory.OST_Stairs, DB.BuiltInCategory.OST_StairsRailing],
+        "railings":           [DB.BuiltInCategory.OST_StairsRailing],
+        "grids":              [DB.BuiltInCategory.OST_Grids],
+        "grid":               [DB.BuiltInCategory.OST_Grids],
+        "levels":             [],  # special handling below
+        "level":              [],
+    }
+
+    # Determine which categories to delete
+    if category and category in CATEGORY_MAP:
+        target_cats = CATEGORY_MAP[category]
+    elif category:
+        return {"error": "Unknown category '{}'. Valid: {}".format(category, ", ".join(sorted(set(CATEGORY_MAP.keys()))))}
+    else:
+        # No category specified = all model element categories
+        target_cats = [
+            DB.BuiltInCategory.OST_Walls, DB.BuiltInCategory.OST_Floors,
+            DB.BuiltInCategory.OST_Columns, DB.BuiltInCategory.OST_StructuralColumns,
+            DB.BuiltInCategory.OST_Doors, DB.BuiltInCategory.OST_Windows,
+            DB.BuiltInCategory.OST_Roofs, DB.BuiltInCategory.OST_Stairs,
+            DB.BuiltInCategory.OST_StairsRailing, DB.BuiltInCategory.OST_Grids,
+        ]
+
+    # Resolve level filter: find AI levels matching the requested range
+    target_level_ids = set()
+    if level_start is not None:
+        ai_levels = []
+        for lvl in DB.FilteredElementCollector(doc).OfClass(DB.Level):
+            ai_levels.append(lvl)
+        ai_levels.sort(key=lambda x: x.Elevation)
+
+        for i, lvl in enumerate(ai_levels):
+            floor_num = i + 1  # 1-based floor number
+            if level_start <= floor_num <= level_end:
+                target_level_ids.add(lvl.Id)
+
+        if not target_level_ids:
+            return {"error": "No levels found matching floor range {}-{}".format(level_start, level_end)}
+
+    deleted_count = 0
+    errors = []
+
+    tg = DB.TransactionGroup(doc, "MCP: Delete Filtered Elements")
+    tg.Start()
+
+    # Delete model elements
+    if target_cats:
+        t = DB.Transaction(doc, "MCP: Delete Filtered")
+        t.Start()
+        setup_failure_handling(t, use_nuclear=True)
+
+        for cat in target_cats:
+            try:
+                collector = DB.FilteredElementCollector(doc).OfCategory(cat).WhereElementIsNotElementType()
+                if target_level_ids:
+                    # Filter by level — check each element
+                    ids_to_delete = []
+                    for el in collector:
+                        el_level_id = None
+                        if hasattr(el, "LevelId"):
+                            el_level_id = el.LevelId
+                        elif hasattr(el, "Level") and el.Level:
+                            el_level_id = el.Level.Id
+                        else:
+                            p = el.get_Parameter(DB.BuiltInParameter.INSTANCE_REFERENCE_LEVEL_PARAM)
+                            if p and p.HasValue:
+                                el_level_id = DB.ElementId(p.AsElementId().Value)
+                        if el_level_id and el_level_id in target_level_ids:
+                            ids_to_delete.append(el.Id)
+                    if ids_to_delete:
+                        from System.Collections.Generic import List
+                        id_list = List[DB.ElementId]()
+                        for eid in ids_to_delete:
+                            id_list.Add(eid)
+                        doc.Delete(id_list)
+                        deleted_count += len(ids_to_delete)
+                else:
+                    ids = collector.ToElementIds()
+                    if ids.Count > 0:
+                        doc.Delete(ids)
+                        deleted_count += ids.Count
+            except Exception as e:
+                errors.append("Category {}: {}".format(cat, str(e)))
+
+        t.Commit()
+        t.Dispose()
+
+    # Delete levels themselves if category is "levels"
+    if category in ("levels", "level"):
+        t = DB.Transaction(doc, "MCP: Delete Levels")
+        t.Start()
+        setup_failure_handling(t, use_nuclear=True)
+
+        all_levels = list(DB.FilteredElementCollector(doc).OfClass(DB.Level))
+        all_levels.sort(key=lambda x: x.Elevation)
+
+        levels_to_delete = []
+        if level_start is not None:
+            for i, lvl in enumerate(all_levels):
+                if level_start <= (i + 1) <= level_end:
+                    levels_to_delete.append(lvl)
+        else:
+            # Delete only AI levels when no range specified
+            for lvl in all_levels:
+                name = lvl.Name
+                if name.startswith("AI Level") or name.startswith("AI_Level") or name.startswith("AI "):
+                    levels_to_delete.append(lvl)
+
+        # Delete associated views first
+        all_views = DB.FilteredElementCollector(doc).OfClass(DB.View).ToElements()
+        for lvl in levels_to_delete:
+            for v in all_views:
+                try:
+                    if hasattr(v, "GenLevel") and v.GenLevel and v.GenLevel.Id == lvl.Id:
+                        if v.Pinned: v.Pinned = False
+                        doc.Delete(v.Id)
+                except: pass
+
+        for lvl in levels_to_delete:
+            try:
+                if lvl.Pinned: lvl.Pinned = False
+                doc.Delete(lvl.Id)
+                deleted_count += 1
+            except Exception as e:
+                errors.append("Level {}: {}".format(lvl.Name, str(e)))
+
+        t.Commit()
+        t.Dispose()
+
+    tg.Assimilate()
+
+    result = {"success": True, "deleted_count": deleted_count}
+    if category:
+        result["filter_category"] = category
+    if level_start is not None:
+        result["filter_levels"] = "{}-{}".format(level_start, level_end)
+    if errors:
+        result["warnings"] = errors
+    return result
+
 def edit_wall_ui(params):
     import Autodesk.Revit.DB as DB # type: ignore
     uiapp = _get_revit_app(); doc = uiapp.ActiveUIDocument.Document
@@ -163,6 +417,145 @@ def move_element_ui(params):
     DB.ElementTransformUtils.MoveElement(doc, eid, DB.XYZ(mm_to_ft(dx), mm_to_ft(dy), mm_to_ft(dz)))
     t.Commit()
     return {"success": True}
+
+def move_staircase_ui(params):
+    import Autodesk.Revit.DB as DB # type: ignore
+    import math
+    uiapp = _get_revit_app()
+    doc = uiapp.ActiveUIDocument.Document
+    from revit_mcp.building_generator import get_model_registry
+    from revit_mcp.utils import mm_to_ft, ft_to_mm
+
+    stair_idx = params['stair_idx']
+    target_x = params['target_x_mm']
+    target_y = params['target_y_mm']
+
+    registry = get_model_registry(doc)
+    
+    stair_elements = {}
+    floor_min_x, floor_min_y = float('inf'), float('inf')
+    floor_max_x, floor_max_y = float('-inf'), float('-inf')
+
+    for ai_id, eid in registry.items():
+        if ai_id.startswith("AI_Stair_"):
+            parts = ai_id.split("_")
+            try:
+                idx = int(parts[2])
+                stair_elements.setdefault(idx, []).append(eid)
+            except: pass
+        elif ai_id.startswith("AI_Floor_"):
+            try:
+                el = doc.GetElement(eid)
+                if el and hasattr(el, "get_BoundingBox"):
+                    bb = el.get_BoundingBox(None)
+                    if bb:
+                        floor_min_x = min(floor_min_x, ft_to_mm(bb.Min.X))
+                        floor_min_y = min(floor_min_y, ft_to_mm(bb.Min.Y))
+                        floor_max_x = max(floor_max_x, ft_to_mm(bb.Max.X))
+                        floor_max_y = max(floor_max_y, ft_to_mm(bb.Max.Y))
+            except: pass
+
+    if stair_idx not in stair_elements:
+        return {"error": "Staircore {} not found in model registry.".format(stair_idx)}
+
+    if floor_min_x == float('inf'):
+        return {"error": "Could not determine floor boundaries."}
+
+    floor_w = floor_max_x - floor_min_x
+    floor_l = floor_max_y - floor_min_y
+    f_center_x = (floor_min_x + floor_max_x) / 2.0
+    f_center_y = (floor_min_y + floor_max_y) / 2.0
+
+    current_positions = {}
+    for idx, eids in stair_elements.items():
+        min_x, min_y, max_x, max_y = float('inf'), float('inf'), float('-inf'), float('-inf')
+        for eid in eids:
+            try:
+                el = doc.GetElement(eid)
+                if el and hasattr(el, "get_BoundingBox"):
+                    bb = el.get_BoundingBox(None)
+                    if bb:
+                        min_x = min(min_x, ft_to_mm(bb.Min.X))
+                        min_y = min(min_y, ft_to_mm(bb.Min.Y))
+                        max_x = max(max_x, ft_to_mm(bb.Max.X))
+                        max_y = max(max_y, ft_to_mm(bb.Max.Y))
+            except: pass
+        if min_x != float('inf'):
+            current_positions[idx] = ((min_x + max_x) / 2.0, (min_y + max_y) / 2.0)
+        else:
+            current_positions[idx] = (f_center_x, f_center_y)
+
+    curr_x, curr_y = current_positions[stair_idx]
+    dx = target_x - curr_x
+    dy = target_y - curr_y
+
+    from revit_mcp.staircase_logic import _check_travel_distance
+    
+    def evaluate_positions(test_x, test_y):
+        positions_rel = []
+        for idx, (cx, cy) in current_positions.items():
+            if idx == stair_idx:
+                px, py = test_x, test_y
+            else:
+                px, py = cx, cy
+            positions_rel.append((px - f_center_x, py - f_center_y))
+        return _check_travel_distance(positions_rel, floor_w, floor_l, 60000)
+
+    is_valid = evaluate_positions(target_x, target_y)
+
+    if not is_valid:
+        best_cand = None
+        min_dist = float('inf')
+        step = 1000 
+        srch_range = 20000 
+        
+        for ring in range(1, (srch_range // step) + 1):
+            offset = ring * step
+            points_to_test = [
+                (target_x + offset, target_y),
+                (target_x - offset, target_y),
+                (target_x, target_y + offset),
+                (target_x, target_y - offset),
+                (target_x + offset, target_y + offset),
+                (target_x - offset, target_y + offset),
+                (target_x + offset, target_y - offset),
+                (target_x - offset, target_y - offset),
+            ]
+            for pt_x, pt_y in points_to_test:
+                if pt_x < floor_min_x or pt_x > floor_max_x or pt_y < floor_min_y or pt_y > floor_max_y:
+                    continue
+                if evaluate_positions(pt_x, pt_y):
+                    d = math.sqrt((pt_x - target_x)**2 + (pt_y - target_y)**2)
+                    if d < min_dist:
+                        min_dist = d
+                        best_cand = (pt_x, pt_y)
+            if best_cand: 
+                break
+                
+        if best_cand:
+            return {
+                "error": "The requested location violates the 60m fire safety travel rule.",
+                "complies": False,
+                "suggested_x": best_cand[0],
+                "suggested_y": best_cand[1]
+            }
+        else:
+            return {
+                "error": "The requested location violates the 60m fire safety travel rule, and no valid nearby location could be suggested.",
+                "complies": False
+            }
+
+    t = DB.Transaction(doc, "MCP: Move Staircase {}".format(stair_idx))
+    t.Start()
+    from System.Collections.Generic import List
+    ids = List[DB.ElementId]()
+    for eid in stair_elements[stair_idx]:
+        ids.Add(eid)
+    
+    DB.ElementTransformUtils.MoveElements(doc, ids, DB.XYZ(mm_to_ft(dx), mm_to_ft(dy), 0.0))
+    t.Commit()
+
+    return {"success": True, "complies": True, "message": "Staircore {} moved successfully.".format(stair_idx)}
 
 def create_floor_ui(params):
     import Autodesk.Revit.DB as DB # type: ignore
@@ -321,6 +714,18 @@ def edit_type_ui(params):
     if not etype: return {"error": "Type not found"}
     t = DB.Transaction(doc, "MCP: Edit Type"); t.Start(); set_params_batch(etype, params.get('parameters', {})); t.Commit()
     return {"success": True}
+
+def regenerate_staircases_ui():
+    import Autodesk.Revit.DB as DB # type: ignore
+    from revit_mcp.revit_workers import RevitWorkers
+    uiapp = _get_revit_app(); doc = uiapp.ActiveUIDocument.Document
+    workers = RevitWorkers(doc)
+    try:
+        res = workers.regenerate_staircases_only()
+        return res
+    except Exception as e:
+        import traceback
+        return {"status": "Error", "message": "Failed: {}\n{}".format(str(e), traceback.format_exc())}
 
 def get_building_metrics_ui():
     import Autodesk.Revit.DB as DB # type: ignore

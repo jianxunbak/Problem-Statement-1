@@ -151,10 +151,9 @@ def setup_failure_handling(transaction, use_nuclear=False):
         from revit_mcp.preprocessors import HideJoinFailuresPreprocessor, NuclearJoinGuard
         doc = transaction.GetDocument()
         if use_nuclear:
-            logic = NuclearJoinGuard(doc)
+            preprocessor = NuclearJoinGuard(doc)
         else:
-            logic = HideJoinFailuresPreprocessor(doc)
-        preprocessor = DB.IFailuresPreprocessor(logic)
+            preprocessor = HideJoinFailuresPreprocessor(doc)
         options = transaction.GetFailureHandlingOptions()
         options.SetFailuresPreprocessor(preprocessor)
         transaction.SetFailureHandlingOptions(options)

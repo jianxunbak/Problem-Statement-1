@@ -2,9 +2,11 @@
 import json
 import time
 try:
-    from mcp.server.fastmcp import FastMCP
+    from mcp.server.fastmcp import FastMCP, Context
 except ImportError:
-    from fastmcp import FastMCP
+    from fastmcp import FastMCP, Context
+import asyncio
+from revit_mcp.progress_tracker import BuildProgressTracker
 
 from revit_mcp.state_manager import state_manager
 from revit_mcp.building_generator import BuildingSystem
@@ -48,9 +50,38 @@ def delete_walls() -> str:
     return json.dumps(mcp_event_handler.run_on_main_thread(logic.delete_walls_ui))
 
 @mcp.tool()
+def delete_all_elements() -> str:
+    """Delete all model elements (walls, floors, columns, doors, windows, roofs, stairs, grids) and all AI-generated levels from the model."""
+    from revit_mcp.bridge import mcp_event_handler
+    return json.dumps(mcp_event_handler.run_on_main_thread(logic.delete_all_elements_ui))
+
+@mcp.tool()
+def delete_elements_by_filter(category: str = "", level_start: int = None, level_end: int = None) -> str:
+    """Delete elements filtered by category and/or level range.
+
+    category: walls, floors, columns, doors, windows, roofs, stairs, railings, grids, levels (empty = all categories)
+    level_start: first floor number to delete from (1-based). Omit to target all levels.
+    level_end: last floor number to delete to (1-based). Defaults to level_start if omitted.
+
+    Examples: delete_elements_by_filter(category="walls") deletes all walls.
+              delete_elements_by_filter(category="columns", level_start=5, level_end=10) deletes columns on floors 5-10.
+              delete_elements_by_filter(level_start=3, level_end=3) deletes everything on floor 3.
+    """
+    from revit_mcp.bridge import mcp_event_handler
+    params = {"category": category, "level_start": level_start, "level_end": level_end}
+    return json.dumps(mcp_event_handler.run_on_main_thread(logic.delete_elements_by_filter_ui, params))
+
+@mcp.tool()
 def move_element(element_id: str, dx_mm: float = 0, dy_mm: float = 0, dz_mm: float = 0, direction: str = "", distance_mm: float = 0) -> str:
     from revit_mcp.bridge import mcp_event_handler
     return json.dumps(mcp_event_handler.run_on_main_thread(logic.move_element_ui, locals()))
+
+@mcp.tool()
+def move_staircase(stair_idx: int, target_x_mm: float, target_y_mm: float) -> str:
+    """Move a specific staircore (all its walls, floors) to a new location, checking the 60m travel rule first."""
+    from revit_mcp.bridge import mcp_event_handler
+    params = {"stair_idx": stair_idx, "target_x_mm": target_x_mm, "target_y_mm": target_y_mm}
+    return json.dumps(mcp_event_handler.run_on_main_thread(logic.move_staircase_ui, params))
 
 @mcp.tool()
 def create_floor(width_mm: float, length_mm: float, center_x: float = 0, center_y: float = 0, level_name: str = "") -> str:
@@ -191,12 +222,16 @@ def edit_type(type_name: str = "", type_id: str = "", parameters: dict = None) -
     return json.dumps(mcp_event_handler.run_on_main_thread(logic.edit_type_ui, {"type_name": type_name, "type_id": type_id, "parameters": parameters or {}}))
 
 @mcp.tool()
-def orchestrate_build(prompt: str) -> str:
+async def orchestrate_build(prompt: str, ctx: Context = None) -> str:
     from . import dispatcher
-    return dispatcher.orchestrator.run_full_stack(_uiapp, prompt)
+    from revit_mcp.runner import log
+    log(f"DEBUG: orchestrate_build called. ctx={bool(ctx)}")
+    loop = asyncio.get_running_loop()
+    tracker = BuildProgressTracker(ctx, loop)
+    return await asyncio.to_thread(dispatcher.orchestrator.run_full_stack, _uiapp, prompt, tracker)
 
 @mcp.tool()
-def edit_entire_building_dimensions(**kwargs) -> str:
+async def edit_entire_building_dimensions(ctx: Context = None, **kwargs) -> str:
     from .gemini_client import client
     from revit_mcp.bridge import mcp_event_handler
     
@@ -211,16 +246,24 @@ def edit_entire_building_dimensions(**kwargs) -> str:
     if kwargs.get('advanced_instructions'):
         prompt += ". " + kwargs['advanced_instructions']
     
-    return orchestrate_build(prompt)
+    return await orchestrate_build(prompt, ctx)
 
 @mcp.tool()
-def generate_building_system(width_mm: float, depth_mm: float, height_mm: float) -> str:
-    return edit_entire_building_dimensions(width_mm=width_mm, depth_mm=depth_mm, height_mm=height_mm)
+async def generate_building_system(ctx: Context = None, width_mm: float = 0, depth_mm: float = 0, height_mm: float = 0) -> str:
+    return await edit_entire_building_dimensions(ctx=ctx, width_mm=width_mm, depth_mm=depth_mm, height_mm=height_mm)
 
 @mcp.tool()
 def sync_building_manifest(manifest_json: str) -> str:
     from revit_mcp.bridge import mcp_event_handler
     return json.dumps(mcp_event_handler.run_on_main_thread(lambda: BuildingSystem(_uiapp.ActiveUIDocument.Document).sync_manifest(json.loads(manifest_json))))
+
+@mcp.tool()
+def regenerate_staircases() -> str:
+    """Regenerate ONLY the staircase runs based on current Revit level heights.
+    Use this to dynamically heal stairs without triggering a full building regeneration.
+    """
+    from revit_mcp.bridge import mcp_event_handler
+    return json.dumps(mcp_event_handler.run_on_main_thread(logic.regenerate_staircases_ui))
 
 @mcp.tool()
 def check_bridge_health() -> str:

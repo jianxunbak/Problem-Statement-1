@@ -15,18 +15,19 @@ class Orchestrator:
         self.workers = None
         self.generator = None
 
-    def run_full_stack(self, uiapp, user_prompt):
+    def run_full_stack(self, uiapp, user_prompt, tracker=None):
         # Do NOT access uiapp.ActiveUIDocument here (thread violation).
         # Simply pass uiapp or rely on the server's global _uiapp if preferred,
         # but here we pass it down.
-        return self._orchestrate(uiapp, user_prompt)
+        return self._orchestrate(uiapp, user_prompt, tracker)
 
     def log(self, message):
         client.log(message)
 
-    def _orchestrate(self, uiapp, user_prompt):
+    def _orchestrate(self, uiapp, user_prompt, tracker=None):
         # All imports moved to top of module
         self.log("Dispatcher: Gathering current BIM state...")
+        if tracker: tracker.start()
 
         # Load Building Presets
         presets = load_presets()
@@ -169,13 +170,24 @@ class Orchestrator:
                 self.log(f"Error gathering state: {e}")
                 state_text = ""
 
+        # 0. Intercept delete/clear/wipe requests — bypass Gemini entirely
+        prompt_lower = user_prompt.lower().strip()
+        delete_result = self._try_intercept_delete(prompt_lower)
+        if delete_result is not None:
+            return delete_result
+
         # 1. Generate Master Manifest (Fast-Track)
         self.log("Step 2: Requesting building plan from Gemini AI (model: {})".format(client.model))
+        if tracker: tracker.report(f"Sending to Gemini AI ({client.model}) for geometric reasoning... This may take 10-20s.")
+
         ai_start = time.time()
         full_prompt = DISPATCHER_PROMPT + presets_text + "\n" + state_text + "\nUser Request: " + user_prompt
         manifest_json = client.generate_content(full_prompt)
         ai_duration = time.time() - ai_start
         self.log("Step 3: Manifest received from AI. (Time: {:.2f}s). Parsing...".format(ai_duration))
+        if tracker:
+            tracker.report(f"AI responded in {ai_duration:.1f}s. Parsing building manifest...")
+            tracker.analyze_manifest(manifest_json)
         self.log(f"Gemini Payload -> {manifest_json}")
         
         try:
@@ -209,7 +221,7 @@ class Orchestrator:
             # Use the high-performance RevitWorkers
             self.log("Step 4: Initializing RevitWorkers and Executing Manifest (Main Thread)...")
             from .revit_workers import RevitWorkers
-            workers = RevitWorkers(doc)
+            workers = RevitWorkers(doc, tracker=tracker)
             
             try:
                 results = workers.execute_fast_manifest(manifest)
@@ -219,6 +231,8 @@ class Orchestrator:
                 # Use 'BIM Polish' command if perfect joins are required.
                 self.log("BIM Health: Optimized Build complete (Draft Mode).")
                 
+                if tracker:
+                    return tracker.generate_final_report(base_summary="Build operations applied in Revit.")
                 return "Build Completed successfully."
             except Exception as e:
                 import traceback
@@ -228,6 +242,72 @@ class Orchestrator:
             
         self.log("Step 6: Submitting build action to Revit main thread...")
         return mcp_event_handler.run_on_main_thread(main_action)
+
+    def _try_intercept_delete(self, prompt_lower):
+        """Detect delete/clear/wipe intent and execute directly, bypassing Gemini.
+        Returns a result string if handled, or None to fall through to Gemini."""
+        import re
+
+        action_words = r"(?:delete|remove|clear|wipe|purge)"
+
+        # --- "delete everything" / "delete all" / "clear the model" ---
+        everything_patterns = [
+            rf"{action_words}\s+(?:every\s*thing|everyth?ing|all\b(?!\s+\w))",  # "delete everything", "delete everyting", "delete all" (not "delete all walls")
+            rf"{action_words}\s+the\s+(?:model|building|project)",
+            rf"clean\s+the\s+(?:model|building|project)",
+        ]
+        for pat in everything_patterns:
+            if re.search(pat, prompt_lower):
+                self.log("Dispatcher: Delete-all intent detected. Bypassing Gemini.")
+                from revit_mcp import tool_logic as logic
+                result = mcp_event_handler.run_on_main_thread(logic.delete_all_elements_ui)
+                self.log("Delete-all result: {}".format(result))
+                return "Deleted {} elements from the model.".format(result.get("deleted_count", 0))
+
+        # --- Partial delete: "delete all walls", "remove columns on floor 3-5" ---
+        category_names = r"(?:walls?|floors?|slabs?|columns?|doors?|windows?|roofs?|stairs?|staircases?|railings?|grids?|levels?)"
+        # Match: "delete [all] <category> [on/from floor/level X[-Y]]"
+        partial_match = re.search(
+            rf"{action_words}\s+(?:all\s+)?({category_names})(?:\s+(?:on|from|at)\s+(?:floor|level|storey)s?\s+(\d+)(?:\s*[-–to]+\s*(\d+))?)?",
+            prompt_lower
+        )
+        if partial_match:
+            category = partial_match.group(1)
+            level_start = int(partial_match.group(2)) if partial_match.group(2) else None
+            level_end = int(partial_match.group(3)) if partial_match.group(3) else None
+
+            params = {"category": category, "level_start": level_start, "level_end": level_end}
+            desc = "category='{}'".format(category)
+            if level_start is not None:
+                desc += ", floors {}-{}".format(level_start, level_end or level_start)
+
+            self.log("Dispatcher: Partial delete detected ({}). Bypassing Gemini.".format(desc))
+            from revit_mcp import tool_logic as logic
+            result = mcp_event_handler.run_on_main_thread(logic.delete_elements_by_filter_ui, params)
+            self.log("Partial delete result: {}".format(result))
+            if result.get("error"):
+                return "Delete failed: {}".format(result["error"])
+            return "Deleted {} {} elements.".format(result.get("deleted_count", 0), category)
+
+        # --- "delete everything on floor 3" (no category, just level) ---
+        level_only_match = re.search(
+            rf"{action_words}\s+(?:everything|all)\s+(?:on|from|at)\s+(?:floor|level|storey)s?\s+(\d+)(?:\s*[-–to]+\s*(\d+))?",
+            prompt_lower
+        )
+        if level_only_match:
+            level_start = int(level_only_match.group(1))
+            level_end = int(level_only_match.group(2)) if level_only_match.group(2) else None
+
+            params = {"category": "", "level_start": level_start, "level_end": level_end}
+            self.log("Dispatcher: Level-scoped delete detected (floors {}-{}). Bypassing Gemini.".format(level_start, level_end or level_start))
+            from revit_mcp import tool_logic as logic
+            result = mcp_event_handler.run_on_main_thread(logic.delete_elements_by_filter_ui, params)
+            self.log("Level-scoped delete result: {}".format(result))
+            if result.get("error"):
+                return "Delete failed: {}".format(result["error"])
+            return "Deleted {} elements on floor(s) {}-{}.".format(result.get("deleted_count", 0), level_start, level_end or level_start)
+
+        return None
 
     def _extract_json(self, text):
         if "```json" in text:

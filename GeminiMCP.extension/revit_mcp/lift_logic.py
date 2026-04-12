@@ -90,15 +90,26 @@ def get_total_core_layout(num_lifts, internal_size=(2500, 2500), lobby_width=300
 
 def get_block_y_offset(b_idx, num_blocks, block_d):
     """
-    STABLE LAYOUT: Block 0 is always at center (0 offset).
-    Subsequent blocks alternate around it.
-    This prevents Scenario 2 'Broken Pieces' by keeping B1 stationary.
+    Return the Y offset for lift-core block b_idx so the entire multi-block
+    assembly is centred on the building centroid (Y = 0).
+
+    For N blocks each of depth block_d the assembly total depth is N * block_d.
+    We start block 0 at  -(N-1)/2 * block_d  so the geometric centre lands at 0.
+
+    Examples
+    --------
+    N=1 : block 0 at  0              (single core, unchanged)
+    N=2 : block 0 at -block_d/2,     block 1 at +block_d/2
+    N=3 : block 0 at -block_d,       block 1 at  0,  block 2 at +block_d
+    N=4 : block 0 at -1.5*block_d,   ...,           block 3 at +1.5*block_d
+
+    Previously block 0 was always at 0 and block 1 at +block_d, which shifted
+    the two-block assembly centre to +block_d/2 (~4 400 mm for a typical core),
+    making both the lift core and the staircases appear off-centre on typical
+    floor plates.
     """
-    if b_idx == 0: return 0.0
-    # Alternating offsets: 1 -> +d, 2 -> -d, 3 -> +2d, 4 -> -2d
-    magnitude = ((b_idx + 1) // 2) * block_d
-    direction = 1 if b_idx % 2 != 0 else -1
-    return magnitude * direction
+    start_offset = -((num_blocks - 1) / 2.0) * block_d
+    return start_offset + b_idx * block_d
 
 
 def get_shaft_void_rectangles_mm(num_lifts, center_pos=(0, 0), internal_size=(2500, 2500), lobby_width=3000):

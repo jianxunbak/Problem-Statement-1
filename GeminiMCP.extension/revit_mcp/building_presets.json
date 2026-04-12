@@ -38,7 +38,7 @@
         "max_travel_distance": 60000,
         "staircase_spec": {
           "riser": 150,
-          "tread": 275,
+          "tread": 300,
           "width_of_flight": 1500,
           "landing_width": 1800
         },
