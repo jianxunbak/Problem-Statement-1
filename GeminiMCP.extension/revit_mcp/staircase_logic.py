@@ -72,6 +72,26 @@ def _calc_num_flights(floor_height_mm, typical_floor_height_mm, riser=150, is_to
     return num_flights
 
 
+def _get_flight_list(floor_height_mm, typical_floor_height_mm, riser=150, is_top_floor=False):
+    """Return a list of riser counts per flight, ensuring consistency across the building."""
+    num_flights = _calc_num_flights(floor_height_mm, typical_floor_height_mm, riser, is_top_floor)
+    total_risers = _snap_risers(floor_height_mm, riser)
+    
+    # SPECIAL CASE: For the top floor leading to roof, force the 1st flight
+    # to match typical floor riser count so mid-landings ALIGN vertically.
+    if is_top_floor and num_flights == 2 and typical_floor_height_mm > 0:
+        rpf_typical = _risers_per_flight_typical(typical_floor_height_mm, riser)
+        if 0 < rpf_typical < total_risers:
+            return [rpf_typical, total_risers - rpf_typical]
+
+    if num_flights > 0:
+        per_flight = total_risers // num_flights
+        remainder = total_risers % num_flights
+        return [per_flight + (1 if i < remainder else 0) for i in range(num_flights)]
+    
+    return [total_risers]
+
+
 def adjust_storey_height(floor_height_mm, typical_floor_height_mm, riser=150, is_top_floor=False):
     """Adjust a floor height so it produces an even number of risers (even flights)
     AND respects the 2400mm vertical headroom requirement for multi-wrap stairs.
@@ -660,13 +680,10 @@ def generate_staircase_manifest(positions, levels_data, _enclosure_width_mm=None
                     # Returns (f_y_start, arr_left, arr_right) for level li+1
                     f_h = levels_data[li+1]['elevation'] - levels_data[li]['elevation']
                     if f_h <= 0: return base_y + t + w_landing, base_y + t + w_landing, base_y + t + w_landing
-                    tot_r = _snap_risers(f_h, riser)
-                    nf = _calc_num_flights(f_h, typical_floor_height_mm or 4000.0, riser)
-                    if nf > 0:
-                        p_f = tot_r // nf
-                        rem = tot_r % nf
-                        f_list = [p_f + (1 if k < rem else 0) for k in range(nf)]
-                    else: f_list = [tot_r]
+                    
+                    is_top_f = (li == len(levels_data) - 2)
+                    typ_h = typical_floor_height_mm or 4000.0
+                    f_list = _get_flight_list(f_h, typ_h, riser, is_top_floor=is_top_f)
                     
                     trd = spec.get("tread", 300)
                     r_len = max(f_list[0] - 1, 1) * trd
@@ -682,19 +699,29 @@ def generate_staircase_manifest(positions, levels_data, _enclosure_width_mm=None
                         return fy_s, fy_s + la_len, fy_s
                     else:
                         # Safety: pull landing depth back 50mm from calculated arrival to avoid angled clashes
-                        return fy_s, fy_s, fy_s + (la_len - lb_len) - 50
+                        # Only apply if not aligning perfectly
+                        arr_y_l = fy_s
+                        arr_y_r = fy_s + (la_len - lb_len)
+                        if la_len != lb_len:
+                            arr_y_r -= 50
+                        return fy_s, arr_y_l, arr_y_r
 
                 # Landing at level i: 
                 # Left side matches departing flight (i) or standard if roof
                 # Right side matches arriving flight (i-1)
-                fy_s_dep, _, _ = _get_flight_arr(i) if not is_roof else (base_y + t + w_landing, 0, 0)
-                _, arr_l, arr_r = _get_flight_arr(i-1)
+                if is_roof:
+                    # Roof landing should match the arrival of the last flight exactly
+                    _, arr_l, arr_r = _get_flight_arr(i-1)
+                    req_l, req_r = arr_l, arr_r
+                else:
+                    fy_s_dep, _, _ = _get_flight_arr(i)
+                    _, arr_l, arr_r = _get_flight_arr(i-1)
+                    req_l = max(fy_s_dep, arr_l)
+                    req_r = arr_r
                 
-                req_l = max(fy_s_dep, arr_l)
-                req_r = arr_r
                 front_y = base_y + t
                 
-                if abs(req_l - req_r) < 1.0:
+                if abs(req_l - req_r) < 5.0:
                     floors.append({
                         "id": "AI_{}_L{}_MainLanding".format(s_tag, i + 1),
                         "level_id": lvl_id, "elevation": lvl['elevation'],
@@ -828,29 +855,8 @@ def get_stair_run_data(positions, levels_data, _enclosure_width_mm=None, spec=No
             if floor_height <= 0:
                 continue
             is_top_floor = (i == len(levels_data) - 2)
-            num_flights = _calc_num_flights(floor_height, typ_h, riser, is_top_floor=is_top_floor)
-            floor_risers = _snap_risers(floor_height, riser)
-            
-            # Ensure even distribution across flights without rounding up
-            # SPECIAL CASE: For the top floor leading to roof, force the 1st flight
-            # to match typical floor riser count so mid-landings ALIGN vertically.
-            if is_top_floor and num_flights == 2 and typical_floor_height_mm > 0:
-                rpf_typical = _risers_per_flight_typical(typical_floor_height_mm, riser)
-                if 0 < rpf_typical < floor_risers:
-                    flight_list = [rpf_typical, floor_risers - rpf_typical]
-                else:
-                    per_flight = floor_risers // num_flights
-                    remainder = floor_risers % num_flights
-                    flight_list = [per_flight + (1 if j < remainder else 0) for j in range(num_flights)]
-            elif num_flights > 0:
-                # floor_risers is already the right count (floor-based)
-                # Just ensure it's evenly split across flights
-                per_flight = floor_risers // num_flights
-                # If not perfectly divisible, keep current split (some floors may have one extra)
-                remainder = floor_risers % num_flights
-                flight_list = [per_flight + (1 if j < remainder else 0) for j in range(num_flights)]
-            else:
-                flight_list = [floor_risers]
+            flight_list = _get_flight_list(floor_height, typ_h, riser, is_top_floor=is_top_floor)
+            floor_risers = sum(flight_list)
             
             # Compute actual riser height for use in Revit
             actual_riser_h = floor_height / float(floor_risers) if floor_risers else float(riser)

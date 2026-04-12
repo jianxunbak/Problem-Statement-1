@@ -52,10 +52,13 @@ class TestStaircaseLogic(unittest.TestCase):
         runs = get_stair_run_data([(0, 0)], levels_data, 3000, {"riser": 150}, typical_h)
         self.assertEqual(len(runs), 1)
         run = runs[0]
-        self.assertEqual(run["flight_list"], [14, 14, 14, 14])
-        self.assertEqual(run["num_flight_pairs"], 2)
-        # intermediate heights: after pair 0, elevation = 14+14 = 28 risers * 150mm = 4200mm
-        self.assertAlmostEqual(run["intermediate_heights_mm"][0], 4200.0, places=0)
+        # Updated Rule: Top floor (leading to roof) forces 2 flights to avoid headroom issues,
+        # and aligns the first flight with typical rpf (14).
+        # floor_risers(8400, 150) = 56. flight_list = [14, 42]
+        self.assertEqual(run["flight_list"], [14, 42])
+        self.assertEqual(run["num_flight_pairs"], 1)
+        # intermediate heights: none for 1-pair stairs
+        self.assertEqual(len(run["intermediate_heights_mm"]), 0)
 
     def test_void_rectangles(self):
         # 100mm offset inside
