@@ -175,73 +175,103 @@ class Orchestrator:
         delete_result = self._try_intercept_delete(prompt_lower)
         if delete_result is not None:
             return delete_result
-
-        # 1. Generate Master Manifest (Fast-Track)
+            
+        # 1. Generate Master Manifest (Fast-Track) with Agentic Loop
         self.log("Step 2: Requesting building plan from Gemini AI (model: {})".format(client.model))
         if tracker: tracker.report(f"Sending to Gemini AI ({client.model}) for geometric reasoning... This may take 10-20s.")
 
-        ai_start = time.time()
-        full_prompt = DISPATCHER_PROMPT + presets_text + "\n" + state_text + "\nUser Request: " + user_prompt
-        manifest_json = client.generate_content(full_prompt)
-        ai_duration = time.time() - ai_start
-        self.log("Step 3: Manifest received from AI. (Time: {:.2f}s). Parsing...".format(ai_duration))
-        if tracker:
-            tracker.report(f"AI responded in {ai_duration:.1f}s. Parsing building manifest...")
-            tracker.analyze_manifest(manifest_json)
-        self.log(f"Gemini Payload -> {manifest_json}")
+        current_prompt = DISPATCHER_PROMPT + presets_text + "\n" + state_text + "\nUser Request: " + user_prompt
+        max_attempts = 3
         
-        try:
-            manifest_str = self._extract_json(manifest_json)
-            manifest = json.loads(manifest_str)
-            self.log("Manifest parsed successfully.")
+        for attempt in range(max_attempts):
+            self.log(f"--- Orchestration Attempt {attempt + 1}/{max_attempts} ---")
             
-            # UNWRAP AI TOOL-CALL-STYLE WRAPPERS
-            for wrapper in ["orchestrate_build", "edit_entire_building_dimensions"]:
-                if wrapper in manifest and len(manifest) == 1:
-                    self.log(f"Dispatcher: Unwrapping manifest from '{wrapper}' key.")
-                    manifest = manifest[wrapper]
-                    break
+            ai_start = time.time()
+            manifest_json = client.generate_content(current_prompt)
+            ai_duration = time.time() - ai_start
             
-            # CHECK FOR QUERY RESPONSE
-            if "response" in manifest and not any(k in manifest for k in ["project_setup", "levels", "shell"]):
-                self.log("Dispatcher: AI detected a QUESTION. Returning natural language response.")
-                return str(manifest["response"])
-        except Exception as e:
-            import traceback
-            err = "Manifest Parsing Error: {}\n{}".format(str(e), traceback.format_exc())
-            self.log(err)
-            return err
-
-        # 2. Single Transaction Batching
-        def main_action():
-            import Autodesk.Revit.DB as DB # type: ignore
-            from .building_generator import BuildingSystem
-            doc = uiapp.ActiveUIDocument.Document
-            
-            # Use the high-performance RevitWorkers
-            self.log("Step 4: Initializing RevitWorkers and Executing Manifest (Main Thread)...")
-            from .revit_workers import RevitWorkers
-            workers = RevitWorkers(doc, tracker=tracker)
+            self.log("Manifest received from AI. (Time: {:.2f}s). Parsing...".format(ai_duration))
+            if tracker:
+                tracker.report(f"AI response (Attempt {attempt+1}) in {ai_duration:.1f}s.")
+                
+            # Stream Intent and Resolution Thoughts to UI
+            self._stream_narrative_to_user(manifest_json, tracker)
             
             try:
-                results = workers.execute_fast_manifest(manifest)
-                self.log("Manifest execution summary: {}".format(results.get('summary', 'Success')))
+                manifest_str = self._extract_json(manifest_json)
+                manifest = json.loads(manifest_str)
                 
-                # Global cleanup and documentation DISABLED for speed during rapid editing.
-                # Use 'BIM Polish' command if perfect joins are required.
-                self.log("BIM Health: Optimized Build complete (Draft Mode).")
+                # UNWRAP AI TOOL-CALL-STYLE WRAPPERS
+                for wrapper in ["orchestrate_build", "edit_entire_building_dimensions"]:
+                    if wrapper in manifest and len(manifest) == 1:
+                        manifest = manifest[wrapper]
+                        break
                 
+                # CHECK FOR QUERY RESPONSE (Natural Language only)
+                if "response" in manifest and not any(k in manifest for k in ["project_setup", "levels", "shell"]):
+                    self.log("Dispatcher: AI detected a QUESTION. Returning natural language response.")
+                    return str(manifest["response"])
+                
+                # EXECUTE BUILD (Validate/Build)
+                def main_action():
+                    import Autodesk.Revit.DB as DB # type: ignore
+                    doc = uiapp.ActiveUIDocument.Document
+                    workers = RevitWorkers(doc, tracker=tracker)
+                    return workers.execute_fast_manifest(manifest)
+
+                self.log(f"Attempting build execution for Attempt {attempt + 1}...")
+                results = mcp_event_handler.run_on_main_thread(main_action)
+                
+                # CHECK FOR CONFLICTS
+                if isinstance(results, dict) and results.get("status") == "CONFLICT":
+                    conflict_desc = results.get("description", "Unknown Spatial Conflict")
+                    self.log(f"CONFLICT DETECTED in Attempt {attempt+1}: {conflict_desc}")
+                    if tracker:
+                        tracker.report(f"### [Validation Failed] Attempt {attempt+1}\n{conflict_desc}")
+                    
+                    if attempt < max_attempts - 1:
+                        current_prompt += f"\n\n[SPATIAL CONFLICT IN PREVIOUS ATTEMPT]:\n{conflict_desc}\n\nPlease resolve this conflict creatively in your next manifest. Explain your solution in the <resolution_thoughts> block."
+                        continue
+                    else:
+                        self.log("Reached maximum orchestration attempts.")
+                        return f"Failed to build after {max_attempts} attempts due to structural/spatial conflicts: {conflict_desc}"
+                
+                # SUCCESS: Return tracker report or summary
                 if tracker:
-                    return tracker.generate_final_report(base_summary="Build operations applied in Revit.")
+                    tracker.analyze_manifest(manifest)
+                    return tracker.generate_final_report(base_summary="Build Successful (Agentic Resolution Applied).")
                 return "Build Completed successfully."
+
             except Exception as e:
                 import traceback
-                error_trace = traceback.format_exc()
-                self.log(f"Manifest execution FAILED: {e}\n{error_trace}")
-                raise e
+                err = "Orchestration Error (Attempt {}): {}\n{}".format(attempt + 1, str(e), traceback.format_exc())
+                self.log(err)
+                if attempt == max_attempts - 1:
+                    return err
+                current_prompt += f"\n\n[ERROR IN PREVIOUS ATTEMPT]:\n{str(e)}\n\nPlease ensure you follow the JSON schema strictly."
+                time.sleep(1)
+
+    def _stream_narrative_to_user(self, text, tracker):
+        """Extracts and streams <architectural_intent> and <resolution_thoughts> to the user."""
+        if not tracker: return
+        
+        import re
+        import time
+        intent_match = re.search(r"<architectural_intent>(.*?)</architectural_intent>", text, re.DOTALL)
+        if intent_match:
+            intent_blocks = intent_match.group(1).strip().split("\n")
+            for block in intent_blocks:
+                if block.strip():
+                    tracker.report(f"**Architectural Intent:**\n{block.strip()}", is_narrative=True)
+                    time.sleep(0.5) # Prevent client-side message squashing
             
-        self.log("Step 6: Submitting build action to Revit main thread...")
-        return mcp_event_handler.run_on_main_thread(main_action)
+        res_match = re.search(r"<resolution_thoughts>(.*?)</resolution_thoughts>", text, re.DOTALL)
+        if res_match:
+            res_blocks = res_match.group(1).strip().split("\n")
+            for block in res_blocks:
+                if block.strip():
+                    tracker.report(f"**Conflict Resolution Logic:**\n{block.strip()}", is_narrative=True)
+                    time.sleep(0.5)
 
     def _try_intercept_delete(self, prompt_lower):
         """Detect delete/clear/wipe intent and execute directly, bypassing Gemini.

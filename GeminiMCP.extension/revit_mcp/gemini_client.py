@@ -132,7 +132,6 @@ class GeminiClient:
             "contents": [{"role": "user", "parts": [{"text": prompt}]}],
             "generationConfig": {
                 "temperature": 0.1,
-                "responseMimeType": "application/json",
             }
         }
         

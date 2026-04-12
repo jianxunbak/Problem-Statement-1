@@ -23,9 +23,90 @@ def get_doc_info_ui():
     if not uiapp or not uiapp.ActiveUIDocument:
         return {"error": "No active document."}
     doc = uiapp.ActiveUIDocument.Document
+    
+    import Autodesk.Revit.DB as DB # type: ignore
+    from revit_mcp.building_generator import get_model_registry # type: ignore
+    
+    registry = get_model_registry(doc)
+    
+    # 1. Collect Floor boundaries
+    floors = DB.FilteredElementCollector(doc).OfClass(DB.Floor).WhereElementIsNotElementType()
+    floor_boundaries = []
+    for f in floors:
+        bb = f.get_BoundingBox(None)
+        if bb:
+            floor_boundaries.append({
+                "id": str(f.Id.Value),
+                "level": doc.GetElement(f.LevelId).Name if f.LevelId != DB.ElementId.InvalidElementId else "Unknown",
+                "bounds": [ft_to_mm(bb.Min.X), ft_to_mm(bb.Min.Y), ft_to_mm(bb.Max.X), ft_to_mm(bb.Max.Y)]
+            })
+            
+    # 2. Collect Core locations (Lifts and Stairs)
+    core_bounds = []
+    for ai_id, eid in registry.items():
+        if "Lift" in ai_id or "Stair" in ai_id:
+            el = doc.GetElement(eid)
+            if el:
+                bb = el.get_BoundingBox(None)
+                if bb:
+                    core_bounds.append([ft_to_mm(bb.Min.X), ft_to_mm(bb.Min.Y), ft_to_mm(bb.Max.X), ft_to_mm(bb.Max.Y)])
+                    
+    # Simplify core bounds to a single bounding area if possible, or keep list
+    unified_core = None
+    if core_bounds:
+        xmin = min(b[0] for b in core_bounds)
+        ymin = min(b[1] for b in core_bounds)
+        xmax = max(b[2] for b in core_bounds)
+        ymax = max(b[3] for b in core_bounds)
+        unified_core = [xmin, ymin, xmax, ymax]
+
+    # 3. Detect "Leftover" or Unmanaged Objects (Flying all over)
+    unmanaged_obstructions = []
+    if floor_boundaries:
+        import System.Collections.Generic as Generic # type: ignore
+        min_x = min(f["bounds"][0] for f in floor_boundaries) - 5000
+        min_y = min(f["bounds"][1] for f in floor_boundaries) - 5000
+        max_x = max(f["bounds"][2] for f in floor_boundaries) + 5000
+        max_y = max(f["bounds"][3] for f in floor_boundaries) + 5000
+        
+        scan_cats = [
+            DB.BuiltInCategory.OST_Walls, DB.BuiltInCategory.OST_Floors,
+            DB.BuiltInCategory.OST_StructuralColumns, DB.BuiltInCategory.OST_Columns,
+            DB.BuiltInCategory.OST_Windows, DB.BuiltInCategory.OST_Doors,
+            DB.BuiltInCategory.OST_GenericModel
+        ]
+        
+        cat_list = Generic.List[DB.BuiltInCategory]()
+        for c in scan_cats: cat_list.Add(c)
+        
+        provider = DB.ElementMulticategoryFilter(cat_list)
+        others = DB.FilteredElementCollector(doc).WherePasses(provider).WhereElementIsNotElementType().ToElements()
+        
+        for el in others:
+            if str(el.Id.Value) in [str(v) for v in registry.values()]: continue
+            p = el.get_Parameter(DB.BuiltInParameter.ALL_MODEL_INSTANCE_COMMENTS)
+            if p and p.HasValue and p.AsString().startswith("AI_"): continue
+            
+            bb = el.get_BoundingBox(None)
+            if bb:
+                ex1, ey1 = ft_to_mm(bb.Min.X), ft_to_mm(bb.Min.Y)
+                ex2, ey2 = ft_to_mm(bb.Max.X), ft_to_mm(bb.Max.Y)
+                if not (ex2 < min_x or ex1 > max_x or ey2 < min_y or ey1 > max_y):
+                    unmanaged_obstructions.append({
+                        "id": str(el.Id.Value),
+                        "category": el.Category.Name,
+                        "bounds": [ex1, ey1, ex2, ey2]
+                    })
+
     return {
         "title": doc.Title,
-        "path": doc.PathName or "Unsaved Document"
+        "path": doc.PathName or "Unsaved Document",
+        "vision": {
+            "floor_boundaries": floor_boundaries,
+            "core_bounds": unified_core,
+            "all_core_elements": core_bounds,
+            "unmanaged_spatial_obstructions": unmanaged_obstructions[:20] # Limit to 20 for prompt tokens
+        }
     }
 
 def create_wall_ui(params):

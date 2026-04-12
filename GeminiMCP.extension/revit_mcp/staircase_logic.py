@@ -191,7 +191,8 @@ def get_max_shaft_depth(levels_data, spec=None, typical_floor_height_mm=None):
 def calculate_staircase_positions(floor_dims_mm, core_center_mm,
                                   lift_core_bounds_mm,
                                   typical_floor_height_mm, spec=None,
-                                  max_travel_mm=60000):
+                                  max_travel_mm=60000,
+                                  num_lifts=None, lobby_width=3000):
     """Determine staircase centre positions.
 
     Args:
@@ -219,13 +220,15 @@ def calculate_staircase_positions(floor_dims_mm, core_center_mm,
     # --- Primary pair: abutt Y-ends of lift core [rules b, c, d] ---
     stair_south_y = core_ymin - shaft_d / 2.0
     stair_north_y = core_ymax + shaft_d / 2.0
+
+    # Rule: for single row lifts (<4), south staircase (front/door side) must be set back for lobby
+    if num_lifts is not None and num_lifts < 4:
+        stair_south_y -= lobby_width
+
     positions = [(cx, stair_south_y), (cx, stair_north_y)]
 
     # --- 60 m rule [rules e, f] ---
-    max_w = max(d[0] for d in floor_dims_mm) if floor_dims_mm else 50000
-    max_l = max(d[1] for d in floor_dims_mm) if floor_dims_mm else 50000
-
-    if _check_travel_distance(positions, max_w, max_l, max_travel_mm):
+    if _check_travel_distance(positions, floor_dims_mm, max_travel_mm):
         return positions
 
     # Need additional staircases — add at perimeter, minimising count.
@@ -234,14 +237,25 @@ def calculate_staircase_positions(floor_dims_mm, core_center_mm,
     enc_w = 2 * w_flight + 3 * t
     _, enc_d = get_shaft_dimensions(typical_floor_height_mm, spec)
 
-    # Perimeter positions at edges of the LARGEST floor plate.
-    # Smaller floors may not need these cores — the per-floor skip
-    # in get_stair_run_data handles that based on travel distance.
-    edge_x = max_w / 2.0 - enc_w / 2.0
-    edge_y = max_l / 2.0 - enc_d / 2.0
+    # Perimeter positions based on 10m setback rule
+    max_w = max(d[0] for d in floor_dims_mm) if floor_dims_mm else 50000
+    max_l = max(d[1] for d in floor_dims_mm) if floor_dims_mm else 50000
+    min_w = min(d[0] for d in floor_dims_mm) if floor_dims_mm else max_w
+    min_l = min(d[1] for d in floor_dims_mm) if floor_dims_mm else max_l
 
-    # 1/3 diagonal spacing rule for the largest floor plate
-    diagonal_mm = math.sqrt(max_w**2 + max_l**2)
+    # Rule: If distance > 10m, align to smallest floor plate; else align to largest.
+    if (max_w - min_w) / 2.0 > 10000.0:
+        edge_x = min_w / 2.0 - enc_w / 2.0
+    else:
+        edge_x = max_w / 2.0 - enc_w / 2.0
+
+    if (max_l - min_l) / 2.0 > 10000.0:
+        edge_y = min_l / 2.0 - enc_d / 2.0
+    else:
+        edge_y = max_l / 2.0 - enc_d / 2.0
+
+    # 1/3 diagonal spacing rule for the target area (the box where we place staircases)
+    diagonal_mm = math.sqrt((2*edge_x)**2 + (2*edge_y)**2)
     min_spacing_mm = diagonal_mm / 3.0
 
     # Generate perimeter candidate points
@@ -288,36 +302,51 @@ def calculate_staircase_positions(floor_dims_mm, core_center_mm,
         # Add the best candidate if it satisfies spacing
         positions.append(best_cand)
 
-        # Stop early if travel distance rule is satisfied
-        if _check_travel_distance(positions, max_w, max_l, max_travel_mm):
+        # Stop early if travel distance rule is satisfied for all floors
+        if _check_travel_distance(positions, floor_dims_mm, max_travel_mm):
             break
 
     return positions
 
 
-def _check_travel_distance(stair_positions, floor_w_mm, floor_l_mm,
+def _check_travel_distance(stair_positions, floor_dims_mm,
                            max_dist_mm, num_required=2):
     """Return True if every sampled floor-plate point can reach at least
     *num_required* staircases within *max_dist_mm* (Euclidean)."""
     if len(stair_positions) < num_required:
         return False
 
-    hw = floor_w_mm / 2.0
-    hl = floor_l_mm / 2.0
-    # Corners, edge midpoints, and quarter-points give good coverage.
-    test_points = [
-        (-hw, -hl), (hw, -hl), (hw, hl), (-hw, hl),
-        (0, -hl), (0, hl), (-hw, 0), (hw, 0),
-        (-hw / 2, -hl / 2), (hw / 2, -hl / 2),
-        (hw / 2, hl / 2), (-hw / 2, hl / 2),
-    ]
-    for px, py in test_points:
-        dists = sorted(
-            math.sqrt((px - sx) ** 2 + (py - sy) ** 2)
-            for sx, sy in stair_positions
-        )
-        if dists[num_required - 1] > max_dist_mm:
-            return False
+    # Collect all unique floor dimensions to test
+    to_test = []
+    if isinstance(floor_dims_mm, list):
+        # Filter duplicates to save time
+        seen = set()
+        for d in floor_dims_mm:
+            w, l = d[0], d[1]
+            if (w, l) not in seen:
+                to_test.append((w, l))
+                seen.add((w, l))
+    else:
+        # Fallback if it's just one dimension pair
+        to_test = [(floor_dims_mm[0], floor_dims_mm[1])]
+
+    for floor_w_mm, floor_l_mm in to_test:
+        hw = floor_w_mm / 2.0
+        hl = floor_l_mm / 2.0
+        # Corners, edge midpoints, and quarter-points give good coverage.
+        test_points = [
+            (-hw, -hl), (hw, -hl), (hw, hl), (-hw, hl),
+            (0, -hl), (0, hl), (-hw, 0), (hw, 0),
+            (-hw / 2, -hl / 2), (hw / 2, -hl / 2),
+            (hw / 2, hl / 2), (-hw / 2, hl / 2),
+        ]
+        for px, py in test_points:
+            dists = sorted(
+                math.sqrt((px - sx) ** 2 + (py - sy) ** 2)
+                for sx, sy in stair_positions
+            )
+            if dists[num_required - 1] > max_dist_mm:
+                return False
     return True
 
 
@@ -398,12 +427,18 @@ def wall_overlaps_box(wall_start, wall_end, box_bounds, tol=100):
 
     return None
 
-def _calc_base_y(s_idx, s_cy, enc_d, lift_core_bounds_mm=None):
+def _calc_base_y(s_idx, s_cy, enc_d, lift_core_bounds_mm=None, num_lifts=None, lobby_width=3000):
     """Internal helper to calculate stable base_y based on core proximity."""
     if s_idx == 0 and lift_core_bounds_mm:
         # South staircase: Back wall (base_y + enc_d) must be at core_ymin
         _, core_ymin, _, _ = lift_core_bounds_mm
-        return core_ymin - enc_d
+        
+        # Match calculate_staircase_positions logic for single row setback
+        offset = 0
+        if num_lifts is not None and num_lifts < 4:
+            offset = lobby_width
+            
+        return core_ymin - enc_d - offset
     elif s_idx == 1 and lift_core_bounds_mm:
         # North staircase: Front wall (base_y) must be at core_ymax
         _, _, _, core_ymax = lift_core_bounds_mm
@@ -415,7 +450,8 @@ def _calc_base_y(s_idx, s_cy, enc_d, lift_core_bounds_mm=None):
 
 def generate_staircase_manifest(positions, levels_data, _enclosure_width_mm=None,
                                 spec=None, typical_floor_height_mm=None,
-                                lift_core_bounds_mm=None, floor_dims_mm=None):
+                                lift_core_bounds_mm=None, floor_dims_mm=None,
+                                num_lifts=None, lobby_width=3000):
     """Generate wall and floor manifest entries for all staircases.
 
     The enclosure footprint (plan size) is **fixed** for every level,
@@ -605,7 +641,7 @@ def generate_staircase_manifest(positions, levels_data, _enclosure_width_mm=None
 
         # --- Stable base coordinates [Alignment Fix] ---
         base_x = s_cx - enc_w / 2.0
-        base_y = _calc_base_y(s_idx, s_cy, enc_d, lift_core_bounds_mm)
+        base_y = _calc_base_y(s_idx, s_cy, enc_d, lift_core_bounds_mm, num_lifts, lobby_width)
 
         for i, lvl in enumerate(levels_data):
             lvl_id = lvl['id']
@@ -734,6 +770,26 @@ def generate_staircase_manifest(positions, levels_data, _enclosure_width_mm=None
                         "points": [[base_x, front_y], [base_x + enc_w, front_y], [base_x + enc_w, req_r], [div_x, req_r], [div_x, req_l], [base_x, req_l]]
                     })
 
+            # --- Fire Safety / Spatial Conflict Detection ---
+            if floor_dims_mm and i < len(floor_dims_mm) and not is_roof:
+                f_w, f_l = floor_dims_mm[i]
+                hw_f, hl_f = f_w / 2.0, f_l / 2.0
+                
+                # Check if staircase enclosure is outside the floor plate
+                stair_xmin, stair_xmax = s_cx - enc_w / 2.0, s_cx + enc_w / 2.0
+                stair_ymin, stair_ymax = s_cy - enc_d / 2.0, s_cy + enc_d / 2.0
+                
+                is_outside_x = (stair_xmin > hw_f + 10) or (stair_xmax < -hw_f - 10)
+                is_outside_y = (stair_ymin > hl_f + 10) or (stair_ymax < -hl_f - 10)
+                
+                if is_outside_x or is_outside_y:
+                    return {
+                        "status": "CONFLICT",
+                        "description": "Staircase {} (at level {}) is outside the floor plate boundaries. Floor: {}x{}mm, Stair Bounds: [{}, {}, {}, {}]".format(
+                            s_tag, i + 1, f_w, f_l, stair_xmin, stair_ymin, stair_xmax, stair_ymax
+                        )
+                    }
+
             # Center divider wall removed per user request — not necessary
             # for the dogleg stair layout.
 
@@ -762,7 +818,7 @@ def generate_staircase_manifest(positions, levels_data, _enclosure_width_mm=None
 
 def get_stair_run_data(positions, levels_data, _enclosure_width_mm=None, spec=None,
                        typical_floor_height_mm=None, lift_core_bounds_mm=None,
-                       floor_dims_mm=None):
+                       floor_dims_mm=None, num_lifts=None, lobby_width=3000):
     """Return geometry data for creating Revit stair runs.
 
     For typical-height storeys: standard 2-flight dogleg (1 pair).
@@ -830,7 +886,7 @@ def get_stair_run_data(positions, levels_data, _enclosure_width_mm=None, spec=No
 
     for s_idx, (s_cx, s_cy) in enumerate(positions):
         s_tag = "Stair_{}".format(s_idx + 1)
-        base_y = _calc_base_y(s_idx, s_cy, enc_d, lift_core_bounds_mm)
+        base_y = _calc_base_y(s_idx, s_cy, enc_d, lift_core_bounds_mm, num_lifts, lobby_width)
         stair_base_x = s_cx - shaft_width_nat / 2.0
 
         # Flight centre X positions (inside the two halves of the shaft)

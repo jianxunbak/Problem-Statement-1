@@ -148,6 +148,11 @@ class RevitWorkers:
             self.log("Step 3a.1: Expanding Vertical Circulation (Staircases)...")
             c0, r0 = created[0], reused[0]
             core_bounds = self._expand_staircases_in_manifest(manifest, current_levels, elevations, floor_dims, core_bounds, affected_elements, results)
+            
+            # Catch Spatial Conflicts
+            if isinstance(core_bounds, dict) and core_bounds.get("status") == "CONFLICT":
+                return core_bounds
+                
             stair_new, stair_reused = created[0] - c0, reused[0] - r0
             self._enforce_disjoint(affected_elements)
             t.Commit()
@@ -229,7 +234,10 @@ class RevitWorkers:
             self._process_walls(current_levels, elevations, floor_dims, shell, registry, results, created, reused, affected_elements)
             walls_new, walls_reused = created[0] - c0, reused[0] - r0
             c0, r0 = created[0], reused[0]
-            expanded_slab_dims = self._process_floors(current_levels, floor_dims, shell, registry, results, created, reused, affected_elements)
+            res_f = self._process_floors(current_levels, floor_dims, shell, registry, results, created, reused, affected_elements)
+            if isinstance(res_f, dict) and res_f.get("status") == "CONFLICT":
+                return res_f
+            expanded_slab_dims = res_f
             floors_new, floors_reused = created[0] - c0, reused[0] - r0
             c0, r0 = created[0], reused[0]
             self._process_parapets(current_levels, expanded_slab_dims, floor_dims, shell, registry, results, created, reused, affected_elements)
@@ -261,10 +269,31 @@ class RevitWorkers:
             t.Commit()
             t.Dispose()
 
+            # --- PHASE 4: STRUCTURE ---
+            # Synthesis Run (enforce 1/3 rule) before processing columns
+            presets = load_presets()
+            preset = presets.get("commercial_office", {})
             max_w = max(d[0] for d in floor_dims)
             max_l = max(d[1] for d in floor_dims)
+            
+            p_col_logic = preset.get("column_logic", {})
+            dna_span = p_col_logic.get("span", [12000, 15000])
+            dna_offset = safe_num(p_col_logic.get("offset_from_edge", 1000), 1000)
+            
+            res_w = self._synthesize_structural_grid(max_w, dna_span, dna_offset)
+            if isinstance(res_w, dict) and res_w.get("status") == "CONFLICT":
+                return res_w
+            _, synth_span_w = res_w
+            
+            res_l = self._synthesize_structural_grid(max_l, dna_span, dna_offset)
+            if isinstance(res_l, dict) and res_l.get("status") == "CONFLICT":
+                return res_l
+            _, synth_span_l = res_l
+            
+            # Store synthesized spans for _process_columns_and_grids
+            self._synth_span_w = synth_span_w
+            self._synth_span_l = synth_span_l
 
-            # --- PHASE 4: STRUCTURE ---
             t = DB.Transaction(doc, "AI Build: Structure")
             t.Start()
             setup_failure_handling(t, use_nuclear=True)
@@ -303,7 +332,9 @@ class RevitWorkers:
             self._process_granular_walls(manifest, current_levels, registry, results, created, reused, affected_elements)
             gw_new, gw_reused = created[0] - c0, reused[0] - r0
             c0, r0 = created[0], reused[0]
-            self._process_granular_floors(manifest, current_levels, registry, results, created, reused, affected_elements)
+            res_gf = self._process_granular_floors(manifest, current_levels, registry, results, created, reused, affected_elements)
+            if isinstance(res_gf, dict) and res_gf.get("status") == "CONFLICT":
+                return res_gf
             gf_new, gf_reused = created[0] - c0, reused[0] - r0
             c0, r0 = created[0], reused[0]
             self._process_granular_columns(manifest, current_levels, registry, results, created, reused)
@@ -411,6 +442,56 @@ class RevitWorkers:
                             DB.JoinGeometryUtils.UnjoinGeometry(doc, el, target)
                 except:
                     pass
+
+    def _synthesize_structural_grid(self, target_dim, span_range, min_offset):
+        """
+        Synthesizes an optimal structural grid based on 1/3 cantilever rules.
+        Returns: (final_dim, final_span) or CONFLICT dict.
+        """
+        import math
+        if isinstance(span_range, (int, float)):
+            min_s, max_s = float(span_range), float(span_range)
+        elif isinstance(span_range, list) and len(span_range) >= 2:
+            min_s, max_s = float(span_range[0]), float(span_range[1])
+        else:
+            min_s, max_s = 10000.0, 12000.0
+            
+        target_half = target_dim / 2.0
+        n = int((target_half - min_offset) // min_s)
+        if n < 0: n = 0
+            
+        def check_rules(half_w, span, n_cols):
+            if n_cols == 0: return True
+            cant = half_w - (n_cols * span)
+            if cant < min_offset - 1.0: return False
+            if cant > (span / 3.0) + 1.0: return False
+            return True
+
+        # Priority 1: Check original span
+        if check_rules(target_half, min_s, n):
+            return target_dim, min_s
+            
+        # Priority 2: Add column and check range
+        n_plus = n + 1
+        s_min_c = target_half / (n_plus + 1.0/3.0)
+        s_max_o = (target_half - min_offset) / n_plus
+        low, high = max(min_s, s_min_c), min(max_s, s_max_o)
+        if low <= high + 1.0: return target_dim, high
+                
+        # Priority 3: Extend span
+        if n > 0:
+            s_min_c = target_half / (n + 1.0/3.0)
+            s_max_o = (target_half - min_offset) / n
+            low, high = max(min_s, s_min_c), min(max_s, s_max_o)
+            if low <= high + 1.0: return target_dim, high
+                
+        # Priority 4: Conflict (No valid grid within DNA constraints)
+        return {
+            "status": "CONFLICT",
+            "description": "Structural Conflict: Could not synthesize a valid grid for {}mm dimension with DNA span range {}mm. The 1/3 cantilever rule is violated.".format(
+                target_dim, span_range
+            )
+        }
 
     def _process_levels(self, manifest, registry, created, reused):
         import Autodesk.Revit.DB as DB # type: ignore
@@ -858,26 +939,23 @@ class RevitWorkers:
                 prev_slab = expanded_slab_dims[k-1] if k > 0 else (0, 0)
                 if k > 0 and (abs(slab_w - prev_slab[0]) > 1 or abs(slab_l - prev_slab[1]) > 1):
                     doc.Regenerate()
-                if k == 0 or abs(slab_w - prev_slab[0]) > 1 or abs(slab_l - prev_slab[1]) > 1:
-                    from .runner import log as _flog3
-                    fd_w = floor_dims[k][0] if k < len(floor_dims) else 0
-                    fd_l = floor_dims[k][1] if k < len(floor_dims) else 0
-                    _flog3("[FloorDiag] L{}: floor_dims=({:.0f},{:.0f}) slab=({:.0f},{:.0f}) "
-                           "box: X=[{:.1f},{:.1f}] Y=[{:.1f},{:.1f}] center=({:.1f},{:.1f}) "
-                           "voids={}".format(
-                               k+1, fd_w, fd_l, slab_w, slab_l,
-                               cx_ft - w_ft/2.0, cx_ft + w_ft/2.0,
-                               cy_ft - l_ft/2.0, cy_ft + l_ft/2.0,
-                               cx_ft, cy_ft,
-                               floor_loops.Count - 1))
-                floor = DB.Floor.Create(doc, floor_loops, ftype.Id, lvl.Id)
-            except Exception as e_void:
-                # Void loops invalid — log actual error, retry without voids
-                from .runner import log as _flog2
-                _flog2("[FloorDims] L{}: void loops invalid ({}), creating floor without voids".format(k+1, e_void))
-                fallback_loops = Generic.List[DB.CurveLoop]()
-                fallback_loops.Add(loop)
-                floor = DB.Floor.Create(doc, fallback_loops, ftype.Id, lvl.Id)
+                
+                # Try create with voids
+                try:
+                    floor = DB.Floor.Create(doc, floor_loops, ftype.Id, lvl.Id)
+                except Exception as e_void:
+                    # Void loops invalid — log actual error, retry without voids
+                    from .runner import log as _flog2
+                    _flog2("[FloorDims] L{}: void loops invalid ({}), creating floor without voids".format(k+1, e_void))
+                    fallback_loops = Generic.List[DB.CurveLoop]()
+                    fallback_loops.Add(loop)
+                    floor = DB.Floor.Create(doc, fallback_loops, ftype.Id, lvl.Id)
+            except Exception as e_final:
+                self.log(f"CRITICAL GEOMETRY ERROR during shell floor creation '{tag}': {e_final}")
+                return {
+                    "status": "CONFLICT",
+                    "description": f"Invalid Shell Floor Geometry for Level {k+1}. The generated boundary points may cause self-intersection. Trace: {str(e_final)}"
+                }
 
             safe_set_comment(floor, tag)
             affected_elements.append(floor)
@@ -911,9 +989,9 @@ class RevitWorkers:
         else:
             preset_span_max = 15000.0
 
-        # Always use preset max span for structural grid — ignore Gemini's column_spacing
-        # as it doesn't account for the preset's structural optimization range.
-        col_span = preset_span_max
+        # Use synthesized spans from synthesis run
+        span_w_ft = mm_to_ft(getattr(self, '_synth_span_w', 12000))
+        span_l_ft = mm_to_ft(getattr(self, '_synth_span_l', 12000))
 
         is_structural = True
         symbol = self._find_type(DB.BuiltInCategory.OST_StructuralColumns, shell.get("column_type", "Column"))
@@ -925,9 +1003,6 @@ class RevitWorkers:
             is_structural = False
         if not symbol: return
         if not symbol.IsActive: symbol.Activate()
-
-        target_span_mm = round(col_span / 100.0) * 100.0
-        span_ft = mm_to_ft(target_span_mm)
 
         # Read offset_from_edge from shell or preset
         offset_from_edge_mm = safe_num(
@@ -961,7 +1036,7 @@ class RevitWorkers:
         m_pos = shell.get("position", [0.0, 0.0])
         cx_ft, cy_ft = mm_to_ft(m_pos[0]), mm_to_ft(m_pos[1])
 
-        def compute_axis_grid(dim_mm, center_ft, core_min_ft, core_max_ft):
+        def compute_axis_grid(dim_mm, center_ft, core_min_ft, core_max_ft, span_ft):
             """Compute column grid positions along one axis."""
             half_dim_ft = mm_to_ft(dim_mm) / 2.0
             edge_pos = center_ft + (half_dim_ft - offset_from_edge_ft)
@@ -986,8 +1061,8 @@ class RevitWorkers:
         y_core_min = lift_core_ft[1] if lift_core_ft else None
         y_core_max = lift_core_ft[3] if lift_core_ft else None
 
-        x_offsets = compute_axis_grid(max_w, cx_ft, x_core_min, x_core_max)
-        y_offsets = compute_axis_grid(max_l, cy_ft, y_core_min, y_core_max)
+        x_offsets = compute_axis_grid(max_w, cx_ft, x_core_min, x_core_max, span_w_ft)
+        y_offsets = compute_axis_grid(max_l, cy_ft, y_core_min, y_core_max, span_l_ft)
 
         # Store grid positions for documentation (grid line creation)
         self._grid_x_offsets_ft = list(x_offsets)
@@ -1030,8 +1105,8 @@ class RevitWorkers:
                     continue
 
                 # Indices for tagging: normalize to span relative to anchor
-                ix = int(round((ox - anchor_ft_x) / span_ft))
-                iy = int(round((oy - anchor_ft_y) / span_ft))
+                ix = int(round((ox - anchor_ft_x) / span_w_ft))
+                iy = int(round((oy - anchor_ft_y) / span_l_ft))
 
                 k_highest = -1
                 for k in range(len(current_levels)):
@@ -1257,18 +1332,26 @@ class RevitWorkers:
             if floor and isinstance(floor, DB.Floor):
                 doc.Delete(floor.Id)
             
-            loops = Generic.List[DB.CurveLoop]()
-            loops.Add(loop)
-            floor = DB.Floor.Create(doc, loops, ftype.Id, lvl.Id)
-            safe_set_comment(floor, ai_id)
-            
-            # Set Height Offset if needed
-            if abs(offset_ft) > 0.001:
-                p_offset = floor.get_Parameter(DB.BuiltInParameter.FLOOR_HEIGHTABOVELEVEL_PARAM)
-                if p_offset: p_offset.Set(offset_ft)
+            try:
+                loops = Generic.List[DB.CurveLoop]()
+                loops.Add(loop)
+                floor = DB.Floor.Create(doc, loops, ftype.Id, lvl.Id)
+                safe_set_comment(floor, ai_id)
                 
-            created[0] += 1
-            results["elements"].append(str(floor.Id.Value))
+                # Set Height Offset if needed
+                if abs(offset_ft) > 0.001:
+                    p_offset = floor.get_Parameter(DB.BuiltInParameter.FLOOR_HEIGHTABOVELEVEL_PARAM)
+                    if p_offset: p_offset.Set(offset_ft)
+                    
+                created[0] += 1
+                results["elements"].append(str(floor.Id.Value))
+            except Exception as e:
+                self.log(f"GEOMETRY ERROR during floor creation '{ai_id}': {e}")
+                return {
+                    "status": "CONFLICT",
+                    "description": f"Invalid Floor Geometry for '{ai_id}': The provided coordinates likely form a self-intersecting or open loop that Revit cannot process. Please check your vertices."
+                }
+        return None
 
     def _process_granular_columns(self, manifest, current_levels, registry, results, created, reused):
         import Autodesk.Revit.DB as DB # type: ignore
@@ -1476,7 +1559,7 @@ class RevitWorkers:
         efficiency = preset.get("building_identity", {}).get("target_efficiency", 0.82)
         load_factor = preset.get("program_requirements", {}).get("occupancy_load_factor", 10.0)
         lift_size = lifts_config.get("size", preset.get("core_logic", {}).get("lift_shaft_size", [2500, 2500]))
-        lobby_w = lifts_config.get("lobby_width", 3000)
+        lobby_w = lifts_config.get("lobby_width", preset.get("core_logic", {}).get("lift_lobby_width", 3000))
 
         # --- 2. Detect existing lift state from registry ---
         registry = getattr(self, '_registry_cache', {})
@@ -1613,6 +1696,8 @@ class RevitWorkers:
             self.log("Lift Core: Layout adjusted lift count {} -> {} for even block distribution.".format(
                 num_lifts_val, layout['total_lifts']))
         num_lifts_val = layout['total_lifts']
+        self._last_num_lifts = num_lifts_val
+        self._last_lobby_w = lobby_w
         if not is_expansion and existing_lift_count is not None and existing_lift_count != num_lifts_val:
             self.log("Lift Core: Final count {} != existing {} — forcing regeneration.".format(
                 num_lifts_val, existing_lift_count))
@@ -1961,9 +2046,12 @@ class RevitWorkers:
         self.log("Staircases: typical_h_mm={:.0f}".format(typical_h_mm))
 
         # --- 5. Calculate positions [rules a-f] ---
+        num_lifts = getattr(self, '_last_num_lifts', None)
+        lobby_width = getattr(self, '_last_lobby_w', preset.get("core_logic", {}).get("lift_lobby_width", 3000))
         positions = staircase_logic.calculate_staircase_positions(
             floor_dims, core_center_mm, lift_core_bounds_mm,
-            typical_h_mm, stair_spec, max_travel
+            typical_h_mm, stair_spec, max_travel,
+            num_lifts=num_lifts, lobby_width=lobby_width
         )
         # Enforce minimum from manifest count
         if len(positions) < num_stairs and lift_core_bounds_mm:
@@ -1999,7 +2087,7 @@ class RevitWorkers:
         typical_h = typical_h_mm
         self._stair_run_data = staircase_logic.get_stair_run_data(
             positions, levels_data, enc_w, stair_spec, typical_h, lift_core_bounds_mm,
-            floor_dims_mm=floor_dims
+            floor_dims_mm=floor_dims, num_lifts=num_lifts, lobby_width=lobby_width
         )
 
         # --- 8. Generate manifest ---
@@ -2007,8 +2095,14 @@ class RevitWorkers:
             positions, levels_data, enc_w, stair_spec,
             typical_floor_height_mm=typical_h_mm,
             lift_core_bounds_mm=lift_core_bounds_mm,
-            floor_dims_mm=floor_dims
+            floor_dims_mm=floor_dims,
+            num_lifts=num_lifts, lobby_width=lobby_width
         )
+        
+        # Catch Spatial Conflicts
+        if isinstance(stair_manifest, dict) and stair_manifest.get("status") == "CONFLICT":
+            return stair_manifest
+            
         stair_walls = stair_manifest.get("walls", [])
         stair_floors = stair_manifest.get("floors", [])
 
@@ -2077,7 +2171,8 @@ class RevitWorkers:
         self._stair_run_data = staircase_logic.get_stair_run_data(
             positions, levels_data, enc_w, stair_spec,
             typical_floor_height_mm=typical_h_mm,
-            floor_dims_mm=floor_dims
+            floor_dims_mm=floor_dims,
+            num_lifts=num_lifts, lobby_width=lobby_width
         )
         stair_spec['_typical_h'] = typical_h_mm
         stair_spec['_rpf'] = staircase_logic._risers_per_flight_typical(

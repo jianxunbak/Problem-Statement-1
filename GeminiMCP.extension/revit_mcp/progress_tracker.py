@@ -28,6 +28,7 @@ class BuildProgressTracker:
             "stair_runs": 0,
         }
         self.adjustments = []
+        self.narrative_history = []
         # Thread-safe queue for messages
         self._msg_queue = deque()
         self._stop_event = threading.Event()
@@ -41,7 +42,7 @@ class BuildProgressTracker:
         if self.loop and self.ctx:
             self.loop.call_soon_threadsafe(self._start_poller)
         else:
-            log(f"DEBUG: ProgressTracker.start() - FAILED: loop={bool(self.loop)}, ctx={bool(self.ctx)}")
+            log(f"DEBUG: ProgressTracker.start() - FAILED: loop={bool(self.loop)}, ctx={bool(self.ctx)}. Streaming disabled.")
 
         self.report("Sending prompt to AI... Waiting for building manifest.")
 
@@ -173,10 +174,18 @@ class BuildProgressTracker:
         except Exception:
             self.report("Manifest received. Building...")
 
-    def report(self, msg, progress_pct=None):
+    def report(self, msg, is_narrative=False):
         """Queue a status update for the background poller, or deliver via callback."""
         from revit_mcp.runner import log
-        log(f"PROGRESS: {msg}")
+        
+        # Add micro-timestamp for uniqueness to prevent client squashing
+        t_now = time.strftime("%H:%M:%S")
+        unique_msg = f"[{t_now}] {msg}"
+        
+        log(f"PROGRESS: {unique_msg}")
+
+        if is_narrative:
+            self.narrative_history.append(msg)
 
         if self._callback:
             try:
@@ -186,7 +195,7 @@ class BuildProgressTracker:
             return
 
         # Simple thread-safe append (deque.append is atomic in CPython)
-        self._msg_queue.append(msg)
+        self._msg_queue.append(unique_msg)
 
     def record_created(self, category, count=1):
         """Track actual elements created during the build."""
@@ -207,7 +216,10 @@ class BuildProgressTracker:
         report.append(f"Status: {base_summary}")
         report.append(f"Duration: {duration:.1f} seconds")
 
-        # Use actual created counts
+        if self.narrative_history:
+            report.append("\nArchitectural Logic:")
+            for item in self.narrative_history:
+                report.append(item)
         report.append("\nConstructed Elements:")
         for key, val in self.elements_created.items():
             if val > 0:

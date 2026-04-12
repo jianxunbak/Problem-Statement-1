@@ -29,6 +29,7 @@
     },
     "core_logic": {
       "lift_waiting_time": 25,
+      "lift_lobby_width": 3000,
       "lift_shaft_size": [
         2700,
         2700

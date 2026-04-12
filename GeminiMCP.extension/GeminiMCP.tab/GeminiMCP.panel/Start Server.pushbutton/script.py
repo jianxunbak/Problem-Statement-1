@@ -202,7 +202,7 @@ class AIChatWindow(object):
             self.StopButton.Visibility = System.Windows.Visibility.Collapsed
         if self.SendButton:
             self.SendButton.IsEnabled = True
-        self.replace_last_message("Operation cancelled by user.")
+        self.add_ai_message("Operation cancelled by user.")
 
     def get_gemini_response(self, prompt):
         responded = False
@@ -249,24 +249,35 @@ class AIChatWindow(object):
             self.StopButton.Visibility = System.Windows.Visibility.Collapsed
         if self.SendButton:
             self.SendButton.IsEnabled = True
-        self.replace_last_message(response)
+        self.add_ai_message(response)
 
-    def replace_last_message(self, new_text):
-        """Replace the last message (Thinking...) with actual response."""
+    def add_ai_message(self, new_text):
+        """Smart add/replace for AI messages. Replaces 'Thinking...' or adds new bubble."""
         if self.ChatHistory and self.ChatHistory.Children.Count > 0:
             last_border = self.ChatHistory.Children[self.ChatHistory.Children.Count - 1]
             if isinstance(last_border.Child, TextBox):
-                last_border.Child.Text = new_text
+                # If it's just the placeholder, replace it
+                if last_border.Child.Text == "Thinking...":
+                    last_border.Child.Text = new_text
+                else:
+                    # Otherwise add a new bubble
+                    self.add_message(new_text, is_user=False)
+                    # Refresh reference to the new last border for styling
+                    if self.ChatHistory.Children.Count > 0:
+                        last_border = self.ChatHistory.Children[self.ChatHistory.Children.Count - 1]
                 
-                # Update background based on content for visual feedback
+                # Apply styling to whatever the last border is now
                 if new_text.startswith("Success:"):
                     last_border.Background = SolidColorBrush(Color.FromRgb(34, 139, 34)) # Green
                 elif new_text.startswith("Error:"):
                     last_border.Background = SolidColorBrush(Color.FromRgb(178, 34, 34)) # Red
                 
-                # Update history too
-                if len(self.history) > 0:
-                    self.history[len(self.history)-1]["text"] = new_text
+                # Update history log
+                self.history.append({"text": new_text, "is_user": False})
+                return
+
+        # Fallback: just add it
+        self.add_message(new_text, is_user=False)
 
     def update_progress(self, msg):
         """Thread-safe progress update -- replaces the 'Thinking...' bubble text.
@@ -289,10 +300,7 @@ class AIChatWindow(object):
         """Must run on WPF dispatcher thread."""
         if self.cancelled or not self.is_thinking:
             return
-        if self.ChatHistory and self.ChatHistory.Children.Count > 0:
-            last_border = self.ChatHistory.Children[self.ChatHistory.Children.Count - 1]
-            if isinstance(last_border.Child, TextBox):
-                last_border.Child.Text = msg
+        self.add_ai_message(msg)
         if self.ChatScroller:
             self.ChatScroller.ScrollToBottom()
 

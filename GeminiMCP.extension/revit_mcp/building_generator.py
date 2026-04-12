@@ -344,11 +344,13 @@ class BuildingSystem:
             low, high = max(min_s, s_min_c), min(max_s, s_max_o)
             if low <= high + 1.0: return target_dim, high
                 
-        # Priority 3: Reduce Floor
-        if n == 0: return (min_offset + 500) * 2.0, min_s
-        new_half = n * max_s + (max_s / 3.0)
-        if new_half > target_half: new_half = n * min_s + (min_s / 3.0)
-        return new_half * 2.0, max_s if new_half <= target_half else min_s
+        # Priority 3: Conflict (No valid grid within DNA constraints)
+        return {
+            "status": "CONFLICT",
+            "description": "Could not synthesize a valid structural grid for dimension {}mm with span range {}mm. The 1/3 cantilever rule (max {}mm) is violated.".format(
+                target_dim, span_range, max_s / 3.0
+            )
+        }
 
     def _expand_high_level_manifest(self, manifest):
         """Converts Architectural Intent (Storeys/Shell) into concrete element lists."""
@@ -391,8 +393,15 @@ class BuildingSystem:
             width, length = side, side
             
         # Synthesis Run (enforce 1/3 rule)
-        width, synth_span_w = self._synthesize_structural_grid(width, dna_span, dna_offset)
-        length, synth_span_l = self._synthesize_structural_grid(length, dna_span, dna_offset)
+        res_w = self._synthesize_structural_grid(width, dna_span, dna_offset)
+        if isinstance(res_w, dict) and res_w.get("status") == "CONFLICT":
+            return res_w
+        width, synth_span_w = res_w
+        
+        res_l = self._synthesize_structural_grid(length, dna_span, dna_offset)
+        if isinstance(res_l, dict) and res_l.get("status") == "CONFLICT":
+            return res_l
+        length, synth_span_l = res_l
         
         # Use simple average or W-span for the global col_span? 
         # Usually buildings have a square/regular grid. We'll prioritize W-span but keep logic robust.
@@ -405,6 +414,7 @@ class BuildingSystem:
         new_floors = []
         
         current_elev = 0.0
+        all_floor_dims = []
         # Step 3a: Extracting Staircase Shafts (HOT RELOADED ONCE)
         from revit_mcp import staircase_logic
         import importlib
@@ -432,6 +442,7 @@ class BuildingSystem:
                 hw, hl = f_w / 2.0, f_l / 2.0
                 f_points = [[-hw, -hl], [hw, -hl], [hw, hl], [-hw, hl]]
                 new_floors.append({"id": "AI_Floor_{}".format(level_idx), "level_id": lvl_id, "points": f_points})
+                all_floor_dims.append((f_w, f_l))
                 current_elev += req_height
             
         # --- PHASE 2: CORE GENERATION ---
@@ -451,8 +462,9 @@ class BuildingSystem:
             num_lifts = lifts_config.get("count")
             if num_lifts is None or num_lifts == "random":
                 num_lifts = lift_logic.calculate_lift_requirements(num_storeys, base_height, 2500, 25.0)
-            lift_size = lifts_config.get("size", preset.get("core_logic", {}).get("lift_shaft_size", [2700, 2700]))
-            lobby_w = lifts_config.get("lobby_width", 3000)
+            p_core_logic = preset.get("core_logic", {})
+            lift_size = lifts_config.get("size", p_core_logic.get("lift_shaft_size", [2700, 2700]))
+            lobby_w = lifts_config.get("lobby_width", p_core_logic.get("lift_lobby_width", 3000))
             layout = lift_logic.get_total_core_layout(int(num_lifts), lift_size, lobby_w)
             center_pos = lifts_config.get("position") or [f_center_x, f_center_y]
             remaining_lifts = layout['total_lifts']
@@ -486,11 +498,16 @@ class BuildingSystem:
         staircase_walls = []
         if num_stairs > 0 and num_storeys >= 2:
             l_core = core_bounds_list[0] if core_bounds_list else None
-            positions = staircase_logic.calculate_staircase_positions([(width, length)], [f_center_x, f_center_y], l_core, base_height, stair_spec, safe_num(preset_fs.get("max_travel_distance", 60000), 60000))
+            positions = staircase_logic.calculate_staircase_positions(all_floor_dims, [f_center_x, f_center_y], l_core, base_height, stair_spec, safe_num(preset_fs.get("max_travel_distance", 60000), 60000), num_lifts=int(num_lifts), lobby_width=lobby_w)
             lift_core_w = (l_core[2]-l_core[0]) if l_core else 0
             shaft_w_nat, _ = staircase_logic.get_shaft_dimensions(base_height, stair_spec)
             enc_w = max(lift_core_w, shaft_w_nat)
-            st_manifest = staircase_logic.generate_staircase_manifest(positions, new_levels, enc_w, stair_spec, base_height, l_core)
+            st_manifest = staircase_logic.generate_staircase_manifest(positions, new_levels, enc_w, stair_spec, base_height, l_core, floor_dims_mm=all_floor_dims, num_lifts=int(num_lifts), lobby_width=lobby_w)
+            
+            # Catch Spatial Conflicts
+            if isinstance(st_manifest, dict) and st_manifest.get("status") == "CONFLICT":
+                return st_manifest
+                
             staircase_walls = st_manifest.get("walls", [])
             new_floors.extend(st_manifest.get("floors", []))
             for p in positions:
