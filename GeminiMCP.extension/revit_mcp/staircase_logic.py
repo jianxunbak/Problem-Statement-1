@@ -25,8 +25,41 @@ import hashlib
 # BUILD_VERSION is read by _create_stair_runs to verify fresh code is loaded
 _BUILD_VERSION = "v2026-04-18-ENTRY-LANDING-ALIGN"
 
-_WALL_THICKNESS = 350  # mm — 350mm structural core walls (user requirement)
-_OVERRUN_HEIGHT = 5000  # mm — staircase overrun above roof (matches lift core)
+# ─────────────────────────────────────────────────────────────────────────────
+#  Load compliance data from JSON files — single source of truth.
+#  Falls back to hardcoded values if files are missing.
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _load_sc():
+    try:
+        import os, json
+        d = os.path.dirname(os.path.abspath(__file__))
+        fs_path = os.path.join(d, "compliance_fire_safety.json")
+        st_path = os.path.join(d, "compliance_structural.json")
+        c_fs = json.load(open(fs_path)) if os.path.exists(fs_path) else {}
+        c_st = json.load(open(st_path)) if os.path.exists(st_path) else {}
+        return c_fs, c_st
+    except Exception:
+        return {}, {}
+
+_SC, _SC2    = _load_sc()
+_STAIR_C     = _SC.get("staircase", {})
+# Authority minimums — sourced from compliance JSON files
+_WALL_THICKNESS  = _SC2.get("wall_thickness_mm", {}).get("core_structural",    350)
+_OVERRUN_HEIGHT  = _STAIR_C.get("overrun_height_mm",                          5000)
+_MAX_TRAVEL      = _STAIR_C.get("max_travel_distance_mm",                    60000)
+_MIN_HEADROOM    = _STAIR_C.get("min_headroom_mm",                            2400)
+_FIRE_LB_AREA    = _SC.get("fire_lift_lobby", {}).get("min_area_mm2",      6000000)
+_SMOKE_LB_AREA   = _SC.get("smoke_stop_lobby", {}).get("min_area_mm2",     4000000)
+_MIN_LB_DEPTH    = _SC.get("smoke_stop_lobby", {}).get("min_clear_depth_mm", 2000)
+_PERIMETER_C     = _SC.get("perimeter_staircase", {})
+_EDGE_GAP        = _PERIMETER_C.get("edge_inset_gap_mm",                       500)
+# Design defaults — last-resort fallbacks when no preset staircase_spec is provided.
+# Actual values are set per typology in building_presets.json → core_logic.staircase_spec
+_STD_RISER       = 150
+_STD_TREAD       = 300
+_STD_W_FLIGHT    = 1500
+_STD_LANDING     = 1500
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -107,7 +140,7 @@ def adjust_storey_height(floor_height_mm, typical_floor_height_mm, riser=150, is
         if nf < 2: nf = 2
         if nf % 2 != 0: nf += 1
         clearance = (test_risers * riser) / (nf / 2.0)
-        return clearance < 2400
+        return clearance < _MIN_HEADROOM
 
     n_risers = int(round(floor_height_mm / float(riser)))
     if n_risers % 2 != 0:
@@ -151,10 +184,10 @@ def get_shaft_dimensions(floor_height_mm, spec=None):
         (shaft_width, shaft_depth) in mm.
     """
     spec = spec or {}
-    riser = spec.get("riser", 150)
-    tread = spec.get("tread", 300)
-    w_flight = spec.get("width_of_flight", 1500)
-    w_landing = spec.get("landing_width", 1500)
+    riser = spec.get("riser", _STD_RISER)
+    tread = spec.get("tread", _STD_TREAD)
+    w_flight = spec.get("width_of_flight", _STD_W_FLIGHT)
+    w_landing = spec.get("landing_width", _STD_LANDING)
     t = _WALL_THICKNESS
 
     num_risers = _snap_risers(floor_height_mm, riser)
@@ -214,9 +247,9 @@ def get_safety_set_dimensions(typical_floor_height_mm, spec=None, is_fire_lift=F
     t = _WALL_THICKNESS
     # Minimum required lobby area (e.g. 6.0 m2 for fire lift)
     # Minimum required lobby area (e.g. 6.0 m2 for fire lift)
-    target_net_area = 6000000 if is_fire_lift else 4000000
-    # Minimum required lobby clear dimension (as per user requirement)
-    min_net_depth = 2000
+    target_net_area = _FIRE_LB_AREA if is_fire_lift else _SMOKE_LB_AREA
+    # Minimum required lobby clear dimension (as per compliance rules)
+    min_net_depth = _MIN_LB_DEPTH
     
     # Add depth to accommodate lobby area
     # net_d already includes 2*w_landing. We need to ADD a dedicated lobby depth.
@@ -241,7 +274,7 @@ def get_safety_set_dimensions(typical_floor_height_mm, spec=None, is_fire_lift=F
 def calculate_staircase_positions(floor_dims_mm, core_center_mm,
                                   lift_core_bounds_mm,
                                   typical_floor_height_mm, spec=None,
-                                  max_travel_mm=60000,
+                                  max_travel_mm=_MAX_TRAVEL,
                                   num_lifts=None, lobby_width=3000,
                                   levels_data=None):
     """Determine staircase centre positions.
@@ -276,7 +309,7 @@ def calculate_staircase_positions(floor_dims_mm, core_center_mm,
 
     # Need additional staircases — add at perimeter, minimising count.
     t = 200
-    w_flight = spec.get("width_of_flight", 1500) if spec else 1500
+    w_flight = spec.get("width_of_flight", _STD_W_FLIGHT) if spec else _STD_W_FLIGHT
     enc_w = 2 * w_flight + 3 * t
     _, enc_d = get_shaft_dimensions(typical_floor_height_mm, spec)
 
@@ -546,10 +579,10 @@ def generate_staircase_manifest(positions, levels_data, _enclosure_width_mm=None
         ``{"walls": [...], "floors": [...]}``
     """
     spec = spec or {}
-    riser = spec.get("riser", 150)
-    tread = spec.get("tread", 300)
-    w_flight = spec.get("width_of_flight", 1500)
-    w_landing = spec.get("landing_width", 1500)
+    riser = spec.get("riser", _STD_RISER)
+    tread = spec.get("tread", _STD_TREAD)
+    w_flight = spec.get("width_of_flight", _STD_W_FLIGHT)
+    w_landing = spec.get("landing_width", _STD_LANDING)
     t = _WALL_THICKNESS
 
     # --- Fixed enclosure dimensions (based on typical storey) ---
@@ -920,9 +953,9 @@ def get_stair_run_data(positions, levels_data, shaft_width_mm, spec, typical_flo
 
     rotated_indices = rotated_indices or []
     spec = spec or {}
-    riser = spec.get("riser", 150)
-    w_flight = spec.get("width_of_flight", 1500)
-    w_landing = spec.get("landing_width", 1500)
+    riser = spec.get("riser", _STD_RISER)
+    w_flight = spec.get("width_of_flight", _STD_W_FLIGHT)
+    w_landing = spec.get("landing_width", _STD_LANDING)
     t = _WALL_THICKNESS
 
     shaft_width_nat = 2 * w_flight + 3 * t
@@ -986,7 +1019,7 @@ def get_stair_run_data(positions, levels_data, shaft_width_mm, spec, typical_flo
                 curr_h += pair_risers * actual_riser_h
                 intermediate_heights_mm.append(curr_h)
 
-            tread = spec.get("tread", 300)
+            tread = spec.get("tread", _STD_TREAD)
             target_risers = flight_list[0] if flight_list else 1
             run_len = max(target_risers - 1, 1) * tread
             shaft_inner_d = enc_d - 2 * t

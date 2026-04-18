@@ -1,6 +1,54 @@
 # -*- coding: utf-8 -*-
 import math
 
+# ─────────────────────────────────────────────────────────────────────────────
+#  Load compliance data from JSON files — single source of truth.
+#  Falls back to hardcoded values if files are missing.
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _load_lc():
+    try:
+        import os, json
+        p = os.path.join(os.path.dirname(os.path.abspath(__file__)), "compliance_lift_engineering.json")
+        if os.path.exists(p):
+            with open(p) as f:
+                return json.load(f)
+    except Exception:
+        pass
+    return {}
+
+def _load_structural():
+    try:
+        import os, json
+        p = os.path.join(os.path.dirname(os.path.abspath(__file__)), "compliance_structural.json")
+        if os.path.exists(p):
+            with open(p) as f:
+                return json.load(f)
+    except Exception:
+        pass
+    return {}
+
+_LC = _load_lc()
+_LT = _LC.get("traffic_analysis", {})
+_WALL_T        = _load_structural().get("wall_thickness_mm", {}).get("core_structural", 350)
+_SPEEDS        = _LT.get("speed_by_height_m", [
+    {"max_building_height_m": 30,   "speed_m_s": 1.6},
+    {"max_building_height_m": 60,   "speed_m_s": 2.5},
+    {"max_building_height_m": 120,  "speed_m_s": 5.0},
+    {"max_building_height_m": 9999, "speed_m_s": 7.0},
+])
+_AVG_PAX       = _LT.get("avg_passengers_per_trip",       10)
+_DOOR_TIME     = _LT.get("door_time_s",                  4.0)
+_TRANSFER_T    = _LT.get("passenger_transfer_time_s",    1.1)
+_PEAK_FRAC     = _LT.get("peak_demand_fraction",        0.12)
+_INTERVAL_S    = _LT.get("interval_period_s",            300)
+_OCC_PER_LIFT  = _LT.get("occupants_per_lift",           300)
+_MAX_PER_BLOCK = _LC.get("capacity_limits", {}).get("max_lifts_per_block", 12)
+_MAX_TOTAL     = _LC.get("capacity_limits", {}).get("max_total_lifts",     24)
+_MIN_LIFTS     = _LC.get("capacity_limits", {}).get("min_lifts",            2)
+_DOOR_MIN_W    = _LC.get("door_min_width_mm",           1000)
+
+
 def calculate_lift_requirements(num_floors, avg_floor_height_mm, total_building_occupancy, target_interval=25.0):
     """
     Calculate the number of lifts using Round Trip Time (RTT) analysis.
@@ -10,41 +58,37 @@ def calculate_lift_requirements(num_floors, avg_floor_height_mm, total_building_
     total_height_m = (num_floors * avg_floor_height_mm) / 1000.0
     H = total_height_m * 0.8  # Average highest reversal floor
 
-    # Lift speed by building height
-    if total_height_m < 30:   V = 1.6
-    elif total_height_m < 60: V = 2.5
-    elif total_height_m < 120: V = 5.0
-    else:                      V = 7.0
+    # Lift speed by building height (from compliance_lift_engineering.json)
+    V = next((s["speed_m_s"] for s in _SPEEDS if total_height_m < s["max_building_height_m"]), _SPEEDS[-1]["speed_m_s"])
 
-    P = 10    # Average passengers per trip
+    P = _AVG_PAX    # Average passengers per trip
     n = float(num_floors)
     S = n * (1 - math.pow(1 - 1.0 / n, P)) if n > 1 else 1.0
 
-    t_d = 4.0   # Door open+close time per stop (s)
-    t_p = 1.1   # Passenger transfer time per person (s)
+    t_d = _DOOR_TIME    # Door open+close time per stop (s)
+    t_p = _TRANSFER_T   # Passenger transfer time per person (s)
 
     RTT = (2 * H / V) + (S + 1) * t_d + (2 * P * t_p)
 
-    # 5-minute peak demand: typically 12% of occupancy tries to travel in 5 min
+    # 5-minute peak demand: peak fraction of occupancy travels in interval_period_s
     # Each lift carries P passengers per RTT seconds.
-    # Lifts needed = peak_demand / (P * 300 / RTT)
-    peak_demand = total_building_occupancy * 0.12   # 12% in 5 min
-    handling_capacity_per_lift = P * (300.0 / RTT)   # persons per 5 min per lift
-    lifts_by_demand = math.ceil(peak_demand / handling_capacity_per_lift) if handling_capacity_per_lift > 0 else 2
+    # Lifts needed = peak_demand / (P * interval_s / RTT)
+    peak_demand = total_building_occupancy * _PEAK_FRAC
+    handling_capacity_per_lift = P * (float(_INTERVAL_S) / RTT)
+    lifts_by_demand = math.ceil(peak_demand / handling_capacity_per_lift) if handling_capacity_per_lift > 0 else _MIN_LIFTS
 
-    # RTT-based count, minimum 2, hard cap 24 (2 full banks of 12).
-    # Population-based sanity cap: ~1 lift per 300 occupants is the
-    # industry norm for office (CIBSE Guide D prestige interval ~25 s).
-    max_from_pop = max(2, int(math.ceil(total_building_occupancy / 300.0)))
-    num_lifts = max(lifts_by_demand, 2)
-    num_lifts = min(num_lifts, max_from_pop, 24)  # cap at pop-based and absolute max
+    # RTT-based count, minimum from compliance, hard cap from compliance.
+    # Population-based sanity cap: ~1 lift per N occupants (CIBSE Guide D).
+    max_from_pop = max(_MIN_LIFTS, int(math.ceil(total_building_occupancy / float(_OCC_PER_LIFT))))
+    num_lifts = max(lifts_by_demand, _MIN_LIFTS)
+    num_lifts = min(num_lifts, max_from_pop, _MAX_TOTAL)
 
     return int(num_lifts)
 
 def get_core_dimensions(num_lifts, internal_size=(2500, 2500), lobby_width=3000):
     """Calculates the total width and depth of a SINGLE lift core block (max 12)."""
     w, l = internal_size
-    t = 350  # wall thickness — 350mm structural core walls
+    t = _WALL_T  # wall thickness from compliance_lift_engineering.json
     
     # Each core: max 12 lifts, max 6 per side
     if num_lifts >= 4:
@@ -68,7 +112,7 @@ def get_total_core_layout(num_lifts, internal_size=(2500, 2500), lobby_width=300
     """Calculates multi-core layout (back-to-back) if num_lifts > 12.
     Ensures equal distribution among cores."""
     # Strict 12-lift max per block
-    num_blocks = int(math.ceil(num_lifts / 12.0))
+    num_blocks = int(math.ceil(num_lifts / float(_MAX_PER_BLOCK)))
     
     # Ensure equal number of lifts per core as requested
     # We round up the total count to a multiple of num_blocks
@@ -138,7 +182,7 @@ def get_shaft_void_rectangles_mm(num_lifts, center_pos=(0, 0), internal_size=(25
 def _get_block_void_rectangles_mm(num_lifts, center_pos, internal_size=(2500, 2500), lobby_width=3000):
     """Void rectangles for a single lift core block (max 12 lifts)."""
     w, l = internal_size
-    t = 350  # wall thickness — 350mm structural core walls
+    t = _WALL_T  # wall thickness from compliance_lift_engineering.json
 
     total_in_block = min(12, num_lifts)
     if total_in_block >= 4:
@@ -207,7 +251,7 @@ def generate_lift_shaft_manifest(num_lifts, levels_data, center_pos=(0, 0), inte
 def _generate_single_block_manifest(num_lifts, levels_data, center_pos=(0, 0), internal_size=(2500, 2500), lobby_width=3000, block_tag=""):
     """Generate wall/floor manifest for a single lift core block (max 12 lifts)."""
     w, l = internal_size
-    t = 350  # wall thickness — 350mm structural core walls
+    t = _WALL_T  # wall thickness from compliance_lift_engineering.json
 
     # Symmetry: Split into two rows if >= 4 lifts
     if num_lifts >= 4:
@@ -341,7 +385,7 @@ def get_passenger_lift_door_positions(num_lifts, center_pos=(0, 0), internal_siz
     For a single row (<4 lifts): doors face the open (south) side.
     """
     w, l = internal_size
-    t = 350  # must match _generate_single_block_manifest
+    t = _WALL_T  # from compliance_lift_engineering.json
 
     layout = get_total_core_layout(num_lifts, internal_size, lobby_width)
     num_blocks = layout["num_blocks"]

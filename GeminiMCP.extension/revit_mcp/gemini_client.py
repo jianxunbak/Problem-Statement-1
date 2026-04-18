@@ -124,11 +124,11 @@ class GeminiClient:
             self.log(err)
             return err
 
-    def generate_content(self, prompt, thinking_budget=2048):
+    def generate_content(self, prompt, thinking_budget=16384):
         """Pure text generation for internal agent manifest generation.
 
-        thinking_budget: number of thinking tokens allowed (0=off, 1024=fast, 2048=default).
-        Caller should pass 1024 for simple edits, 2048 for full builds.
+        thinking_budget: number of thinking tokens allowed (0=off, 1024=fast, 16384=default).
+        Caller should pass 1024 for simple edits, 16384 for full builds.
         """
         self.log("generate_content() entered with model: {} | thinking_budget: {}".format(self.model, thinking_budget))
         url = "https://generativelanguage.googleapis.com/v1beta/models/{}:generateContent?key={}".format(self.model, self.api_key)
@@ -136,7 +136,9 @@ class GeminiClient:
             "contents": [{"role": "user", "parts": [{"text": prompt}]}],
             "generationConfig": {
                 "temperature": 0.1,
-                "maxOutputTokens": 32768,
+                # Thinking tokens count against maxOutputTokens in Gemini 2.5 Flash.
+                # Reserve thinking_budget for reasoning + 8192 tokens for the JSON output.
+                "maxOutputTokens": thinking_budget + 8192,
                 "thinkingConfig": {"thinkingBudget": thinking_budget},
             }
         }

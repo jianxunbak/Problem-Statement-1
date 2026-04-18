@@ -368,8 +368,8 @@ class BuildingSystem:
         
         # --- PRESET LOADING ---
         presets = load_presets()
-        typology = setup.get("typology", "commercial_office").lower().replace(" ", "_")
-        preset = presets.get(typology, presets.get("commercial_office", {}))
+        typology = (manifest.get("typology") or setup.get("typology", "")).lower().replace(" ", "_")
+        preset = presets.get(typology) or presets.get("default") or presets.get("commercial_office", {})
         
         num_storeys = int(safe_num(setup.get("levels", 1), 1))
         

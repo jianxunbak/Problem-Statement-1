@@ -8,7 +8,7 @@ from revit_mcp.agent_prompts import *
 from revit_mcp.revit_workers import RevitWorkers, execute_in_transaction_group
 from revit_mcp.bridge import mcp_event_handler
 from revit_mcp.building_generator import BuildingSystem
-from revit_mcp.utils import load_presets
+from revit_mcp.utils import load_presets, load_compliance
 
 class Orchestrator:
     def __init__(self):
@@ -34,6 +34,23 @@ class Orchestrator:
         presets_text = ""
         if presets:
             presets_text = "\nBUILDING PRESETS (DNA):\n" + json.dumps(presets, indent=2)
+
+        # Load Authority Compliance Rules and inject into prompt
+        _c_lift   = load_compliance("lift_engineering")
+        _c_fire   = load_compliance("fire_safety")
+        _c_struct = load_compliance("structural")
+        compliance_text = ""
+        if _c_lift or _c_fire or _c_struct:
+            compliance_text = "\nAUTHORITY COMPLIANCE RULES (MANDATORY — embed values used into manifest compliance_parameters):\n"
+            if _c_lift:
+                compliance_text += "## Lift Engineering — BS EN 81-20 / CIBSE Guide D:\n"
+                compliance_text += json.dumps(_c_lift, indent=2) + "\n"
+            if _c_fire:
+                compliance_text += "## Fire Safety — BS EN 81-72 / BS 9999 / Approved Doc B:\n"
+                compliance_text += json.dumps(_c_fire, indent=2) + "\n"
+            if _c_struct:
+                compliance_text += "## Structural — Wall Thicknesses:\n"
+                compliance_text += json.dumps(_c_struct, indent=2) + "\n"
 
         def gather_state():
             import Autodesk.Revit.DB as DB # type: ignore
@@ -157,10 +174,30 @@ class Orchestrator:
                 state_text = f"CURRENT BIM STATE: {storeys} storeys. "
                 if cur_heights: state_text += f"\nEXISTING HEIGHTS: {cur_heights}"
                 if cur_overrides: state_text += f"\nEXISTING OVERRIDES: {cur_overrides}"
-                if cur_stats: 
+                if cur_stats:
                     state_text += f"\nPROJECT TOTALS: {json.dumps(cur_stats['total_stats'])}"
                     state_text += f"\nPER-FLOOR BREAKDOWN: {json.dumps(cur_stats['per_floor_breakdown'])}"
                     state_text += f"\nDETECTED COLUMN SPAN: {cur_stats['current_column_span']}mm"
+                # Load persisted shell parametric state (shape, footprint_scale_overrides, etc.)
+                try:
+                    import os as _os
+                    from revit_mcp.utils import get_log_path
+                    _shell_path = _os.path.join(_os.path.dirname(get_log_path()), "last_shell_state.json")
+                    if _os.path.exists(_shell_path):
+                        with open(_shell_path) as _f:
+                            _saved_shell = json.load(_f)
+                        if _saved_shell:
+                            state_text += f"\nEXISTING SHELL PARAMETERS: {json.dumps(_saved_shell)}"
+                            state_text += (
+                                "\nCRITICAL — SHELL MEMORY: The EXISTING SHELL PARAMETERS above define "
+                                "the current building shape and per-floor scale pattern. You MUST carry "
+                                "these values forward into your manifest unchanged UNLESS the user "
+                                "explicitly asks to modify them. In particular, preserve 'shape', "
+                                "'footprint_scale_overrides' (extending or merging for new floors), "
+                                "'width', and 'length'."
+                            )
+                except Exception as _le:
+                    self.log(f"Shell state load warning: {_le}")
                 state_text += f"\nCRITICAL: Refer to PER-FLOOR BREAKDOWN for detailed queries. Preserve existing state unless asked to change."
                 self._cached_state = state_text
                 self._cache_time = now
@@ -179,7 +216,7 @@ class Orchestrator:
         self.log("Step 2: Requesting building plan from Gemini AI (model: {}, thinking_budget: {})".format(client.model, thinking_budget))
         if tracker: tracker.report(f"Sending to Gemini AI ({client.model}) for geometric reasoning... This may take 10-20s.")
 
-        current_prompt = DISPATCHER_PROMPT + presets_text + "\n" + state_text + "\nUser Request: " + user_prompt
+        current_prompt = DISPATCHER_PROMPT + presets_text + compliance_text + "\n" + state_text + "\nUser Request: " + user_prompt
         max_attempts = 3
 
         for attempt in range(max_attempts):
@@ -211,7 +248,14 @@ class Orchestrator:
                 if "response" in manifest and not any(k in manifest for k in ["project_setup", "levels", "shell"]):
                     self.log("Dispatcher: AI detected a QUESTION. Returning natural language response.")
                     return str(manifest["response"])
-                
+
+                # Log full manifest to runner/console for debugging
+                self.log("=== BUILDING MANIFEST ===\n{}\n=== END MANIFEST ===".format(
+                    json.dumps(manifest, indent=2)))
+
+                # Report design parameters and compliance numbers to chat
+                self._report_design_parameters(manifest, presets, tracker)
+
                 # EXECUTE BUILD (Validate/Build)
                 def main_action():
                     import Autodesk.Revit.DB as DB # type: ignore
@@ -236,7 +280,10 @@ class Orchestrator:
                         self.log("Reached maximum orchestration attempts.")
                         return f"Failed to build after {max_attempts} attempts due to structural/spatial conflicts: {conflict_desc}"
                 
-                # SUCCESS: Return tracker report or summary
+                # SUCCESS: invalidate BIM state cache so next prompt picks up the new shell
+                self._cache_time = 0
+
+                # Return tracker report or summary
                 if tracker:
                     tracker.analyze_manifest(manifest)
                     return tracker.generate_final_report(base_summary="Build Successful (Agentic Resolution Applied).")
@@ -248,31 +295,48 @@ class Orchestrator:
                 self.log(err)
                 if attempt == max_attempts - 1:
                     return err
-                current_prompt += f"\n\n[ERROR IN PREVIOUS ATTEMPT]:\n{str(e)}\n\nPlease ensure you follow the JSON schema strictly."
+                # If the failure was a missing JSON block (model produced prose instead),
+                # give a laser-focused retry that forbids all prose output.
+                if "Expecting value" in str(e) or "no JSON" in str(e).lower():
+                    current_prompt += (
+                        "\n\n[CRITICAL — PREVIOUS RESPONSE HAD NO JSON BLOCK]:\n"
+                        "Your last response contained only prose/reasoning text — no ```json block was found.\n"
+                        "THIS TIME: Output ONLY two things, nothing else:\n"
+                        "1. <architectural_intent> block — 2 sentences MAX\n"
+                        "2. The ```json\\n{...}\\n``` manifest block\n"
+                        "Do NOT write any analysis, tables, bullet lists, or explanations outside these two blocks.\n"
+                        "Use sparse footprint_scale_overrides (5-8 control points only, NOT one entry per floor)."
+                    )
+                else:
+                    current_prompt += f"\n\n[ERROR IN PREVIOUS ATTEMPT]:\n{str(e)}\n\nPlease ensure you follow the JSON schema strictly."
                 time.sleep(1)
 
     def _classify_prompt_thinking_budget(self, user_prompt):
         """Return Gemini thinking token budget based on prompt complexity.
 
         Simple edits (dimension changes, level count adjustments, minor overrides)
-        get 1024 tokens — enough to reason without burning time.
-        Full builds or complex multi-constraint requests get 2048.
+        get 8192 tokens — enough headroom without burning time.
+        Full builds or complex multi-constraint requests get 16384.
         """
         import re
         p = user_prompt.lower()
 
-        # Complex: new building, full regeneration, multi-constraint specification
+        # Complex: new building, full regeneration, multi-constraint specification,
+        # or any storey addition/extension (requires recalculating scale overrides for all floors)
         complex_keywords = [
             r"\bcreate\b", r"\bbuild\b", r"\bgenerate\b", r"\bnew building\b",
             r"\bfrom scratch\b", r"\bfire safety\b", r"\bbs en\b",
             r"\bmixed.use\b", r"\bcomplex\b", r"\bmulti.?storey\b",
+            r"\badd.{0,20}stor", r"\bextend.{0,20}stor", r"\bmore.{0,20}stor",
+            r"\badditional.{0,20}stor", r"\btaper\b", r"\bhourglass\b",
+            r"\bfootprint.scale\b",
         ]
         for kw in complex_keywords:
             if re.search(kw, p):
-                return 2048
+                return 16384
 
         # Simple: single-dimension edits, height/width/floor changes, count tweaks
-        return 1024
+        return 8192
 
     def _stream_narrative_to_user(self, text, tracker):
         """Extracts and streams <architectural_intent> and <resolution_thoughts> to the user."""
@@ -357,6 +421,116 @@ class Orchestrator:
             return "Deleted {} elements on floor(s) {}-{}.".format(result.get("deleted_count", 0), level_start, level_end or level_start)
 
         return None
+
+    def _report_design_parameters(self, manifest, presets, tracker):
+        """Format and stream design parameters + compliance numbers to the chat UI."""
+        if not tracker:
+            return
+
+        typology = manifest.get("typology", "default")
+        preset   = presets.get(typology) or presets.get("default") or {}
+        cp       = manifest.get("compliance_parameters", {})
+        setup    = manifest.get("project_setup", {})
+        shell    = manifest.get("shell", {})
+        lifts    = manifest.get("lifts", {})
+        stairs   = manifest.get("staircases", {})
+
+        lines = []
+
+        # ── Typology ──────────────────────────────────────────────────────────
+        lines.append("**Typology:** `{}`".format(typology))
+
+        # ── Manifest shell ────────────────────────────────────────────────────
+        lines.append("\n**Manifest — Building Shell:**")
+        lvls = setup.get("levels", "?")
+        lh   = setup.get("level_height", "?")
+        lines.append("  - Levels: {}, typical height: {}mm".format(lvls, lh))
+        if shell.get("width") and shell.get("length"):
+            lines.append("  - Footprint: {}mm × {}mm".format(shell["width"], shell["length"]))
+        if shell.get("column_spacing"):
+            lines.append("  - Column grid: {}mm".format(shell["column_spacing"]))
+        if lifts.get("count"):
+            lines.append("  - Lifts: {}".format(lifts["count"]))
+        if stairs.get("count"):
+            lines.append("  - Staircases: {}".format(stairs["count"]))
+
+        # ── Design parameters from preset ─────────────────────────────────────
+        bd  = preset.get("building_defaults", {})
+        cl  = preset.get("core_logic", {})
+        pr  = preset.get("program_requirements", {})
+        col = preset.get("column_logic", {})
+        if bd or cl or pr or col:
+            lines.append("\n**Design Parameters (preset: `{}`):**".format(typology))
+            if bd.get("typical_floor_height"):
+                lines.append("  - Typical floor height: {}mm".format(bd["typical_floor_height"]))
+            if bd.get("first_storey_floor_height"):
+                lines.append("  - Ground floor height: {}mm".format(bd["first_storey_floor_height"]))
+            if bd.get("clear_ceiling_height"):
+                lines.append("  - Clear ceiling height: {}mm".format(bd["clear_ceiling_height"]))
+            if col.get("span"):
+                lines.append("  - Column span range: {}–{}mm".format(col["span"][0], col["span"][1]))
+            if col.get("offset_from_edge"):
+                lines.append("  - Column offset from edge: {}mm".format(col["offset_from_edge"]))
+            if pr.get("minimum_distance_facade_to_core"):
+                lines.append("  - Min facade-to-core depth: {}mm".format(pr["minimum_distance_facade_to_core"]))
+            if pr.get("core_area_ratio"):
+                lo, hi = pr["core_area_ratio"]
+                lines.append("  - Core area ratio: {:.0f}–{:.0f}%".format(lo * 100, hi * 100))
+            if pr.get("occupancy_load_factor"):
+                lines.append("  - Occupancy load factor: {} m²/person".format(pr["occupancy_load_factor"]))
+            if cl.get("lift_waiting_time"):
+                lines.append("  - Target lift waiting time: {}s".format(cl["lift_waiting_time"]))
+            if cl.get("lift_lobby_width"):
+                lines.append("  - Lift lobby width: {}mm".format(cl["lift_lobby_width"]))
+            if cl.get("lift_shaft_size"):
+                sz = cl["lift_shaft_size"]
+                lines.append("  - Lift shaft size: {}×{}mm".format(sz[0], sz[1]))
+            if cl.get("fire_lobby_std_depth"):
+                lines.append("  - Fire lobby std depth: {}mm".format(cl["fire_lobby_std_depth"]))
+            sc = cl.get("staircase_spec", {})
+            if sc:
+                lines.append("  - Staircase: {}mm riser / {}mm tread / {}mm flight / {}mm landing".format(
+                    sc.get("riser", "?"), sc.get("tread", "?"),
+                    sc.get("width_of_flight", "?"), sc.get("landing_width", "?")))
+
+        # ── Authority compliance parameters (embedded in manifest) ─────────────
+        if cp:
+            lines.append("\n**Authority Compliance Parameters (manifest `compliance_parameters`):**")
+            _labels = {
+                "max_travel_distance_mm":    ("Max travel distance",  "mm"),
+                "stair_riser_mm":            ("Stair riser",          "mm"),
+                "stair_tread_mm":            ("Stair tread",          "mm"),
+                "stair_flight_width_mm":     ("Stair flight width",   "mm"),
+                "stair_landing_width_mm":    ("Stair landing width",  "mm"),
+                "stair_headroom_mm":         ("Stair headroom",       "mm"),
+                "stair_overrun_mm":          ("Stair overrun",        "mm"),
+                "fire_lobby_min_area_mm2":   ("Fire lobby min area",  "m²"),
+                "smoke_lobby_min_area_mm2":  ("Smoke lobby min area", "m²"),
+                "smoke_lobby_min_depth_mm":  ("Smoke lobby min depth","mm"),
+                "fire_lift_car_size_mm":     ("Fire lift car size",   "mm"),
+                "lift_wall_thickness_mm":    ("Lift shaft wall",      "mm"),
+                "std_wall_thickness_mm":     ("Std wall thickness",   "mm"),
+                "lift_speed_m_s":            ("Lift speed",           "m/s"),
+                "lift_door_time_s":          ("Lift door time",       "s"),
+                "lift_transfer_time_s":      ("Lift transfer time",   "s"),
+                "lift_peak_demand_fraction": ("Peak demand fraction", ""),
+                "lift_interval_s":           ("Lift interval period", "s"),
+                "lift_occupants_per_lift":   ("Occupants per lift",   ""),
+            }
+            for k, v in cp.items():
+                label, unit = _labels.get(k, (k, ""))
+                # Convert mm² values to m² for readability
+                if unit == "m²" and isinstance(v, (int, float)):
+                    display = "{:.1f} m²".format(v / 1_000_000)
+                elif unit:
+                    display = "{} {}".format(v, unit)
+                else:
+                    display = str(v)
+                lines.append("  - {}: {}".format(label, display))
+        else:
+            lines.append("\n*No `compliance_parameters` block in manifest — Gemini did not embed compliance values.*")
+
+        tracker.report("\n".join(lines))
 
     def _extract_json(self, text):
         # Log tail of response to diagnose extraction failures

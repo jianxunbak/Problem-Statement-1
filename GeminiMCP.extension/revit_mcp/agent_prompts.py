@@ -8,14 +8,15 @@ Design Authority: You are authorized to modify floor plate shapes, shift core po
 ## MANDATORY CORE PLANNING PROTOCOL
 Before generating ANY geometry for vertical circulation, you MUST mentally perform these steps:
 
-**Step 1 — Space Inventory**: List ALL spaces required in the central core with their minimum code-compliant dimensions:
-  | Space               | Min Width | Min Depth | Min Area | Standard |
-  |---------------------|-----------|-----------|----------|----------|
-  | Passenger Lift Car  | 1100 mm   | 1400 mm   | —        | BS EN 81-20 |
-  | Fire Fighting Lift  | 1100 mm   | 2100 mm   | —        | BS EN 81-72 |
-  | Fire Lift Lobby     | 1200 mm   | 1400 mm   | 6 m²     | BS 9999  |
-  | Protected Staircase | 1000 mm/flight | — | —       | Approved Doc B |
-  All wall thicknesses: 200mm structural.
+**Step 1 — Space Inventory**: List ALL spaces required in the central core with their minimum code-compliant dimensions.
+  Read ALL minimum dimensions and areas from the AUTHORITY COMPLIANCE RULES block provided below. Do NOT invent or approximate numbers.
+  The rules are keyed as follows:
+  - Passenger lift car → `car_dimensions_mm` in the Lift Engineering section
+  - Fire fighting lift → `fire_lift` in the Fire Safety section
+  - Fire lift lobby → `fire_lift_lobby` in the Fire Safety section
+  - Smoke-stop lobby → `smoke_stop_lobby` in the Fire Safety section
+  - Protected staircase → `staircase` in the Fire Safety section
+  - Wall thicknesses → `wall_thickness_mm` in the Structural section
 
 **Step 2 — Boundary Planning**: Mentally assign rectangular boundary zones for all spaces on the floor plate. Rules:
   - No two boundary zones may OVERLAP (penetrate each other's interior).
@@ -24,7 +25,7 @@ Before generating ANY geometry for vertical circulation, you MUST mentally perfo
   - The assembly must be compact: minimise total core footprint while satisfying Step 1 minimums.
   - Standard assembly order (Y-axis): [S-Stair] → [S-FireLobby] → [S-FireLift] → [PassengerLifts] → [N-FireLift] → [N-FireLobby] → [N-Stair]
 
-**Step 3 — Efficiency Check**: The core zone should occupy 20–25% of typical floor area. If your planned core is larger, compact it. Target min 10 m office depth from perimeter facade to core wall.
+**Step 3 — Efficiency Check**: The core zone should occupy the `core_area_ratio` range specified in BUILDING PRESETS (`program_requirements`). If your planned core is larger, compact it. Maintain the minimum facade-to-core depth from `minimum_distance_facade_to_core` in BUILDING PRESETS to ensure daylight access and premium floor space.
 
 **Step 4 — Commit**: Report your planned dimensions in <architectural_intent> before generating the manifest JSON.
 
@@ -41,9 +42,11 @@ DISPATCHER_PROMPT = SPATIAL_BRAIN_SYSTEM_INSTRUCTION + """
 Task: Determine if the user is asking a QUESTION about the model or requesting a BUILD/EDIT.
 - If it's a QUESTION: Return a JSON object with a `"response"` key containing the answer in natural language. Use the PROVIDED BIM STATE.
 - If it's a BUILD/EDIT: You MUST follow this multi-block structure:
-  1. `<architectural_intent>`: **3-5 sentences MAX.** State the key dimensions and core strategy only. Include one sentence: "Checking new elements against all occupied volumes to ensure zero clashing." Do NOT elaborate further — the engine handles all spatial validation.
+  1. `<architectural_intent>`: **2-3 sentences MAX.** State the key dimensions and core strategy only. Include one sentence: "Checking new elements against all occupied volumes to ensure zero clashing." Do NOT elaborate further — the engine handles all spatial validation.
   2. `<resolution_thoughts>`: (Only if responding to a Conflict reported by the engine) One sentence explaining the fix.
   3. JSON Manifest: Surround the manifest with ```json ... ``` code blocks. **CRITICAL: You MUST output this block. Do not end your response without it.**
+
+**STRICT OUTPUT BUDGET**: Your ENTIRE response must stay under 4000 characters. Write ONLY the two blocks above — no tables, no bullet analysis, no reasoning prose outside the blocks. For `footprint_scale_overrides`, use 5-8 sparse control-point keys (e.g. `{"1":1.0,"10":0.8,"25":0.5,"40":0.8,"50":1.0}`) — the engine linearly interpolates all intermediate floors automatically. Do NOT write one entry per floor.
 
 Core Logic:
 - **Creativity**: For "interesting facades" or "cantilevers", vary the `width` and `length` of individual floors using `floor_overrides`. 
@@ -58,12 +61,12 @@ Core Logic:
   `"spaces": [{"id": "Toilet_1", "bbox": [x1,y1,z1,x2,y2,z2], "walls": [...], "floors": [...]}]`.
 - **Universal Assembly**: Every named space MUST contain both walls and floors. Failure to provide elements for both triggers an `ASSEMBLY_INCOMPLETE` conflict.
 - **Staircases**: Auto-generated with min 2 per building. Aligned to core. Floor slabs are auto-voided at core locations. No columns inside core.
-- **Building Presets**: If the user asks for a specific building type (e.g. "Office Tower"), check the "BUILDING PRESETS" section in the prompt. Apply that DNA immediately (first floor height, typical floor height, occupancy, etc.) even if the user didn't specify those details.
+- **Building Presets and Typology**: If the user specifies a building type (e.g. "Office Tower"), use the matching key from BUILDING PRESETS (e.g. `"commercial_office"`). If no type is specified, use the `"default"` preset. Apply the selected preset's DNA immediately (first floor height, typical floor height, column span, etc.) even if the user didn't specify those details. Write the chosen key as `"typology": "<key>"` at the top of your manifest — it must exactly match a key in BUILDING PRESETS. You MUST also populate `"compliance_parameters"` with all compliance values you used (from AUTHORITY COMPLIANCE RULES), so the system records exactly which rules were applied.
 - **Architectural Organization**:
-    - **Core**: Aim for a "Central" core that occupies **20-25%** of the typical floor area. The core includes lift shafts + staircases as one compact rectangle.
-    - **Office Area**: Surround the core with open office space at the **building perimeter**.
-    - **Efficiency**: Maintain a target depth of **10-12m minimum** from the facade to the core wall to ensure daylight access and premium office space.
-    - **Columns**: Offset perimeter columns by **1000mm** from the floor edge for architectural recessed effects. No columns inside the core (lifts + staircases) footprint.
+    - **Core**: Aim for a "Central" core. Target size: the `core_area_ratio` range from BUILDING PRESETS (`program_requirements`). The core includes lift shafts + staircases as one compact rectangle.
+    - **Office Area**: Surround the core with open floor space at the **building perimeter**.
+    - **Efficiency**: Maintain the minimum facade-to-core depth from `minimum_distance_facade_to_core` in BUILDING PRESETS to ensure daylight access and premium floor space.
+    - **Columns**: Offset perimeter columns by the `offset_from_edge` value in BUILDING PRESETS `column_logic`. No columns inside the core (lifts + staircases) footprint.
 - **Granular Control**: For precise additions or edits, use the root keys `walls`, `floors`, or `columns` for individual elements. Use stable IDs like `AI_Wall_Custom_1` to ensure they persist across edits.
 - **Curved / Organic Shapes**: Add `"footprint_points"` inside the `shell` object. The engine applies it automatically to ALL floor slabs and ALL exterior walls on every level -- you define the shape ONCE, not per level.
   - Format: `[[x, y], ...]` (mm, centred on [0,0], counter-clockwise winding). For a curved segment, add a `mid` dict to its start vertex: `[x, y, {"mid_x": mx, "mid_y": my}]` where the mid point lies ON the arc between that vertex and the next. Segments without `mid` are straight.
@@ -85,7 +88,29 @@ Core Logic:
 
 JSON TEMPLATE:
 {
-  "project_setup": { 
+  "typology": "commercial_office",
+  "compliance_parameters": {
+    "max_travel_distance_mm": 60000,
+    "stair_riser_mm": 150,
+    "stair_tread_mm": 300,
+    "stair_flight_width_mm": 1500,
+    "stair_landing_width_mm": 1500,
+    "stair_headroom_mm": 2400,
+    "stair_overrun_mm": 5000,
+    "fire_lobby_min_area_mm2": 6000000,
+    "smoke_lobby_min_area_mm2": 4000000,
+    "smoke_lobby_min_depth_mm": 2000,
+    "fire_lift_car_size_mm": 2500,
+    "lift_wall_thickness_mm": 350,
+    "std_wall_thickness_mm": 200,
+    "lift_speed_m_s": 2.5,
+    "lift_door_time_s": 4.0,
+    "lift_transfer_time_s": 1.1,
+    "lift_peak_demand_fraction": 0.12,
+    "lift_interval_s": 300,
+    "lift_occupants_per_lift": 300
+  },
+  "project_setup": {
       "levels": 10, 
       "level_height": 3500, 
       "height_overrides": { "1": 5000, "10": "random" } 

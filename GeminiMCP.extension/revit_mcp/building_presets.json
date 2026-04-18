@@ -1,4 +1,40 @@
 {
+  "default": {
+    "building_identity": {
+      "typology": "Generic",
+      "target_efficiency": 0.75,
+      "typical_floor_area": 1500
+    },
+    "building_defaults": {
+      "typical_floor_height": 3500,
+      "first_storey_floor_height": 5000,
+      "last_floor_height": 4000,
+      "clear_ceiling_height": 2700,
+      "core_position": "Central"
+    },
+    "column_logic": {
+      "span": [8000, 12000],
+      "offset_from_edge": 500
+    },
+    "program_requirements": {
+      "occupancy_load_factor": 12.0,
+      "minimum_distance_facade_to_core": 8000,
+      "core_area_ratio": [0.15, 0.25]
+    },
+    "core_logic": {
+      "lift_waiting_time": 30,
+      "lift_lobby_width": 2500,
+      "lift_shaft_size": [2200, 2200],
+      "fire_lobby_std_depth": 2000,
+      "staircase_spec": {
+        "riser": 150,
+        "tread": 300,
+        "width_of_flight": 1200,
+        "landing_width": 1200,
+        "entry_landing_width": 2400
+      }
+    }
+  },
   "commercial_office": {
     "building_identity": {
       "typology": "Commercial Office",
@@ -13,44 +49,25 @@
       "core_position": "Central"
     },
     "column_logic": {
-      "span": [
-        12000,
-        15000
-      ],
+      "span": [12000, 15000],
       "offset_from_edge": 500
     },
     "program_requirements": {
       "occupancy_load_factor": 10.0,
       "minimum_distance_facade_to_core": 12000,
-      "core_area_ratio": [
-        0.20,
-        0.25
-      ]
+      "core_area_ratio": [0.20, 0.25]
     },
     "core_logic": {
       "lift_waiting_time": 25,
       "lift_lobby_width": 3000,
-      "lift_shaft_size": [
-        2700,
-        2700
-      ],
-      "fire_safety": {
-        "fire_escape_staircases": 2,
-        "max_travel_distance": 60000,
-        "staircase_spec": {
-          "riser": 150,
-          "tread": 300,
-          "width_of_flight": 1500,
-          "landing_width": 1800
-        },
-        "fire_fighting_lifts": 2,
-        "fire_fighting_lift_lobby": {
-          "min_width": 2000,
-          "min_area": 6000000
-        },
-        "smoke_stop_lobby": {
-          "min_area": 3000000
-        }
+      "lift_shaft_size": [2700, 2700],
+      "fire_lobby_std_depth": 2000,
+      "staircase_spec": {
+        "riser": 150,
+        "tread": 300,
+        "width_of_flight": 1500,
+        "landing_width": 1500,
+        "entry_landing_width": 2800
       }
     }
   }

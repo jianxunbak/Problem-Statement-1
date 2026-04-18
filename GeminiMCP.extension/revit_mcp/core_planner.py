@@ -21,50 +21,71 @@ import math
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+#  Load compliance data from JSON files — single source of truth
+#  Falls back to hardcoded values if files are missing.
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _load_cp_compliance(name):
+    try:
+        import os, json
+        p = os.path.join(os.path.dirname(os.path.abspath(__file__)), "compliance_{}.json".format(name))
+        if os.path.exists(p):
+            with open(p) as f:
+                return json.load(f)
+    except Exception:
+        pass
+    return {}
+
+_c_lift = _load_cp_compliance("lift_engineering")
+_c_fire = _load_cp_compliance("fire_safety")
+_c_stru = _load_cp_compliance("structural")
+
+# ─────────────────────────────────────────────────────────────────────────────
 #  Code-compliant minimum space requirements (all in mm)
+#  Values sourced from compliance JSON files; hardcoded literals are fallbacks.
 # ─────────────────────────────────────────────────────────────────────────────
 
 SPACE_REQUIREMENTS = {
     # Passenger lift car (BS EN 81-20 Cat 2, min 8-person)
     "passenger_lift_car": {
-        "min_width":   1100,   # mm clear internal
-        "min_depth":   1400,   # mm clear internal
-        "std_width":   2000,   # mm standard office car
-        "std_depth":   2000,   # mm standard office car
-        "wall_t":       200,   # mm shaft wall thickness
+        "min_width":   _c_lift.get("car_dimensions_mm", {}).get("min_width",   1100),
+        "min_depth":   _c_lift.get("car_dimensions_mm", {}).get("min_depth",   1400),
+        "std_width":   _c_lift.get("car_dimensions_mm", {}).get("std_width",   2000),
+        "std_depth":   _c_lift.get("car_dimensions_mm", {}).get("std_depth",   2000),
+        "wall_t":      _c_stru.get("wall_thickness_mm", {}).get("core_structural", 350),
         "description": "Passenger lift car — BS EN 81-20",
     },
     # Fire fighting lift car (BS EN 81-72 / BS 5588-5)
     "fire_lift_car": {
-        "min_width":   1100,   # mm clear (stretcher-accessible)
-        "min_depth":   2100,   # mm clear (stretcher length)
-        "std_width":   2000,   # mm
-        "std_depth":   2000,   # mm
-        "wall_t":       200,   # mm
+        "min_width":   _c_fire.get("fire_lift", {}).get("min_car_width_mm",   1100),
+        "min_depth":   _c_fire.get("fire_lift", {}).get("min_car_depth_mm",   2100),
+        "std_width":   _c_fire.get("fire_lift", {}).get("std_car_width_mm",   2000),
+        "std_depth":   _c_fire.get("fire_lift", {}).get("std_car_depth_mm",   2000),
+        "wall_t":      _c_stru.get("wall_thickness_mm", {}).get("standard",    200),
         "description": "Fire fighting lift — BS EN 81-72",
     },
     # Fire lift lobby (BS 9999 / BS 5588-5)
     "fire_lobby": {
-        "min_area":  6_000_000,  # mm² = 6 m²
-        "min_width":    1200,    # mm clear
-        "min_depth":    1400,    # mm clear
-        "std_depth":    2000,    # mm clear (comfortable egress)
-        "description":  "Fire lift lobby — BS 9999",
+        "min_area":    _c_fire.get("fire_lift_lobby", {}).get("min_area_mm2",  6_000_000),
+        "min_width":   _c_fire.get("fire_lift_lobby", {}).get("min_width_mm",  1200),
+        "min_depth":   _c_fire.get("fire_lift_lobby", {}).get("min_depth_mm",  1400),
+        "std_depth":   2000,  # design default — overridden by preset core_logic.fire_lobby_std_depth at call time
+        "description": "Fire lift lobby — BS 9999",
     },
     # Protected staircase (Building Regs Approved Document B)
     "staircase": {
-        "min_flight_width":  1000,   # mm clear flight width
-        "std_flight_width":  1200,   # mm (typical office standard)
-        "min_riser":           100,  # mm
-        "max_riser":           220,  # mm
-        "min_tread":           250,  # mm going
-        "std_riser":           150,  # mm
-        "std_tread":           300,  # mm
+        "min_flight_width":  _c_fire.get("staircase", {}).get("min_flight_width_mm",  1000),
+        "std_flight_width":  1500,  # design default — overridden by preset core_logic.staircase_spec at call time
+        "min_riser":         _c_fire.get("staircase", {}).get("min_riser_mm",          100),
+        "max_riser":         _c_fire.get("staircase", {}).get("max_riser_mm",          220),
+        "min_tread":         _c_fire.get("staircase", {}).get("min_tread_mm",          250),
+        "std_riser":         150,   # design default — overridden by preset core_logic.staircase_spec at call time
+        "std_tread":         300,   # design default — overridden by preset core_logic.staircase_spec at call time
         "description": "Protected staircase — Approved Doc B",
     },
 }
 
-WALL_T = 200  # mm — standard structural wall thickness throughout
+WALL_T = _c_stru.get("wall_thickness_mm", {}).get("standard", 200)  # mm — standard structural wall thickness
 
 
 # ─────────────────────────────────────────────────────────────────────────────

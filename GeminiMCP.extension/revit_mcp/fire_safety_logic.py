@@ -3,12 +3,32 @@ import math
 from . import staircase_logic
 from .utils import safe_num
 
-_WALL_THICKNESS = 350  # mm — 350mm structural core walls (user requirement)
-_OVERRUN_HEIGHT = 5000  # mm  (must match staircase_logic._OVERRUN_HEIGHT)
+# ─────────────────────────────────────────────────────────────────────────────
+#  Load compliance data from JSON files — single source of truth.
+#  Falls back to hardcoded values if files are missing.
+# ─────────────────────────────────────────────────────────────────────────────
 
-# Rule 3: fire lift car matches passenger lift car (2500 mm internal)
-_FL_CAR_SIZE = 2500  # mm — internal car dimension
-_FL_SHAFT_D  = _FL_CAR_SIZE + 2 * _WALL_THICKNESS  # = 2900 mm outer shaft
+def _load_fsc():
+    try:
+        import os, json
+        d = os.path.dirname(os.path.abspath(__file__))
+        fs_path = os.path.join(d, "compliance_fire_safety.json")
+        st_path = os.path.join(d, "compliance_structural.json")
+        c_fs = json.load(open(fs_path)) if os.path.exists(fs_path) else {}
+        c_st = json.load(open(st_path)) if os.path.exists(st_path) else {}
+        return c_fs, c_st
+    except Exception:
+        return {}, {}
+
+_FSC, _STC      = _load_fsc()
+_WALL_THICKNESS = _STC.get("wall_thickness_mm", {}).get("core_structural",  350)
+_OVERRUN_HEIGHT = _FSC.get("staircase", {}).get("overrun_height_mm",       5000)
+_FL_CAR_SIZE    = _FSC.get("fire_lift", {}).get("car_size_mm",             2500)
+_FL_SHAFT_D     = _FL_CAR_SIZE + 2 * _WALL_THICKNESS
+_MAX_TRAVEL     = _FSC.get("staircase", {}).get("max_travel_distance_mm", 60000)
+_PERIMETER_C    = _FSC.get("perimeter_staircase", {})
+_EDGE_GAP_MM    = _PERIMETER_C.get("edge_inset_gap_mm",                     500)
+_SMOKE_CLEAR_D  = _PERIMETER_C.get("smoke_stop_lobby_clear_depth_mm",      2000)
 
 from . import lift_logic
 
@@ -106,7 +126,7 @@ def calculate_fire_safety_requirements(floor_dims_mm, core_center_mm, lift_core_
     EW layout  — pos is the entry point at the lift-core X boundary
                  (x = lift_xmin or lift_xmax, y = lift_core_cy).
     """
-    max_travel_dist = 60000
+    max_travel_dist = _MAX_TRAVEL
     final_sets = []
 
     # Compute passenger lift core bounds if not provided
@@ -284,14 +304,14 @@ def generate_fire_safety_manifest(safety_sets, levels_data, stair_spec,
             # Smoke-stop lobby: min 2000mm clear width (= sw_nat - 2t) already
             # satisfied by the staircase width.  Depth: 2000mm clear = 2400mm outer.
             # Target ~4-5 sqm net: 2000mm clear × (sw_nat - 2t) already large enough.
-            lobby_d_p  = 2 * _WALL_THICKNESS + 2000  # 2400mm outer = 2000mm clear depth
+            lobby_d_p  = 2 * _WALL_THICKNESS + _SMOKE_CLEAR_D  # outer = clear depth + 2 walls
             fl_box = None  # no fire lift
 
             # Inset the staircase from the building edge so the floor-slab void does
             # not coincide with the slab boundary (which causes "can't make extrusion"
             # errors in Revit).  500 mm is enough to clear the 200 mm wall thickness
             # plus Revit's minimum-face-width tolerance.
-            _EDGE_GAP = 500  # mm
+            _EDGE_GAP = _EDGE_GAP_MM
 
             if is_south_p:
                 # Staircase at south edge (inset), lobby north of it (facing floor plate)

@@ -1,0 +1,30 @@
+{
+  "_standard": "BS EN 81-20 / CIBSE Guide D",
+  "traffic_analysis": {
+    "speed_by_height_m": [
+      {"max_building_height_m": 30,   "speed_m_s": 1.6},
+      {"max_building_height_m": 60,   "speed_m_s": 2.5},
+      {"max_building_height_m": 120,  "speed_m_s": 5.0},
+      {"max_building_height_m": 9999, "speed_m_s": 7.0}
+    ],
+    "avg_passengers_per_trip": 10,
+    "door_time_s": 4.0,
+    "passenger_transfer_time_s": 1.1,
+    "peak_demand_fraction": 0.12,
+    "interval_period_s": 300,
+    "occupants_per_lift": 300,
+    "target_waiting_time_s": 25
+  },
+  "capacity_limits": {
+    "min_lifts": 2,
+    "max_lifts_per_block": 12,
+    "max_total_lifts": 24
+  },
+  "car_dimensions_mm": {
+    "min_width": 1100,
+    "min_depth": 1400,
+    "std_width": 2000,
+    "std_depth": 2000
+  },
+  "door_min_width_mm": 1000
+}

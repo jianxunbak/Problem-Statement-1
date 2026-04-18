@@ -1,0 +1,7 @@
+{
+  "_standard": "Approved Document A / General Practice",
+  "wall_thickness_mm": {
+    "core_structural": 350,
+    "standard": 200
+  }
+}

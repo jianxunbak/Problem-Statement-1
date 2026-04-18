@@ -14,6 +14,17 @@ def load_presets():
         pass
     return {}
 
+def load_compliance(name):
+    """Load compliance_{name}.json from same directory as building_presets.json."""
+    try:
+        path = os.path.join(os.path.dirname(__file__), "compliance_{}.json".format(name))
+        if os.path.exists(path):
+            with open(path, "r") as f:
+                return json.load(f)
+    except Exception:
+        pass
+    return {}
+
 _cached_log_path = None
 
 def get_log_path():

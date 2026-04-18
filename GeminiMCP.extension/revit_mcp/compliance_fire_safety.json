@@ -1,0 +1,35 @@
+{
+  "_standard": "SCDF Fire Code 2023",
+  "fire_lift": {
+    "min_car_width_mm": 1100,
+    "min_car_depth_mm": 2100,
+    "std_car_width_mm": 2000,
+    "std_car_depth_mm": 2000,
+    "car_size_mm": 2500,
+    "min_count": 2
+  },
+  "fire_lift_lobby": {
+    "min_area_mm2": 6000000,
+    "min_width_mm": 1200,
+    "min_depth_mm": 1400
+  },
+  "smoke_stop_lobby": {
+    "min_area_mm2": 4000000,
+    "min_clear_depth_mm": 2000
+  },
+  "staircase": {
+    "min_count": 2,
+    "max_travel_distance_mm": 60000,
+    "min_flight_width_mm": 1000,
+    "min_headroom_mm": 2400,
+    "overrun_height_mm": 5000,
+    "min_riser_mm": 100,
+    "max_riser_mm": 220,
+    "min_tread_mm": 250
+  },
+  "perimeter_staircase": {
+    "edge_inset_gap_mm": 500,
+    "smoke_stop_lobby_outer_depth_mm": 2400,
+    "smoke_stop_lobby_clear_depth_mm": 2000
+  }
+}

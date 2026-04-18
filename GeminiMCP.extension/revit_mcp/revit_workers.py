@@ -97,6 +97,35 @@ def _expand_shape_shorthand(shell):
     return shell
 
 
+def _get_interpolated_scale(scale_overrides, level_1based):
+    """Return the scale for a given 1-based level index, linearly interpolating
+    between sparse control-point keys (e.g. {"1":1.1,"10":0.7,"20":1.1}).
+    Levels outside the key range clamp to the nearest endpoint."""
+    if not scale_overrides:
+        return 1.0
+    # Normalise all keys to int
+    pts = {}
+    for k, v in scale_overrides.items():
+        try:
+            pts[int(k)] = float(v)
+        except (ValueError, TypeError):
+            pass
+    if not pts:
+        return 1.0
+    if level_1based in pts:
+        return pts[level_1based]
+    sorted_keys = sorted(pts.keys())
+    if level_1based <= sorted_keys[0]:
+        return pts[sorted_keys[0]]
+    if level_1based >= sorted_keys[-1]:
+        return pts[sorted_keys[-1]]
+    # Find bracketing keys and lerp
+    lo = max(k for k in sorted_keys if k < level_1based)
+    hi = min(k for k in sorted_keys if k > level_1based)
+    t = (level_1based - lo) / float(hi - lo)
+    return pts[lo] + t * (pts[hi] - pts[lo])
+
+
 def _scale_footprint(pts, scale):
     """Scale footprint_points about the origin [0,0] by a uniform scale factor.
     Arc mid-points (3rd element dicts with mid_x/mid_y) are scaled the same way."""
@@ -146,6 +175,11 @@ class RevitWorkers:
         # 1. State Scan
         registry = get_model_registry(doc)
         self._registry_cache = registry  # Cache so sub-methods can access for lift count detection
+
+        # Extract typology and compliance_params from manifest for downstream use
+        _typology = manifest.get("typology", "")
+        self._manifest_typology = _typology  # store so sub-methods can access
+        self._compliance_params = manifest.get("compliance_parameters", {})
         
         # Track counts of elements handled/created/deleted
         reused = [0]
@@ -347,7 +381,8 @@ class RevitWorkers:
             # --- PHASE 4: STRUCTURE ---
             # Synthesis Run (enforce 1/3 rule) before processing columns
             presets = load_presets()
-            preset = presets.get("commercial_office", {})
+            _t = getattr(self, "_manifest_typology", "")
+            preset = presets.get(_t) or presets.get("default") or presets.get("commercial_office", {})
             max_w = max(d[0] for d in floor_dims)
             max_l = max(d[1] for d in floor_dims)
             
@@ -497,6 +532,23 @@ class RevitWorkers:
             
             results["summary"] = {"reused": reused[0], "created": created[0], "deleted": deleted[0]}
             self.log("Fast-Track Summary: {}".format(results["summary"]))
+
+            # Persist shell parametric state so the next prompt can reference the
+            # current shape/footprint_scale_overrides without reverse-engineering geometry.
+            try:
+                import json as _json, os as _os
+                from revit_mcp.utils import get_log_path
+                _shell_to_save = {k: v for k, v in manifest.get("shell", {}).items()}
+                # footprint_points is auto-generated from 'shape' — skip to keep file compact
+                if _shell_to_save.get("shape") and "footprint_points" in _shell_to_save:
+                    del _shell_to_save["footprint_points"]
+                _shell_path = _os.path.join(_os.path.dirname(get_log_path()), "last_shell_state.json")
+                with open(_shell_path, "w") as _f:
+                    _json.dump(_shell_to_save, _f)
+                self.log("Shell state saved to last_shell_state.json")
+            except Exception as _se:
+                self.log("Shell state save warning: {}".format(_se))
+
             return results
             
         except Exception as e:
@@ -787,7 +839,7 @@ class RevitWorkers:
             scale_overrides = shell.get("footprint_scale_overrides", {})
             for k, lvl in enumerate(current_levels):
                 elev = elevations[k]
-                scale = float(scale_overrides.get(str(k+1), scale_overrides.get(k+1, 1.0)))
+                scale = _get_interpolated_scale(scale_overrides, k + 1)
                 level_pts = _scale_footprint(footprint_pts, scale) if scale != 1.0 else footprint_pts
                 n = len(level_pts)
                 for j in range(n):
@@ -963,10 +1015,10 @@ class RevitWorkers:
                 # Organic mode: parapets sit on the slab edge.
                 # Slab scale = max(this level's scale, level below's scale) -- shelter rule.
                 # Parapet is needed when the slab is larger than the wall above it.
-                scale_here  = float(scale_overrides.get(str(k+1), scale_overrides.get(k+1, 1.0)))
-                scale_below = float(scale_overrides.get(str(k),   scale_overrides.get(k,   1.0))) if k > 0 else 0.0
+                scale_here  = _get_interpolated_scale(scale_overrides, k + 1)
+                scale_below = _get_interpolated_scale(scale_overrides, k) if k > 0 else 0.0
                 slab_scale  = max(scale_here, scale_below)
-                scale_above = float(scale_overrides.get(str(k+2), scale_overrides.get(k+2, 1.0))) if k + 1 < len(current_levels) else 0.0
+                scale_above = _get_interpolated_scale(scale_overrides, k + 2) if k + 1 < len(current_levels) else 0.0
                 if slab_scale <= scale_above:
                     continue  # wall above covers this slab edge -- no exposed parapet needed
                 level_pts = _scale_footprint(footprint_pts, slab_scale) if slab_scale != 1.0 else footprint_pts
@@ -1083,8 +1135,8 @@ class RevitWorkers:
                 # so the slab always covers the larger of the two adjacent floor plates,
                 # matching the rectangular mode's expanded_slab_dims max(below, here) logic.
                 scale_overrides = shell.get("footprint_scale_overrides", {})
-                scale_here  = float(scale_overrides.get(str(k+1), scale_overrides.get(k+1, 1.0)))
-                scale_below = float(scale_overrides.get(str(k),   scale_overrides.get(k,   1.0))) if k > 0 else 0.0
+                scale_here  = _get_interpolated_scale(scale_overrides, k + 1)
+                scale_below = _get_interpolated_scale(scale_overrides, k) if k > 0 else 0.0
                 scale = max(scale_here, scale_below)
                 level_pts = _scale_footprint(footprint_pts, scale) if scale != 1.0 else footprint_pts
                 n = len(level_pts)
@@ -1226,7 +1278,8 @@ class RevitWorkers:
 
         # 1. Logic Setup: Span from shell -> existing model -> preset (use MAX for fewest columns)
         presets = load_presets()
-        preset = presets.get("commercial_office", {})
+        _t = getattr(self, "_manifest_typology", "")
+        preset = presets.get(_t) or presets.get("default") or presets.get("commercial_office", {})
         p_col_logic = preset.get("column_logic", {})
         preset_span = p_col_logic.get("span", [12000, 15000])
         if isinstance(preset_span, list) and len(preset_span) >= 2:
@@ -2118,9 +2171,9 @@ class RevitWorkers:
         from revit_mcp import staircase_logic, fire_safety_logic, lift_logic
         
         setup = manifest.get("project_setup", {})
-        typology = setup.get("typology", "commercial_office").lower().replace(" ", "_")
+        typology = (manifest.get("typology") or setup.get("typology", "")).lower().replace(" ", "_")
         presets = load_presets()
-        preset = presets.get(typology, presets.get("commercial_office", {}))
+        preset = presets.get(typology) or presets.get("default") or presets.get("commercial_office", {})
         
         # 1. Base Dimensions
         num_storeys = len(elevations) - 1
@@ -4524,10 +4577,7 @@ class RevitWorkers:
         if not positions:
             return {"status": "Error", "message": "No existing AI staircases found to regenerate."}
             
-        presets = load_presets()
-        preset = presets.get("commercial_office", {})
-        preset_fs = preset.get("core_logic", {}).get("fire_safety", {})
-        stair_spec = preset_fs.get("staircase_spec", {})
+        stair_spec = getattr(self, "_compliance_params", {})
         
         self.log("Regenerating {} stairs with typical_h_mm={}".format(len(positions), typical_h_mm))
         
