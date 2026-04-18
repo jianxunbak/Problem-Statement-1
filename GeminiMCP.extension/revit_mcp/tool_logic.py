@@ -186,6 +186,44 @@ def create_wall_ui(params):
     t.Commit()
     return {"success": True, "wall_id": str(new_wall.Id.Value)}
 
+def create_arc_wall_ui(params):
+    """Create a curved wall along an arc defined by start, end, and mid points (all in mm)."""
+    import Autodesk.Revit.DB as DB # type: ignore
+    uiapp = _get_revit_app()
+    doc = uiapp.ActiveUIDocument.Document
+
+    p1 = DB.XYZ(mm_to_ft(params['start_x']), mm_to_ft(params['start_y']), 0)
+    p2 = DB.XYZ(mm_to_ft(params['end_x']),   mm_to_ft(params['end_y']),   0)
+    pm = DB.XYZ(mm_to_ft(params['mid_x']),   mm_to_ft(params['mid_y']),   0)
+
+    try:
+        arc = DB.Arc.Create(p1, p2, pm)
+    except Exception as e:
+        return {"error": "Failed to create arc curve: {}. Ensure the three points are not collinear.".format(str(e))}
+
+    level = find_level(doc, params.get('level_name') or params.get('level_id'))
+
+    from revit_mcp.utils import nuclear_lockdown, setup_failure_handling, disallow_joins
+    nuclear_lockdown(doc)
+
+    t = DB.Transaction(doc, "MCP: Create Arc Wall")
+    t.Start()
+    setup_failure_handling(t, use_nuclear=True)
+    new_wall = DB.Wall.Create(doc, arc, level.Id, False)
+    state_manager.set_ai_metadata(new_wall, params.get('ai_id') or "AI_Wall_{}".format(new_wall.Id.Value))
+    disallow_joins(new_wall)
+
+    param = new_wall.get_Parameter(DB.BuiltInParameter.WALL_USER_HEIGHT_PARAM)
+    if param: param.Set(mm_to_ft(params.get('height_mm', 3000)))
+
+    thickness_mm = params.get('thickness_mm')
+    if thickness_mm:
+        wt = next((w for w in DB.FilteredElementCollector(doc).OfClass(DB.WallType) if str(int(thickness_mm)) in w.Name), None)
+        if wt: new_wall.WallType = wt
+
+    t.Commit()
+    return {"success": True, "wall_id": str(new_wall.Id.Value)}
+
 def get_element_details_ui(element_id_val):
     import Autodesk.Revit.DB as DB # type: ignore
     uiapp = _get_revit_app()
@@ -878,8 +916,16 @@ def create_polygon_floor_ui(params):
     points = params['points_mm']
     loop = DB.CurveLoop()
     for i in range(len(points)):
-        p1, p2 = points[i], points[(i+1)%len(points)]
-        loop.Append(DB.Line.CreateBound(DB.XYZ(mm_to_ft(p1['x']), mm_to_ft(p1['y']), 0), DB.XYZ(mm_to_ft(p2['x']), mm_to_ft(p2['y']), 0)))
+        seg_start = points[i]
+        seg_end   = points[(i + 1) % len(points)]
+        p1 = DB.XYZ(mm_to_ft(seg_start['x']), mm_to_ft(seg_start['y']), 0)
+        p2 = DB.XYZ(mm_to_ft(seg_end['x']),   mm_to_ft(seg_end['y']),   0)
+        if seg_start.get('mid'):
+            mid = seg_start['mid']
+            pm  = DB.XYZ(mm_to_ft(mid['x']), mm_to_ft(mid['y']), 0)
+            loop.Append(DB.Arc.Create(p1, p2, pm))
+        else:
+            loop.Append(DB.Line.CreateBound(p1, p2))
     loops = Generic.List[DB.CurveLoop](); loops.Add(loop)
     lvl = find_level(doc, params.get('level_name') or params.get('level_id'))
     ftype = DB.FilteredElementCollector(doc).OfClass(DB.FloorType).FirstElement()

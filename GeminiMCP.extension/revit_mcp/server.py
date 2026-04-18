@@ -40,6 +40,14 @@ def create_wall(length_mm: float = 5000, height_mm: float = 3000, start_x: float
     return json.dumps(mcp_event_handler.run_on_main_thread(logic.create_wall_ui, locals()))
 
 @mcp.tool()
+def create_arc_wall(start_x: float, start_y: float, end_x: float, end_y: float, mid_x: float, mid_y: float, height_mm: float = 3000, thickness_mm: float = 0, level_name: str = "") -> str:
+    """Create a curved wall along an arc. The arc passes through start (start_x, start_y),
+    end (end_x, end_y), and a mid-point on the arc (mid_x, mid_y) — all in millimetres.
+    The three points must not be collinear."""
+    from revit_mcp.bridge import mcp_event_handler
+    return json.dumps(mcp_event_handler.run_on_main_thread(logic.create_arc_wall_ui, locals()))
+
+@mcp.tool()
 def get_element_details(element_id: str) -> str:
     from revit_mcp.bridge import mcp_event_handler
     return json.dumps(mcp_event_handler.run_on_main_thread(logic.get_element_details_ui, element_id))

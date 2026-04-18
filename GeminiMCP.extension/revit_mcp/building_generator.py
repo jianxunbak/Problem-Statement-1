@@ -226,34 +226,41 @@ class BuildingSystem:
             
         return wall
 
+    @staticmethod
+    def _build_curve_loop(pts):
+        """Build a DB.CurveLoop from a points list.
+        Each point is either [x_mm, y_mm] (straight segment to next)
+        or [x_mm, y_mm, {"mid_x": mx, "mid_y": my}] (arc segment to next).
+        """
+        import Autodesk.Revit.DB as DB # type: ignore
+        loop = DB.CurveLoop()
+        n = len(pts)
+        for i in range(n):
+            raw1 = pts[i]
+            raw2 = pts[(i + 1) % n]
+            p1 = DB.XYZ(mm_to_ft(raw1[0]), mm_to_ft(raw1[1]), 0)
+            p2 = DB.XYZ(mm_to_ft(raw2[0]), mm_to_ft(raw2[1]), 0)
+            arc_data = raw1[2] if len(raw1) > 2 else None
+            if arc_data and isinstance(arc_data, dict):
+                pm = DB.XYZ(mm_to_ft(arc_data['mid_x']), mm_to_ft(arc_data['mid_y']), 0)
+                loop.Append(DB.Arc.Create(p1, p2, pm))
+            else:
+                loop.Append(DB.Line.CreateBound(p1, p2))
+        return loop
+
     def _sync_floor(self, data, level_map):
         import Autodesk.Revit.DB as DB # type: ignore
         import System.Collections.Generic as Generic # type: ignore
         ai_id = data['id']
-        points = data['points'] # [[x,y], [x,y], ...]
+        points = data['points'] # [[x,y], [x,y], ...] or [[x,y,{mid}], ...]
         level = level_map.get(data.get('level_id'))
-        
-        curve_loop = DB.CurveLoop()
-        for i in range(len(points)):
-            p1_raw = points[i]
-            p2_raw = points[(i+1)%len(points)]
-            p1 = DB.XYZ(mm_to_ft(p1_raw[0]), mm_to_ft(p1_raw[1]), 0)
-            p2 = DB.XYZ(mm_to_ft(p2_raw[0]), mm_to_ft(p2_raw[1]), 0)
-            curve_loop.Append(DB.Line.CreateBound(p1, p2))
-            
+
         loops = Generic.List[DB.CurveLoop]()
-        loops.Add(curve_loop) # Outer boundary
+        loops.Add(self._build_curve_loop(points)) # Outer boundary
 
         if 'voids' in data:
             for void_pts in data['voids']:
-                void_loop = DB.CurveLoop()
-                for i in range(len(void_pts)):
-                    p1_raw = void_pts[i]
-                    p2_raw = void_pts[(i+1)%len(void_pts)]
-                    p1 = DB.XYZ(mm_to_ft(p1_raw[0]), mm_to_ft(p1_raw[1]), 0)
-                    p2 = DB.XYZ(mm_to_ft(p2_raw[0]), mm_to_ft(p2_raw[1]), 0)
-                    void_loop.Append(DB.Line.CreateBound(p1, p2))
-                loops.Add(void_loop)
+                loops.Add(self._build_curve_loop(void_pts))
                 
         floor = None
         

@@ -34,6 +34,7 @@ Before generating ANY geometry for vertical circulation, you MUST mentally perfo
 3. **Spatial Contract**: No two "Managed Spaces" can have overlapping bounding boxes. Overlaps return a `CONFLICT`.
 4. **Occupancy Vision**: Always use the `vision_3d` -> `occupancy_map` from `get_document_info` to avoid existing geometry.
 5. **Minimum Non-Negotiable**: Once a space's minimum dimension/area is set (Step 1), it CANNOT be reduced in subsequent overrides. Only increases permitted.
+6. **Curved Geometry**: For an organic building footprint, add `"footprint_points"` inside `shell`, OR use `"shape": "circle"` / `"shape": "ellipse"` for engine-computed shapes. ALWAYS use `"shape": "circle"` for any round/circular building request. For per-level cantilevers/recesses, add `"footprint_scale_overrides": {"5": 1.15, "10": 0.9}`. See the Curved/Organic Shapes rules in the dispatcher section for full details.
 """
 
 DISPATCHER_PROMPT = SPATIAL_BRAIN_SYSTEM_INSTRUCTION + """
@@ -64,6 +65,22 @@ Core Logic:
     - **Efficiency**: Maintain a target depth of **10-12m minimum** from the facade to the core wall to ensure daylight access and premium office space.
     - **Columns**: Offset perimeter columns by **1000mm** from the floor edge for architectural recessed effects. No columns inside the core (lifts + staircases) footprint.
 - **Granular Control**: For precise additions or edits, use the root keys `walls`, `floors`, or `columns` for individual elements. Use stable IDs like `AI_Wall_Custom_1` to ensure they persist across edits.
+- **Curved / Organic Shapes**: Add `"footprint_points"` inside the `shell` object. The engine applies it automatically to ALL floor slabs and ALL exterior walls on every level -- you define the shape ONCE, not per level.
+  - Format: `[[x, y], ...]` (mm, centred on [0,0], counter-clockwise winding). For a curved segment, add a `mid` dict to its start vertex: `[x, y, {"mid_x": mx, "mid_y": my}]` where the mid point lies ON the arc between that vertex and the next. Segments without `mid` are straight.
+  - Still include `shell.width` and `shell.length` (bounding box of the footprint) for the structural column grid.
+  - Example -- rounded facade with a curved south wall and three straight sides:
+    `"footprint_points": [[-20000,-20000,{"mid_x":0,"mid_y":-28000}],[20000,-20000],[20000,20000],[-20000,20000]]`
+  - The core (lifts, stairs, lobbies) is auto-generated. Do NOT add perimeter walls/floors in `walls[]`/`floors[]` for the exterior when using `footprint_points`.
+- **Shape Shorthands**: Instead of computing arc points manually, set `"shape"` inside `shell` and the engine generates `footprint_points` automatically:
+  - `"shape": "circle"` — perfect circle, radius = max(width, length) / 2
+  - `"shape": "ellipse"` — ellipse, semi-axes = width/2 and length/2
+  - **ALWAYS use `"shape": "circle"` when the user asks for a circular, round, or cylindrical building.** Do NOT try to manually write `footprint_points` for a circle.
+  - `footprint_scale_overrides` still works with shape shorthands for per-level cantilevers/recesses.
+- **Curved Cantilevers / Recesses (per-level organic variation)**: Use `"footprint_scale_overrides"` inside `shell` to scale the footprint polygon per level. Values >1.0 expand the slab outward (cantilever), values <1.0 pull it inward (recess). The engine scales all polygon vertices AND arc mid-points about [0,0] -- the shape stays organic/curved, just bigger or smaller. Parapets are drawn automatically only at cantilever edges (where this level's scale > next level's scale).
+  - Format: `{"footprint_scale_overrides": {"1": 1.0, "5": 1.15, "10": 0.9, "15": 1.05}}` (level number as string key, float scale as value).
+  - Levels without an explicit entry inherit scale 1.0.
+  - Example for a tower that swells then tapers: `"footprint_scale_overrides": {"1":0.85, "5":1.0, "10":1.2, "15":1.05, "20":0.9}`.
+  - **IMPORTANT**: When the user asks for "randomised", "organic", "cantilevers", or "interesting" floor plates on a curved building, use `footprint_scale_overrides` -- NOT `floor_overrides` with `width`/`length`, which only works for rectangular buildings.
 
 
 JSON TEMPLATE:
@@ -73,9 +90,12 @@ JSON TEMPLATE:
       "level_height": 3500, 
       "height_overrides": { "1": 5000, "10": "random" } 
   },
-  "shell": { 
+  "shell": {
       "width": 30000, "length": 50000, "column_spacing": 10000, "parapet_height": 1100, "cantilever_depth": 0,
-      "floor_overrides": { "4": { "width": 40000, "cantilever_depth": 2000 } }
+      "floor_overrides": { "4": { "width": 40000, "cantilever_depth": 2000 } },
+      "shape": "circle",
+      "footprint_points": [[-15000,-20000,{"mid_x":0,"mid_y":-28000}],[15000,-20000],[15000,20000],[-15000,20000]],
+      "footprint_scale_overrides": { "1": 0.85, "5": 1.0, "10": 1.15, "15": 1.0 }
   },
   "lifts": {
       "count": "random",
