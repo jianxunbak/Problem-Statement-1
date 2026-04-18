@@ -139,28 +139,23 @@ class RevitWorkers:
             floor_dims, shell = self._process_shell_dimensions(manifest, current_levels, registry)
 
             # --- PHASE 2: VERTICAL CIRCULATION (Unified Core: Lifts + Staircases) ---
-            t = DB.Transaction(doc, "AI Build: Vertical Circulation")
-            t.Start()
-            setup_failure_handling(t, use_nuclear=True)
+            # Pre-calculate core layout BEFORE opening a transaction — this is pure Python
+            # (no Revit document writes). Keeping heavy calc inside a transaction was wasting
+            # lock time and contributing to the overall build latency.
             import importlib
             importlib.reload(staircase_logic)
             importlib.reload(fire_safety_logic)
-            self.log("Step 3a: Expanding Unified Vertical Circulation...")
+            self.log("Step 3a: Pre-calculating Unified Vertical Circulation layout...")
             if self.tracker: self.tracker.report("Calculating unified core layout (Lifts + Fire Safety)...")
-            
-            c0, r0 = created[0], reused[0]
-            
-            # --- CONSOLIDATION: Skip re-expansion if already planned ---
+
             core_bounds_ft = None
             if "core_bounds" in manifest and manifest["core_bounds"]:
                 self.log("Consolidation: Using pre-planned core bounds from manifest.")
                 from revit_mcp.utils import mm_to_ft
                 cb_list = manifest["core_bounds"]
-                # Create a single unified bounding box in feet for the worker's logic
                 bx1 = min(cb[0] for cb in cb_list); by1 = min(cb[1] for cb in cb_list)
                 bx2 = max(cb[2] for cb in cb_list); by2 = max(cb[3] for cb in cb_list)
                 core_bounds_ft = (mm_to_ft(bx1), mm_to_ft(by1), mm_to_ft(bx2), mm_to_ft(by2))
-                # Also extract and convert voids
                 voids_mm = manifest.get("voids", [])
                 u_voids_ft = []
                 for (vx1, vy1, vx2, vy2) in voids_mm:
@@ -168,17 +163,20 @@ class RevitWorkers:
                 self._stair_voids = u_voids_ft
                 core_bounds = core_bounds_ft
             else:
-                self._stair_voids = [] # Clear stale voids
+                self._stair_voids = []
                 core_bounds = self._expand_unified_vertical_circulation(manifest, current_levels, elevations, floor_dims, affected_elements, results)
-            
-            # Catch Spatial Conflicts
+
+            # Catch Spatial Conflicts from the pre-calculation
             if isinstance(core_bounds, dict) and core_bounds.get("status") == "CONFLICT":
-                try: t.RollBack(); t.Dispose()
-                except: pass
                 try: tg.RollBack()
                 except: pass
                 return core_bounds
-            
+
+            # Now open the transaction only for the actual enforce-disjoint write
+            t = DB.Transaction(doc, "AI Build: Vertical Circulation")
+            t.Start()
+            setup_failure_handling(t, use_nuclear=True)
+            c0, r0 = created[0], reused[0]
             core_new, core_reused = created[0] - c0, reused[0] - r0
             self._enforce_disjoint(affected_elements)
             t.Commit()
@@ -197,31 +195,33 @@ class RevitWorkers:
                 )
 
             # --- PHASE 2.9: AGGRESSIVE PRE-CLEANUP ---
-            # Delete ALL old AI components (except protected cores handled in 2.5)
-            # This prevents "identical instances" and "overlapping floors" during creation.
+            # Collect ALL old AI element IDs first, then bulk-delete in one call.
+            # The previous per-element doc.Delete() in a loop was slow; bulk deletion
+            # via a single ICollection[ElementId] call is significantly faster.
             t_clean = DB.Transaction(doc, "AI Build: Pre-Cleanup")
             t_clean.Start()
             setup_failure_handling(t_clean, use_nuclear=True)
-            pre_del_count = 0
-            
-            # Delete ALL old AI elements — no exceptions.
-            # Attempting to "update" old walls in place (moving their curve) is unreliable
-            # because Revit silently rejects the move when the wall has stale top-level
-            # constraints, join constraints, or room-boundary pins from the old build.
-            # Deleting everything and recreating fresh is both simpler and more robust.
+
+            from System.Collections.Generic import List as CsList  # type: ignore
+            ids_to_delete = CsList[DB.ElementId]()
             cats = [DB.BuiltInCategory.OST_Walls, DB.BuiltInCategory.OST_Floors, DB.BuiltInCategory.OST_Columns, DB.BuiltInCategory.OST_StructuralColumns]
             for c in cats:
                 for el in DB.FilteredElementCollector(doc).OfCategory(c).WhereElementIsNotElementType().ToElements():
                     try:
                         p = el.get_Parameter(DB.BuiltInParameter.ALL_MODEL_INSTANCE_COMMENTS)
                         if p and p.HasValue and p.AsString().startswith("AI_"):
-                            doc.Delete(el.Id)
-                            pre_del_count += 1
-                    except: pass
+                            ids_to_delete.Add(el.Id)
+                    except:
+                        pass
+
+            pre_del_count = ids_to_delete.Count
+            if pre_del_count > 0:
+                doc.Delete(ids_to_delete)
+
             t_clean.Commit()
             t_clean.Dispose()
             if pre_del_count > 0:
-                self.log("Atomic Pre-Cleanup: purged {} legacy AI elements for clean build.".format(pre_del_count))
+                self.log("Atomic Pre-Cleanup: bulk-deleted {} legacy AI elements for clean build.".format(pre_del_count))
 
             # --- PHASE 3: WALLS & FLOORS ---
             t = DB.Transaction(doc, "AI Build: Shell")
@@ -1561,10 +1561,16 @@ class RevitWorkers:
         _occ_density = safe_num(lifts_config.get("occupancy_density", 0.1), 0.1)
         _total_occ = max(100, (_fw * _fl_dim / 1e6) * _occ_density * num_storeys)
         _auto_lifts = lift_logic.calculate_lift_requirements(num_storeys, typical_h_mm, _total_occ)
+        # AI may return count as a dict e.g. {"passenger": 4, "fire_fighting": 2}
+        if isinstance(num_lifts, dict):
+            num_lifts = num_lifts.get("passenger", num_lifts.get("total", num_lifts.get("count", None)))
         if num_lifts is None or num_lifts == "random":
             num_lifts = _auto_lifts
         else:
-            num_lifts = min(int(num_lifts), _auto_lifts)
+            try:
+                num_lifts = min(int(num_lifts), _auto_lifts)
+            except (TypeError, ValueError):
+                num_lifts = _auto_lifts
         num_lifts = int(num_lifts)
         self._last_num_lifts = num_lifts # Cache for later
         
