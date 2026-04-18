@@ -23,9 +23,116 @@ def get_doc_info_ui():
     if not uiapp or not uiapp.ActiveUIDocument:
         return {"error": "No active document."}
     doc = uiapp.ActiveUIDocument.Document
+    
+    import Autodesk.Revit.DB as DB # type: ignore
+    from revit_mcp.building_generator import get_model_registry # type: ignore
+    
+    registry = get_model_registry(doc)
+    
+    # 1. Collect Floor boundaries
+    floors = DB.FilteredElementCollector(doc).OfClass(DB.Floor).WhereElementIsNotElementType()
+    floor_boundaries = []
+    for f in floors:
+        bb = f.get_BoundingBox(None)
+        if bb:
+            floor_boundaries.append({
+                "id": str(f.Id.Value),
+                "level": doc.GetElement(f.LevelId).Name if f.LevelId != DB.ElementId.InvalidElementId else "Unknown",
+                "bounds": [ft_to_mm(bb.Min.X), ft_to_mm(bb.Min.Y), ft_to_mm(bb.Max.X), ft_to_mm(bb.Max.Y)]
+            })
+            
+    # 2. Collect Core locations (Lifts and Stairs)
+    core_bounds = []
+    for ai_id, eid in registry.items():
+        if "Lift" in ai_id or "Stair" in ai_id:
+            el = doc.GetElement(eid)
+            if el:
+                bb = el.get_BoundingBox(None)
+                if bb:
+                    core_bounds.append([ft_to_mm(bb.Min.X), ft_to_mm(bb.Min.Y), ft_to_mm(bb.Max.X), ft_to_mm(bb.Max.Y)])
+                    
+    # Simplify core bounds to a single bounding area if possible, or keep list
+    unified_core = None
+    if core_bounds:
+        xmin = min(b[0] for b in core_bounds)
+        ymin = min(b[1] for b in core_bounds)
+        xmax = max(b[2] for b in core_bounds)
+        ymax = max(b[3] for b in core_bounds)
+        unified_core = [xmin, ymin, xmax, ymax]
+
+    # 3. Detect "Leftover" or Unmanaged Objects (Flying all over)
+    unmanaged_obstructions = []
+    if floor_boundaries:
+        import System.Collections.Generic as Generic # type: ignore
+        min_x = min(f["bounds"][0] for f in floor_boundaries) - 5000
+        min_y = min(f["bounds"][1] for f in floor_boundaries) - 5000
+        max_x = max(f["bounds"][2] for f in floor_boundaries) + 5000
+        max_y = max(f["bounds"][3] for f in floor_boundaries) + 5000
+        
+        scan_cats = [
+            DB.BuiltInCategory.OST_Walls, DB.BuiltInCategory.OST_Floors,
+            DB.BuiltInCategory.OST_StructuralColumns, DB.BuiltInCategory.OST_Columns,
+            DB.BuiltInCategory.OST_Windows, DB.BuiltInCategory.OST_Doors,
+            DB.BuiltInCategory.OST_GenericModel
+        ]
+        
+        cat_list = Generic.List[DB.BuiltInCategory]()
+        for c in scan_cats: cat_list.Add(c)
+        
+        provider = DB.ElementMulticategoryFilter(cat_list)
+        others = DB.FilteredElementCollector(doc).WherePasses(provider).WhereElementIsNotElementType().ToElements()
+        
+        for el in others:
+            if str(el.Id.Value) in [str(v) for v in registry.values()]: continue
+            p = el.get_Parameter(DB.BuiltInParameter.ALL_MODEL_INSTANCE_COMMENTS)
+            if p and p.HasValue and p.AsString().startswith("AI_"): continue
+            
+            bb = el.get_BoundingBox(None)
+            if bb:
+                ex1, ey1 = ft_to_mm(bb.Min.X), ft_to_mm(bb.Min.Y)
+                ex2, ey2 = ft_to_mm(bb.Max.X), ft_to_mm(bb.Max.Y)
+                if not (ex2 < min_x or ex1 > max_x or ey2 < min_y or ey1 > max_y):
+                    unmanaged_obstructions.append({
+                        "id": str(el.Id.Value),
+                        "category": el.Category.Name,
+                        "bounds": [ex1, ey1, ex2, ey2]
+                    })
+
+    # 4. Generate 3D Occupancy Map
+    occupancy_map = []
+    
+    # Process Cores (Lifts/Stairs)
+    for ai_id, eid in registry.items():
+        if "Lift" in ai_id or "Stair" in ai_id or "SafetySet" in ai_id:
+            el = doc.GetElement(eid)
+            if el:
+                bb = el.get_BoundingBox(None)
+                if bb:
+                    occupancy_map.append({
+                        "id": ai_id,
+                        "type": "CORE",
+                        "bbox": [ft_to_mm(bb.Min.X), ft_to_mm(bb.Min.Y), ft_to_mm(bb.Min.Z),
+                                 ft_to_mm(bb.Max.X), ft_to_mm(bb.Max.Y), ft_to_mm(bb.Max.Z)]
+                    })
+
+    # Process unmanaged obstructions in 3D
+    for obs in unmanaged_obstructions:
+        occupancy_map.append({
+            "id": obs["id"],
+            "type": "OBSTRUCTION",
+            "category": obs["category"],
+            "bbox": [obs["bounds"][0], obs["bounds"][1], 0, obs["bounds"][2], obs["bounds"][3], 4000] # Default height if unknown
+        })
+
     return {
         "title": doc.Title,
-        "path": doc.PathName or "Unsaved Document"
+        "path": doc.PathName or "Unsaved Document",
+        "vision_3d": {
+            "occupancy_map": occupancy_map[:30], # Top 30 for token efficiency
+            "floor_boundaries": floor_boundaries,
+            "overall_core_bounds": unified_core
+        },
+        "system_status": "Spatial Clearinghouse ACTIVE. Global Geometric Constraints enforced."
     }
 
 def create_wall_ui(params):
@@ -76,6 +183,44 @@ def create_wall_ui(params):
         wt = next((w for w in DB.FilteredElementCollector(doc).OfClass(DB.WallType) if str(int(thickness_mm)) in w.Name), None)
         if wt: new_wall.WallType = wt
                 
+    t.Commit()
+    return {"success": True, "wall_id": str(new_wall.Id.Value)}
+
+def create_arc_wall_ui(params):
+    """Create a curved wall along an arc defined by start, end, and mid points (all in mm)."""
+    import Autodesk.Revit.DB as DB # type: ignore
+    uiapp = _get_revit_app()
+    doc = uiapp.ActiveUIDocument.Document
+
+    p1 = DB.XYZ(mm_to_ft(params['start_x']), mm_to_ft(params['start_y']), 0)
+    p2 = DB.XYZ(mm_to_ft(params['end_x']),   mm_to_ft(params['end_y']),   0)
+    pm = DB.XYZ(mm_to_ft(params['mid_x']),   mm_to_ft(params['mid_y']),   0)
+
+    try:
+        arc = DB.Arc.Create(p1, p2, pm)
+    except Exception as e:
+        return {"error": "Failed to create arc curve: {}. Ensure the three points are not collinear.".format(str(e))}
+
+    level = find_level(doc, params.get('level_name') or params.get('level_id'))
+
+    from revit_mcp.utils import nuclear_lockdown, setup_failure_handling, disallow_joins
+    nuclear_lockdown(doc)
+
+    t = DB.Transaction(doc, "MCP: Create Arc Wall")
+    t.Start()
+    setup_failure_handling(t, use_nuclear=True)
+    new_wall = DB.Wall.Create(doc, arc, level.Id, False)
+    state_manager.set_ai_metadata(new_wall, params.get('ai_id') or "AI_Wall_{}".format(new_wall.Id.Value))
+    disallow_joins(new_wall)
+
+    param = new_wall.get_Parameter(DB.BuiltInParameter.WALL_USER_HEIGHT_PARAM)
+    if param: param.Set(mm_to_ft(params.get('height_mm', 3000)))
+
+    thickness_mm = params.get('thickness_mm')
+    if thickness_mm:
+        wt = next((w for w in DB.FilteredElementCollector(doc).OfClass(DB.WallType) if str(int(thickness_mm)) in w.Name), None)
+        if wt: new_wall.WallType = wt
+
     t.Commit()
     return {"success": True, "wall_id": str(new_wall.Id.Value)}
 
@@ -771,8 +916,16 @@ def create_polygon_floor_ui(params):
     points = params['points_mm']
     loop = DB.CurveLoop()
     for i in range(len(points)):
-        p1, p2 = points[i], points[(i+1)%len(points)]
-        loop.Append(DB.Line.CreateBound(DB.XYZ(mm_to_ft(p1['x']), mm_to_ft(p1['y']), 0), DB.XYZ(mm_to_ft(p2['x']), mm_to_ft(p2['y']), 0)))
+        seg_start = points[i]
+        seg_end   = points[(i + 1) % len(points)]
+        p1 = DB.XYZ(mm_to_ft(seg_start['x']), mm_to_ft(seg_start['y']), 0)
+        p2 = DB.XYZ(mm_to_ft(seg_end['x']),   mm_to_ft(seg_end['y']),   0)
+        if seg_start.get('mid'):
+            mid = seg_start['mid']
+            pm  = DB.XYZ(mm_to_ft(mid['x']), mm_to_ft(mid['y']), 0)
+            loop.Append(DB.Arc.Create(p1, p2, pm))
+        else:
+            loop.Append(DB.Line.CreateBound(p1, p2))
     loops = Generic.List[DB.CurveLoop](); loops.Add(loop)
     lvl = find_level(doc, params.get('level_name') or params.get('level_id'))
     ftype = DB.FilteredElementCollector(doc).OfClass(DB.FloorType).FirstElement()

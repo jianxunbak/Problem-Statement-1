@@ -29,10 +29,10 @@ class GeminiClient:
             try: self.session.close()
             except: pass
         self.session = httpx.Client(
-            timeout=120.0,
+            timeout=httpx.Timeout(connect=10.0, read=180.0, write=15.0, pool=5.0),
             headers={"User-Agent": "Revit-MCP-Httpx/3.0"},
             follow_redirects=True,
-            verify=False 
+            verify=False
         )
 
     def _test_connectivity(self):
@@ -124,61 +124,92 @@ class GeminiClient:
             self.log(err)
             return err
 
-    def generate_content(self, prompt):
-        """Pure text generation for internal agent manifest generation"""
-        self.log("generate_content() entered with model: " + str(self.model))
+    def generate_content(self, prompt, thinking_budget=2048):
+        """Pure text generation for internal agent manifest generation.
+
+        thinking_budget: number of thinking tokens allowed (0=off, 1024=fast, 2048=default).
+        Caller should pass 1024 for simple edits, 2048 for full builds.
+        """
+        self.log("generate_content() entered with model: {} | thinking_budget: {}".format(self.model, thinking_budget))
         url = "https://generativelanguage.googleapis.com/v1beta/models/{}:generateContent?key={}".format(self.model, self.api_key)
         data = {
             "contents": [{"role": "user", "parts": [{"text": prompt}]}],
             "generationConfig": {
                 "temperature": 0.1,
-                "responseMimeType": "application/json",
+                "maxOutputTokens": 32768,
+                "thinkingConfig": {"thinkingBudget": thinking_budget},
             }
         }
-        
+
         try:
             response_json = self._make_request(url, data)
             if not response_json or "error" in response_json:
                 err = response_json.get("error", "Unknown API Error") if response_json else "Empty Response"
                 self.log("Error in generate_content: " + str(err))
                 return "Error: " + str(err)
-            
-            result = response_json['candidates'][0]['content']['parts'][0]['text']
-            self.log("generate_content successful. Result length: {}".format(len(result)))
+
+            # Gemini 2.5 thinking models can return multiple parts:
+            #   [{"thought": True, "text": "<thinking tokens>"},
+            #    {"text": "<architectural_intent>...</architectural_intent>"},
+            #    {"text": "```json\n{...}\n```"}]
+            # We must skip thought parts and JOIN all remaining text parts so both
+            # the narrative and the JSON block are present in the result.
+            parts = response_json['candidates'][0]['content']['parts']
+            text_parts = [p['text'] for p in parts if 'text' in p and not p.get('thought', False)]
+            if not text_parts:
+                self.log("generate_content: no non-thought text parts in response")
+                return "Error: No text in response"
+            result = '\n'.join(text_parts)
+            self.log("generate_content successful. Parts: {} | Result length: {}".format(len(text_parts), len(result)))
             return result
         except Exception as e:
             self.log("generate_content CRASH: " + str(e))
             return "Error: " + str(e)
 
     def _make_request(self, url, data, max_retries=3):
-        """Optimized httpx request with connection pooling and auto-recovery."""
+        """Optimized httpx request with connection pooling and smart retry/recovery.
+
+        Retry policy:
+          - HTTP error (4xx/5xx): retry with exponential backoff, no session reset
+          - Timeout: retry with backoff, no session reset (connection pool is fine)
+          - Network error (DNS, refused, reset): reset session then retry
+        """
         safe_url = url.split("key=")[0] + "key=********" if "key=" in url else url
         self.log("Requesting (httpx): " + safe_url)
-        
+
         last_err = None
         for attempt in range(max_retries):
             try:
                 start_time = time.time()
                 resp = self.session.post(url, json=data)
                 duration = time.time() - start_time
-                
+
                 self.log("Network: Response {} | Time: {:.2f}s | Size: {} bytes".format(
                     resp.status_code, duration, len(resp.content)))
-                
+
                 if resp.status_code == 200:
                     return resp.json()
-                
+
                 last_err = "HTTP {}".format(resp.status_code)
                 self.log("API Error ({}/{}): {}".format(attempt + 1, max_retries, resp.text[:200]))
-                if attempt < max_retries - 1: time.sleep(1)
-                
+                if attempt < max_retries - 1:
+                    time.sleep(2 ** attempt)  # 1s, 2s
+
+            except httpx.TimeoutException as e:
+                last_err = "Timeout: {}".format(str(e))
+                self.log("Network TIMEOUT (Attempt {}/{}): {}".format(attempt + 1, max_retries, last_err))
+                # Timeout does NOT corrupt the session — keep pool, just back off
+                if attempt < max_retries - 1:
+                    time.sleep(2 ** attempt)
+
             except Exception as e:
                 last_err = str(e)
                 self.log("Network ERROR (Attempt {}/{}): {}".format(attempt + 1, max_retries, last_err))
-                # CRITICAL FIX: On network error, recreate the session to clear the pool
+                # True network failure — recreate session to clear stale pool
                 self._init_session()
-                if attempt < max_retries - 1: time.sleep(1)
-        
+                if attempt < max_retries - 1:
+                    time.sleep(2 ** attempt)
+
         return {"error": last_err}
 
 client = GeminiClient()

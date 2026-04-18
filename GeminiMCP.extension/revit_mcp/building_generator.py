@@ -13,6 +13,8 @@ from revit_mcp.state_manager import state_manager
 from revit_mcp.utils import safe_num, mm_to_ft, load_presets
 from . import lift_logic
 from . import staircase_logic
+from . import fire_safety_logic
+from .spatial_registry import SpatialRegistry
 
 def get_model_registry(doc, zone_bbox=None):
     """
@@ -60,10 +62,10 @@ def get_model_registry(doc, zone_bbox=None):
                 registry[val] = el.Id
     
     return registry
-
 class BuildingSystem:
     def __init__(self, doc):
         self.doc = doc
+        self.spatial_registry = SpatialRegistry()
 
     def sync_manifest(self, manifest):
         """State-aware manifest execution with high-speed transaction batching."""
@@ -224,34 +226,41 @@ class BuildingSystem:
             
         return wall
 
+    @staticmethod
+    def _build_curve_loop(pts):
+        """Build a DB.CurveLoop from a points list.
+        Each point is either [x_mm, y_mm] (straight segment to next)
+        or [x_mm, y_mm, {"mid_x": mx, "mid_y": my}] (arc segment to next).
+        """
+        import Autodesk.Revit.DB as DB # type: ignore
+        loop = DB.CurveLoop()
+        n = len(pts)
+        for i in range(n):
+            raw1 = pts[i]
+            raw2 = pts[(i + 1) % n]
+            p1 = DB.XYZ(mm_to_ft(raw1[0]), mm_to_ft(raw1[1]), 0)
+            p2 = DB.XYZ(mm_to_ft(raw2[0]), mm_to_ft(raw2[1]), 0)
+            arc_data = raw1[2] if len(raw1) > 2 else None
+            if arc_data and isinstance(arc_data, dict):
+                pm = DB.XYZ(mm_to_ft(arc_data['mid_x']), mm_to_ft(arc_data['mid_y']), 0)
+                loop.Append(DB.Arc.Create(p1, p2, pm))
+            else:
+                loop.Append(DB.Line.CreateBound(p1, p2))
+        return loop
+
     def _sync_floor(self, data, level_map):
         import Autodesk.Revit.DB as DB # type: ignore
         import System.Collections.Generic as Generic # type: ignore
         ai_id = data['id']
-        points = data['points'] # [[x,y], [x,y], ...]
+        points = data['points'] # [[x,y], [x,y], ...] or [[x,y,{mid}], ...]
         level = level_map.get(data.get('level_id'))
-        
-        curve_loop = DB.CurveLoop()
-        for i in range(len(points)):
-            p1_raw = points[i]
-            p2_raw = points[(i+1)%len(points)]
-            p1 = DB.XYZ(mm_to_ft(p1_raw[0]), mm_to_ft(p1_raw[1]), 0)
-            p2 = DB.XYZ(mm_to_ft(p2_raw[0]), mm_to_ft(p2_raw[1]), 0)
-            curve_loop.Append(DB.Line.CreateBound(p1, p2))
-            
+
         loops = Generic.List[DB.CurveLoop]()
-        loops.Add(curve_loop) # Outer boundary
+        loops.Add(self._build_curve_loop(points)) # Outer boundary
 
         if 'voids' in data:
             for void_pts in data['voids']:
-                void_loop = DB.CurveLoop()
-                for i in range(len(void_pts)):
-                    p1_raw = void_pts[i]
-                    p2_raw = void_pts[(i+1)%len(void_pts)]
-                    p1 = DB.XYZ(mm_to_ft(p1_raw[0]), mm_to_ft(p1_raw[1]), 0)
-                    p2 = DB.XYZ(mm_to_ft(p2_raw[0]), mm_to_ft(p2_raw[1]), 0)
-                    void_loop.Append(DB.Line.CreateBound(p1, p2))
-                loops.Add(void_loop)
+                loops.Add(self._build_curve_loop(void_pts))
                 
         floor = None
         
@@ -306,8 +315,23 @@ class BuildingSystem:
             
     def _synthesize_structural_grid(self, target_dim, span_range, min_offset):
         """
-        Synthesizes an optimal structural grid based on 1/3 cantilever rules.
-        Returns: (final_dim, final_span)
+        Synthesises an optimal structural grid span for the given building dimension.
+
+        The 1/3 cantilever rule governs the PERIMETER overhang (facade → first
+        column = min_offset), which is always satisfied for typical values.
+        It does NOT govern the inner zone between the last bay column and the
+        building centre — in a central-core building that zone is the core, and
+        no structural columns are placed there.
+
+        Strategy (in priority order):
+          1. Find n such that a span in [min_s, max_s] produces an edge overhang
+             (half_w − n·span) between min_offset and span/2 (generous inner rule).
+          2. Use the largest span in range that fits n+1 intervals.
+          3. Fall back to the DNA midpoint span — the actual column placement code
+             (get_grid_offsets_mm) divides each region into equal sub-spans and
+             always produces a valid grid regardless.
+
+        Returns: (final_dim, final_span)  — never returns CONFLICT.
         """
         if isinstance(span_range, (int, float)):
             min_s, max_s = float(span_range), float(span_range)
@@ -315,45 +339,32 @@ class BuildingSystem:
             min_s, max_s = float(span_range[0]), float(span_range[1])
         else:
             min_s, max_s = 10000.0, 12000.0
-            
-        target_half = target_dim / 2.0
-        n = int((target_half - min_offset) // min_s)
-        if n < 0: n = 0
-            
-        def check_rules(half_w, span, n_cols):
-            if n_cols == 0: return True
-            cant = half_w - (n_cols * span)
-            if cant < min_offset - 1.0: return False
-            if cant > (span / 3.0) + 1.0: return False
-            return True
 
-        if check_rules(target_half, min_s, n):
-            return target_dim, min_s
-            
-        # Priority 1: Add column and check range
-        n_plus = n + 1
-        s_min_c = target_half / (n_plus + 1.0/3.0)
-        s_max_o = (target_half - min_offset) / n_plus
-        low, high = max(min_s, s_min_c), min(max_s, s_max_o)
-        if low <= high + 1.0: return target_dim, high
-                
-        # Priority 2: Extend span
-        if n > 0:
-            s_min_c = target_half / (n + 1.0/3.0)
-            s_max_o = (target_half - min_offset) / n
-            low, high = max(min_s, s_min_c), min(max_s, s_max_o)
-            if low <= high + 1.0: return target_dim, high
-                
-        # Priority 3: Reduce Floor
-        if n == 0: return (min_offset + 500) * 2.0, min_s
-        new_half = n * max_s + (max_s / 3.0)
-        if new_half > target_half: new_half = n * min_s + (min_s / 3.0)
-        return new_half * 2.0, max_s if new_half <= target_half else min_s
+        mid_s = (min_s + max_s) / 2.0
+        target_half = target_dim / 2.0
+
+        # Try increasing n (number of full spans from centre outward) and find a
+        # span that keeps the perimeter overhang within [min_offset, span/2].
+        for n in range(1, 20):
+            # Span range that satisfies: min_offset ≤ half_w − n·s ≤ s/2
+            # → half_w / (n + 0.5) ≤ s ≤ (half_w − min_offset) / n
+            s_lo = target_half / (n + 0.5)
+            s_hi = (target_half - min_offset) / n if n > 0 else max_s
+            lo = max(min_s, s_lo)
+            hi = min(max_s, s_hi)
+            if lo <= hi + 1.0:
+                return target_dim, hi
+
+        # Fallback: DNA midpoint — get_grid_offsets_mm handles the rest.
+        return target_dim, mid_s
 
     def _expand_high_level_manifest(self, manifest):
         """Converts Architectural Intent (Storeys/Shell) into concrete element lists."""
         setup = manifest.get("project_setup", {})
         shell = manifest.get("shell", {})
+        
+        # --- RESET SPATIAL REGISTRY ---
+        self.spatial_registry.clear()
         
         # --- PRESET LOADING ---
         presets = load_presets()
@@ -391,8 +402,15 @@ class BuildingSystem:
             width, length = side, side
             
         # Synthesis Run (enforce 1/3 rule)
-        width, synth_span_w = self._synthesize_structural_grid(width, dna_span, dna_offset)
-        length, synth_span_l = self._synthesize_structural_grid(length, dna_span, dna_offset)
+        res_w = self._synthesize_structural_grid(width, dna_span, dna_offset)
+        if isinstance(res_w, dict) and res_w.get("status") == "CONFLICT":
+            return res_w
+        width, synth_span_w = res_w
+        
+        res_l = self._synthesize_structural_grid(length, dna_span, dna_offset)
+        if isinstance(res_l, dict) and res_l.get("status") == "CONFLICT":
+            return res_l
+        length, synth_span_l = res_l
         
         # Use simple average or W-span for the global col_span? 
         # Usually buildings have a square/regular grid. We'll prioritize W-span but keep logic robust.
@@ -405,10 +423,13 @@ class BuildingSystem:
         new_floors = []
         
         current_elev = 0.0
+        all_floor_dims = []
         # Step 3a: Extracting Staircase Shafts (HOT RELOADED ONCE)
         from revit_mcp import staircase_logic
+        from . import fire_safety_logic
         import importlib
         importlib.reload(staircase_logic)
+        importlib.reload(fire_safety_logic)
         
         # --- PHASE 1: LEVELS & FLOORS ---
         for i in range(num_storeys + 1):
@@ -431,13 +452,18 @@ class BuildingSystem:
                 
                 hw, hl = f_w / 2.0, f_l / 2.0
                 f_points = [[-hw, -hl], [hw, -hl], [hw, hl], [-hw, hl]]
+                
+                # --- SPATIAL RESERVATION: Shell Volume ---
+                if i == 0:
+                    self.spatial_registry.reserve("Building_Shell_{}".format(level_idx), (-hw, -hl, 0, hw, hl, current_elev + req_height), tags=["Shell"])
                 new_floors.append({"id": "AI_Floor_{}".format(level_idx), "level_id": lvl_id, "points": f_points})
-                current_elev += req_height
-            
-        # --- PHASE 2: CORE GENERATION ---
+                all_floor_dims.append((f_w, f_l))
+            # --- PHASE 2: CORE GENERATION ---
         lifts_config = manifest.get("lifts", {})
         lift_walls, core_bounds_list = [], []
         f_center_x, f_center_y = 0.0, 0.0
+        num_lifts = 0
+        lobby_w = 3000
         l1_floor_search = [f for f in new_floors if f.get("id") == "AI_Floor_1"]
         l1_floor = l1_floor_search[0] if l1_floor_search else (new_floors[0] if new_floors else None)
         if l1_floor:
@@ -446,58 +472,87 @@ class BuildingSystem:
                 f_center_x = (min(p[0] for p in l1_pts) + max(p[0] for p in l1_pts)) / 2.0
                 f_center_y = (min(p[1] for p in l1_pts) + max(p[1] for p in l1_pts)) / 2.0
 
-        if lifts_config or num_storeys >= 3 or shell.get("include_lifts"):
+        # --- PHASE 2: CORE GENERATION (Unified) ---
+        num_lifts = 0
+        p_core_logic = preset.get("core_logic", {})
+        lobby_w = p_core_logic.get("lift_lobby_width", 3000)
+        
+        if shell.get("include_lifts") or num_storeys >= 3 or manifest.get("lifts"):
             from . import lift_logic
+            lifts_config = manifest.get("lifts", {})
             num_lifts = lifts_config.get("count")
+            # Occupancy from floor area (m²) × density (persons/m²) × storeys
+            _fw = safe_num(shell.get("width", 30000), 30000)
+            _fl = safe_num(shell.get("length", 50000), 50000)
+            _occ_density = safe_num(lifts_config.get("occupancy_density", 0.1), 0.1)
+            _total_occ = max(100, (_fw * _fl / 1e6) * _occ_density * num_storeys)
+            _auto_lifts = lift_logic.calculate_lift_requirements(num_storeys, base_height, _total_occ, 25.0)
             if num_lifts is None or num_lifts == "random":
-                num_lifts = lift_logic.calculate_lift_requirements(num_storeys, base_height, 2500, 25.0)
-            lift_size = lifts_config.get("size", preset.get("core_logic", {}).get("lift_shaft_size", [2700, 2700]))
-            lobby_w = lifts_config.get("lobby_width", 3000)
-            layout = lift_logic.get_total_core_layout(int(num_lifts), lift_size, lobby_w)
-            center_pos = lifts_config.get("position") or [f_center_x, f_center_y]
-            remaining_lifts = layout['total_lifts']
-            for b_idx in range(layout['num_blocks']):
-                b_lifts = min(remaining_lifts, layout['lifts_per_block'])
-                remaining_lifts -= b_lifts
-                b_y_offset = lift_logic.get_block_y_offset(b_idx, layout['num_blocks'], layout['block_d'])
-                b_man = lift_logic.generate_lift_shaft_manifest(b_lifts, new_levels, center_pos=[center_pos[0], center_pos[1] + b_y_offset], internal_size=lift_size, lobby_width=lobby_w)
-                lift_walls.extend(b_man.get("walls", [])); new_floors.extend(b_man.get("floors", []))
-            if lift_walls:
-                xs = [w['start'][0] for w in lift_walls] + [w['end'][0] for w in lift_walls]; ys = [w['start'][1] for w in lift_walls] + [w['end'][1] for w in lift_walls]
-                core_bounds_list.append((min(xs), min(ys), max(xs), max(ys)))
+                num_lifts = _auto_lifts
+            else:
+                # Cap Gemini-specified count against demand-based calculation
+                num_lifts = min(int(num_lifts), _auto_lifts)
+            num_lifts = int(num_lifts)
+            lobby_w = lifts_config.get("lobby_width", lobby_w)
 
-        # --- STAIRCASE GENERATION ---
+        # Initial core center based on floor center
+        center_pos = [f_center_x, f_center_y]
+        all_voids = []
+        # Calculate Unified Core (Passenger Lifts + Fire Safety Sets)
         preset_fs = preset.get("core_logic", {}).get("fire_safety", {})
-        p_num_stairs = preset_fs.get("fire_escape_staircases", 2)
-        p_stair_spec = preset_fs.get("staircase_spec", {})
-        max_travel = safe_num(preset_fs.get("max_travel_distance", 60000), 60000)
-
+        stair_spec = preset_fs.get("staircase_spec", {}).copy()
         m_stair_config = manifest.get("staircases", {})
-        num_stairs = int(safe_num(m_stair_config.get("count", p_num_stairs), p_num_stairs))
-        if num_storeys >= 2:
-            num_stairs = max(num_stairs, 2)
+        if "spec" in m_stair_config:
+            for k in ["riser", "tread", "width_of_flight", "landing_width"]:
+                if k in m_stair_config["spec"]:
+                    stair_spec[k] = safe_num(m_stair_config["spec"][k], stair_spec.get(k))
 
-        stair_spec = p_stair_spec.copy()
-        m_spec = m_stair_config.get("spec", {})
-        for k in ["riser", "tread", "width_of_flight", "landing_width"]:
-            if k in m_spec:
-                stair_spec[k] = safe_num(m_spec[k], stair_spec.get(k))
+        # Initial core center based on floor center
+        center_pos = [f_center_x, f_center_y]
+        
+        # 1. First, determine positions
+        safety_sets = fire_safety_logic.calculate_fire_safety_requirements(
+            all_floor_dims, center_pos, None, 
+            base_height, preset_fs, num_lifts, lobby_w
+        )
+        
+        # 2. Generate the Unified Manifest
+        unified_man = fire_safety_logic.generate_fire_safety_manifest(
+            safety_sets, new_levels, stair_spec, base_height, preset_fs, None, num_lifts, lobby_w,
+            center_pos_mm=center_pos
+        )
+        
+        if isinstance(unified_man, dict) and unified_man.get("status") == "CONFLICT":
+            return unified_man
 
-        staircase_walls = []
-        if num_stairs > 0 and num_storeys >= 2:
-            l_core = core_bounds_list[0] if core_bounds_list else None
-            positions = staircase_logic.calculate_staircase_positions([(width, length)], [f_center_x, f_center_y], l_core, base_height, stair_spec, safe_num(preset_fs.get("max_travel_distance", 60000), 60000))
-            lift_core_w = (l_core[2]-l_core[0]) if l_core else 0
-            shaft_w_nat, _ = staircase_logic.get_shaft_dimensions(base_height, stair_spec)
-            enc_w = max(lift_core_w, shaft_w_nat)
-            st_manifest = staircase_logic.generate_staircase_manifest(positions, new_levels, enc_w, stair_spec, base_height, l_core)
-            staircase_walls = st_manifest.get("walls", [])
-            new_floors.extend(st_manifest.get("floors", []))
-            for p in positions:
-                sw, sd = staircase_logic.get_shaft_dimensions(base_height, stair_spec)
-                sw = max(sw, enc_w)
-                core_bounds_list.append((p[0]-sw/2.0, p[1]-sd/2.0, p[0]+sw/2.0, p[1]+sd/2.0))
+        # 3. Precise Mental Model Reservation
+        core_bounds_list = unified_man.get("core_bounds", [])
+        sub_bounds = unified_man.get("sub_boundaries", [])
+        
+        if sub_bounds:
+            for sb in sub_bounds:
+                res_id = sb["id"]
+                rect = sb["rect"]
+                # Use current_elev as a quick approximation for the built volume height
+                res, conflict = self.spatial_registry.reserve(res_id, (rect[0], rect[1], 0, rect[2], rect[3], base_height))
+                if not res and "Shell" not in str(conflict):
+                     return {
+                        "status": "CONFLICT",
+                        "type": "GEOMETRIC_INTERFERENCE",
+                        "description": "Spatial Conflict: '{}' overlaps with '{}'".format(res_id, conflict)
+                    }
+        else:
+            # Fallback for core boundaries
+            for i, cb in enumerate(core_bounds_list):
+                res_id = "Passenger_Core" if i == 0 and num_lifts > 0 else "Safety_Set_{}".format(i)
+                res, conflict = self.spatial_registry.reserve(res_id, (cb[0], cb[1], 0, cb[2], cb[3], base_height))
+                if not res and "Shell" not in str(conflict):
+                    return {"status": "CONFLICT", "type": "GEOMETRIC_INTERFERENCE", "description": "Core element {} overlaps with: {}".format(res_id, conflict)}
 
+        new_walls.extend(unified_man.get("walls", []))
+        new_floors.extend(unified_man.get("floors", []))
+        all_voids.extend(unified_man.get("voids", []))
+        
         # --- PHASE 3: SHELL WALLS WITH CURBING ---
         for i in range(num_storeys):
             level_idx = i + 1; lvl_id = "AI_Level_{}".format(level_idx); raw_h = safe_num(height_overrides.get(str(level_idx), base_height), base_height); is_top = (i == num_storeys - 1)
@@ -516,7 +571,7 @@ class BuildingSystem:
                 for s_idx, seg in enumerate(segments):
                     new_walls.append({"id": "AI_Wall_L{}_{}_{}".format(level_idx, tags[j], s_idx), "level_id": lvl_id, "start": [seg[0][0], seg[0][1], 0], "end": [seg[1][0], seg[1][1], 0], "height": req_h})
 
-        new_walls.extend(lift_walls); new_walls.extend(staircase_walls)
+        new_walls.extend(lift_walls)
         # Combined Core Bounds for Column logic
         core_bounds = (min(c[0] for c in core_bounds_list), min(c[1] for c in core_bounds_list), max(c[2] for c in core_bounds_list), max(c[3] for c in core_bounds_list)) if core_bounds_list else None
 
@@ -635,7 +690,38 @@ class BuildingSystem:
                         "type": shell.get("column_type", "")
                     })
 
-        return {"levels": new_levels, "walls": new_walls, "floors": new_floors, "columns": new_columns}
+        # --- PHASE 4: UNIVERSAL ASSEMBLY VALIDATION & GRANULAR SPACES ---
+        # If the manifest contains custom "spaces", validate them
+        custom_spaces = manifest.get("spaces", [])
+        for space in custom_spaces:
+            sid = space.get("id")
+            bbox_raw = space.get("bbox") # [x1, y1, z1, x2, y2, z2]
+            if not sid or not bbox_raw: continue
+            
+            # Validation: Must have walls and floors
+            is_valid, err = self.spatial_registry.validate_assembly(sid, space)
+            if not is_valid:
+                return {"status": "CONFLICT", "type": "ASSEMBLY_INCOMPLETE", "description": err}
+                
+            # Reservation
+            res, conflict = self.spatial_registry.reserve(sid, tuple(bbox_raw), tags=space.get("tags", []))
+            if not res:
+                return {"status": "CONFLICT", "type": "GEOMETRIC_INTERFERENCE", "description": "Space {} overlaps with: {}".format(sid, conflict)}
+            
+            # Extract elements from space and add to manifest
+            new_walls.extend(space.get("walls", []))
+            new_floors.extend(space.get("floors", []))
+            if "columns" in space: new_columns.extend(space["columns"])
+
+        # --- SPATIAL SUMMARY LOGGING ---
+        occupancy = self.spatial_registry.get_occupancy_map()
+        self.log("Spatial Clearinghouse: {} volumes reserved (Cores: {}, Custom: {}). Zero conflicts detected.".format(
+            len(occupancy),
+            len([o for o in occupancy if "Core" in o['id'] or "Safety" in o['id']]),
+            len([o for o in occupancy if "Shell" not in o['id'] and "Core" not in o['id'] and "Safety" not in o['id']])
+        ))
+
+        return {"levels": new_levels, "walls": new_walls, "floors": new_floors, "columns": new_columns, "core_bounds": core_bounds_list, "voids": all_voids}
 
     def _curb_wall_segment(self, p1, p2, bounds, tolerance=100.0):
         xmin, ymin, xmax, ymax = bounds

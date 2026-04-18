@@ -32,19 +32,19 @@ def calculate_lift_requirements(num_floors, avg_floor_height_mm, total_building_
     handling_capacity_per_lift = P * (300.0 / RTT)   # persons per 5 min per lift
     lifts_by_demand = math.ceil(peak_demand / handling_capacity_per_lift) if handling_capacity_per_lift > 0 else 2
 
-    # Both approaches give a number; take the max but hard-cap at realistic values.
-    # Real office towers: roughly 1 lift per 35-50k m² NLA or per ~2000 occupants.
-    # Hard cap: 1 lift per 1500 occupants (generous), minimum 2.
-    max_from_pop = max(2, int(math.ceil(total_building_occupancy / 1500.0)))
+    # RTT-based count, minimum 2, hard cap 24 (2 full banks of 12).
+    # Population-based sanity cap: ~1 lift per 300 occupants is the
+    # industry norm for office (CIBSE Guide D prestige interval ~25 s).
+    max_from_pop = max(2, int(math.ceil(total_building_occupancy / 300.0)))
     num_lifts = max(lifts_by_demand, 2)
-    num_lifts = min(num_lifts, max_from_pop)  # Never exceed population-based cap
+    num_lifts = min(num_lifts, max_from_pop, 24)  # cap at pop-based and absolute max
 
     return int(num_lifts)
 
 def get_core_dimensions(num_lifts, internal_size=(2500, 2500), lobby_width=3000):
     """Calculates the total width and depth of a SINGLE lift core block (max 12)."""
     w, l = internal_size
-    t = 200 # wall thickness
+    t = 350  # wall thickness — 350mm structural core walls
     
     # Each core: max 12 lifts, max 6 per side
     if num_lifts >= 4:
@@ -59,8 +59,9 @@ def get_core_dimensions(num_lifts, internal_size=(2500, 2500), lobby_width=3000)
         block_depth = (2 * (l + 2 * t)) + lobby_width
     else:
         block_width = (num_lifts * w) + ((num_lifts + 1) * t)
-        block_depth = l + (2 * t)
-        
+        # Single row: include lobby_width so a waiting corridor exists south of the shaft
+        block_depth = (l + (2 * t)) + lobby_width
+
     return block_width, block_depth
 
 def get_total_core_layout(num_lifts, internal_size=(2500, 2500), lobby_width=3000):
@@ -119,11 +120,25 @@ def get_shaft_void_rectangles_mm(num_lifts, center_pos=(0, 0), internal_size=(25
     The rectangles are aligned to the inner faces of the shaft walls (offset by wall
     thickness t = 200 mm inward from the outer wall face).
     One rectangle per lift car — e.g. 4 lifts → 4 rectangles.
-    Multi-block layouts (>12 lifts) are handled by the caller, which calls this function
-    once per block with the per-block center_pos.
+    Multi-block layouts (>12 lifts) are handled internally using get_total_core_layout.
     """
+    layout = get_total_core_layout(num_lifts, internal_size, lobby_width)
+    num_blocks = layout["num_blocks"]
+    lifts_per_block = layout["lifts_per_block"]
+    block_d = layout["block_d"]
+
+    all_voids = []
+    for b_idx in range(num_blocks):
+        block_center_y = center_pos[1] + get_block_y_offset(b_idx, num_blocks, block_d)
+        block_center = (center_pos[0], block_center_y)
+        all_voids.extend(_get_block_void_rectangles_mm(lifts_per_block, block_center, internal_size, lobby_width))
+    return all_voids
+
+
+def _get_block_void_rectangles_mm(num_lifts, center_pos, internal_size=(2500, 2500), lobby_width=3000):
+    """Void rectangles for a single lift core block (max 12 lifts)."""
     w, l = internal_size
-    t = 200  # wall thickness (same as in generate_lift_shaft_manifest)
+    t = 350  # wall thickness — 350mm structural core walls
 
     total_in_block = min(12, num_lifts)
     if total_in_block >= 4:
@@ -142,14 +157,13 @@ def get_shaft_void_rectangles_mm(num_lifts, center_pos=(0, 0), internal_size=(25
 
     def _row_voids(n_lifts, row_y_offset):
         this_row_w = (n_lifts * w) + ((n_lifts + 1) * t)
-        # Centre the row relative to max_block_w (same logic as generate_lift_shaft_manifest)
         row_base_x = center_pos[0] - (max_block_w / 2.0) + (max_block_w - this_row_w) / 2.0
         base_y = center_pos[1] + row_y_offset
         for j in range(n_lifts):
-            x1 = row_base_x + j * (w + t) + (t / 2.0)
-            x2 = x1 + w
-            y1 = base_y + (t / 2.0)
-            y2 = y1 + l + t
+            x1 = row_base_x + j * (w + t) + (t / 2.0) + 1.0
+            x2 = x1 + w - 2.0
+            y1 = base_y + (t / 2.0) + 1.0
+            y2 = y1 + l + t - 2.0
             voids.append((x1, y1, x2, y2))
 
     if n1 > 0:
@@ -167,16 +181,38 @@ def generate_lift_shaft_manifest(num_lifts, levels_data, center_pos=(0, 0), inte
     Generates manifest data for lift shafts centered around center_pos.
     Both rows are aligned to the same max_block_width for correct visual symmetry.
     Wall IDs use the level name (e.g. AI Level 3) for stable re-identification.
+    Supports multi-block layouts (>12 lifts) by generating walls for each block.
     """
-    walls = []
+    layout = get_total_core_layout(num_lifts, internal_size, lobby_width)
+    num_blocks = layout["num_blocks"]
+    lifts_per_block = layout["lifts_per_block"]
+    block_d = layout["block_d"]
+
+    all_walls_total = []
+    all_floors_total = []
+
+    for b_idx in range(num_blocks):
+        block_center_y = center_pos[1] + get_block_y_offset(b_idx, num_blocks, block_d)
+        block_center = (center_pos[0], block_center_y)
+        block_tag = "B{}".format(b_idx) if num_blocks > 1 else ""
+        w_block, f_block = _generate_single_block_manifest(
+            lifts_per_block, levels_data, block_center, internal_size, lobby_width, block_tag
+        )
+        all_walls_total.extend(w_block)
+        all_floors_total.extend(f_block)
+
+    return {"walls": all_walls_total, "floors": all_floors_total}
+
+
+def _generate_single_block_manifest(num_lifts, levels_data, center_pos=(0, 0), internal_size=(2500, 2500), lobby_width=3000, block_tag=""):
+    """Generate wall/floor manifest for a single lift core block (max 12 lifts)."""
     w, l = internal_size
-    t = 200  # wall thickness
+    t = 350  # wall thickness — 350mm structural core walls
 
     # Symmetry: Split into two rows if >= 4 lifts
     if num_lifts >= 4:
-        total_in_block = min(12, num_lifts)
-        lifts_in_row1 = int(math.ceil(total_in_block / 2.0))
-        lifts_in_row2 = int(math.floor(total_in_block / 2.0))
+        lifts_in_row1 = int(math.ceil(num_lifts / 2.0))
+        lifts_in_row2 = int(math.floor(num_lifts / 2.0))
     else:
         lifts_in_row1 = int(num_lifts)
         lifts_in_row2 = 0
@@ -278,17 +314,121 @@ def generate_lift_shaft_manifest(num_lifts, levels_data, center_pos=(0, 0), inte
         if lifts_in_row2 > 0:
             r1_y_start = -(shaft_depth + lobby_width / 2.0)
             r2_y_start = (lobby_width / 2.0)
-            w1, f1 = create_row_manifest(lifts_in_row1, r1_y_start, "LiftR1")
-            w2, f2 = create_row_manifest(lifts_in_row2, r2_y_start, "LiftR2")
+            w1, f1 = create_row_manifest(lifts_in_row1, r1_y_start, "LiftR1" + block_tag)
+            w2, f2 = create_row_manifest(lifts_in_row2, r2_y_start, "LiftR2" + block_tag)
             all_walls.extend(w1)
             all_walls.extend(w2)
             all_floors.extend(f1)
             all_floors.extend(f2)
         else:
-            r1_y_start = -(shaft_depth / 2.0)
-            w1, f1 = create_row_manifest(lifts_in_row1, r1_y_start, "LiftR1")
+            # Single row: shift shaft northward so lobby corridor appears to the south.
+            # Shaft is centered within (shaft_depth + lobby_width), south half = lobby.
+            r1_y_start = (lobby_width - shaft_depth) / 2.0
+            w1, f1 = create_row_manifest(lifts_in_row1, r1_y_start, "LiftR1" + block_tag)
             all_walls.extend(w1)
             all_floors.extend(f1)
 
-    return {"walls": all_walls, "floors": all_floors}
+    return all_walls, all_floors
 
+
+def get_passenger_lift_door_positions(num_lifts, center_pos=(0, 0), internal_size=(2500, 2500),
+                                      lobby_width=3000, levels_data=None):
+    """Return door specs for passenger lift openings facing the central lobby.
+
+    For a 2-row block (>=4 lifts per block):
+        Row 1 (south) doors face NORTH toward lobby (back wall).
+        Row 2 (north) doors face SOUTH toward lobby (front wall).
+    For a single row (<4 lifts): doors face the open (south) side.
+    """
+    w, l = internal_size
+    t = 350  # must match _generate_single_block_manifest
+
+    layout = get_total_core_layout(num_lifts, internal_size, lobby_width)
+    num_blocks = layout["num_blocks"]
+    lifts_per_block = layout["lifts_per_block"]
+    block_d = layout["block_d"]
+
+    all_level_ids = [lvl['id'] for lvl in levels_data[:-1]] if levels_data and len(levels_data) > 1 else []
+    if not all_level_ids and levels_data:
+        all_level_ids = [levels_data[0]['id']]
+
+    door_specs = []
+    shaft_depth = l + 2 * t
+
+    for b_idx in range(num_blocks):
+        block_cy = center_pos[1] + get_block_y_offset(b_idx, num_blocks, block_d)
+        cx = center_pos[0]
+
+        block_tag_str = "B{}".format(b_idx) if layout["num_blocks"] > 1 else ""
+
+        if lifts_per_block >= 4:
+            n1 = int(math.ceil(lifts_per_block / 2.0))
+            n2 = int(math.floor(lifts_per_block / 2.0))
+
+            row1_w = (n1 * w) + ((n1 + 1) * t)
+            row2_w = (n2 * w) + ((n2 + 1) * t) if n2 > 0 else 0
+            max_bw = max(row1_w, row2_w)
+
+            # Row 1 (south): back wall faces north = lobby side
+            r1_y_start = block_cy - (shaft_depth + lobby_width / 2.0)
+            r1_back_y  = r1_y_start + shaft_depth
+            r1_base_x  = cx - max_bw / 2.0 + (max_bw - row1_w) / 2.0
+            row1_tag = "LiftR1" + block_tag_str
+            for j in range(n1):
+                lift_cx = r1_base_x + j * (w + t) + t + w / 2.0
+                door_specs.append({
+                    "id": "AI_PaxLift_B{}_R1_J{}".format(b_idx, j),
+                    "position_mm": [lift_cx, r1_back_y],
+                    "wall_line_mm": [[r1_base_x, r1_back_y], [r1_base_x + row1_w, r1_back_y]],
+                    "levels": all_level_ids,
+                    "swing_in": True, "flip_hand": True, "min_width_mm": 1000,
+                    "door_category": "lift",
+                    "wall_ai_id_map": {
+                        lvl['id']: "AI_{}__{}_W_Back".format(row1_tag, lvl['id'].replace(" ", "_"))
+                        for lvl in (levels_data or [])
+                    },
+                })
+
+            # Row 2 (north): front wall faces south = lobby side
+            if n2 > 0:
+                r2_y_start = block_cy + lobby_width / 2.0
+                r2_front_y = r2_y_start
+                r2_base_x  = cx - max_bw / 2.0 + (max_bw - row2_w) / 2.0
+                row2_tag = "LiftR2" + block_tag_str
+                for j in range(n2):
+                    lift_cx = r2_base_x + j * (w + t) + t + w / 2.0
+                    door_specs.append({
+                        "id": "AI_PaxLift_B{}_R2_J{}".format(b_idx, j),
+                        "position_mm": [lift_cx, r2_front_y],
+                        "wall_line_mm": [[r2_base_x, r2_front_y], [r2_base_x + row2_w, r2_front_y]],
+                        "levels": all_level_ids,
+                        "swing_in": True, "min_width_mm": 1000,
+                        "door_category": "lift",
+                        "wall_ai_id_map": {
+                            lvl['id']: "AI_{}__{}_W_Front".format(row2_tag, lvl['id'].replace(" ", "_"))
+                            for lvl in (levels_data or [])
+                        },
+                    })
+        else:
+            # Single row — shaft shifted north; door on front (south) wall facing lobby corridor
+            row1_w    = (lifts_per_block * w) + ((lifts_per_block + 1) * t)
+            r1_y_start = block_cy + (lobby_width - shaft_depth) / 2.0
+            r1_front_y = r1_y_start
+            r1_base_x  = cx - row1_w / 2.0
+            row1_tag = "LiftR1" + block_tag_str
+            for j in range(lifts_per_block):
+                lift_cx = r1_base_x + j * (w + t) + t + w / 2.0
+                door_specs.append({
+                    "id": "AI_PaxLift_B{}_R1_J{}".format(b_idx, j),
+                    "position_mm": [lift_cx, r1_front_y],
+                    "wall_line_mm": [[r1_base_x, r1_front_y], [r1_base_x + row1_w, r1_front_y]],
+                    "levels": all_level_ids,
+                    "swing_in": True, "flip_hand": True, "min_width_mm": 1000,
+                    "door_category": "lift",
+                    "wall_ai_id_map": {
+                        lvl['id']: "AI_{}__{}_W_Front".format(row1_tag, lvl['id'].replace(" ", "_"))
+                        for lvl in (levels_data or [])
+                    },
+                })
+
+    return door_specs
