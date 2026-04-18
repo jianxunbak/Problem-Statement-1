@@ -10,6 +10,7 @@ from revit_mcp.utils import (
 )
 from . import lift_logic
 from . import staircase_logic
+from . import fire_safety_logic
 import math
 
 
@@ -56,8 +57,10 @@ def _merge_void_rects(rects):
 
 class RevitWorkers:
     def __init__(self, doc, tracker=None):
+        from .spatial_registry import SpatialRegistry
         self.doc = doc
         self.tracker = tracker
+        self.spatial_registry = SpatialRegistry()
 
     def log(self, message):
         client.log(message)
@@ -135,25 +138,48 @@ class RevitWorkers:
             results["levels"] = [str(l.Id.Value) for l in current_levels]
             floor_dims, shell = self._process_shell_dimensions(manifest, current_levels, registry)
 
-            # --- PHASE 2: VERTICAL CIRCULATION (Lifts + Staircases) ---
+            # --- PHASE 2: VERTICAL CIRCULATION (Unified Core: Lifts + Staircases) ---
             t = DB.Transaction(doc, "AI Build: Vertical Circulation")
             t.Start()
             setup_failure_handling(t, use_nuclear=True)
-            self.log("Step 3a: Expanding Vertical Circulation (Lifts)...")
-            if self.tracker: self.tracker.report("Processing lift cores...")
+            import importlib
+            importlib.reload(staircase_logic)
+            importlib.reload(fire_safety_logic)
+            self.log("Step 3a: Expanding Unified Vertical Circulation...")
+            if self.tracker: self.tracker.report("Calculating unified core layout (Lifts + Fire Safety)...")
+            
             c0, r0 = created[0], reused[0]
-            core_bounds = self._expand_lifts_in_manifest(manifest, current_levels, elevations, floor_dims, affected_elements, results)
-            lift_new, lift_reused = created[0] - c0, reused[0] - r0
-
-            self.log("Step 3a.1: Expanding Vertical Circulation (Staircases)...")
-            c0, r0 = created[0], reused[0]
-            core_bounds = self._expand_staircases_in_manifest(manifest, current_levels, elevations, floor_dims, core_bounds, affected_elements, results)
+            
+            # --- CONSOLIDATION: Skip re-expansion if already planned ---
+            core_bounds_ft = None
+            if "core_bounds" in manifest and manifest["core_bounds"]:
+                self.log("Consolidation: Using pre-planned core bounds from manifest.")
+                from revit_mcp.utils import mm_to_ft
+                cb_list = manifest["core_bounds"]
+                # Create a single unified bounding box in feet for the worker's logic
+                bx1 = min(cb[0] for cb in cb_list); by1 = min(cb[1] for cb in cb_list)
+                bx2 = max(cb[2] for cb in cb_list); by2 = max(cb[3] for cb in cb_list)
+                core_bounds_ft = (mm_to_ft(bx1), mm_to_ft(by1), mm_to_ft(bx2), mm_to_ft(by2))
+                # Also extract and convert voids
+                voids_mm = manifest.get("voids", [])
+                u_voids_ft = []
+                for (vx1, vy1, vx2, vy2) in voids_mm:
+                    u_voids_ft.append((mm_to_ft(vx1), mm_to_ft(vy1), mm_to_ft(vx2), mm_to_ft(vy2)))
+                self._stair_voids = u_voids_ft
+                core_bounds = core_bounds_ft
+            else:
+                self._stair_voids = [] # Clear stale voids
+                core_bounds = self._expand_unified_vertical_circulation(manifest, current_levels, elevations, floor_dims, affected_elements, results)
             
             # Catch Spatial Conflicts
             if isinstance(core_bounds, dict) and core_bounds.get("status") == "CONFLICT":
+                try: t.RollBack(); t.Dispose()
+                except: pass
+                try: tg.RollBack()
+                except: pass
                 return core_bounds
-                
-            stair_new, stair_reused = created[0] - c0, reused[0] - r0
+            
+            core_new, core_reused = created[0] - c0, reused[0] - r0
             self._enforce_disjoint(affected_elements)
             t.Commit()
             t.Dispose()
@@ -164,33 +190,11 @@ class RevitWorkers:
             # Must be outside ANY transaction because it starts its own.
             self._stair_fps_cache = self._cleanup_staircases(doc, getattr(self, '_stair_run_data', []), manifest)
 
-            if self.tracker:
-                parts = []
-                if lift_new or lift_reused:
-                    ls = getattr(self, '_lift_summary', None)
-                    if ls:
-                        parts.append(
-                            f"{self._phase_msg('lift elements', lift_new, lift_reused)} "
-                            f"({ls['count']} lifts, shaft {ls['shaft_w']}x{ls['shaft_h']}mm, "
-                            f"lobby {ls['lobby_w']}mm, core {ls['core_w']:.0f}x{ls['core_d']:.0f}mm)"
-                        )
-                    else:
-                        parts.append(self._phase_msg("lift elements", lift_new, lift_reused))
-                if stair_new or stair_reused:
-                    ss = getattr(self, '_stair_summary', None)
-                    if ss:
-                        parts.append(
-                            f"{self._phase_msg('staircase elements', stair_new, stair_reused)} "
-                            f"({ss['count']} cores, {ss['enc_w']:.0f}x{ss['enc_d']:.0f}mm enclosure, "
-                            f"riser {ss['riser']}mm, tread {ss['tread']}mm, "
-                            f"{ss['flights_typical']} flights x {ss['risers_per_flight']} risers, "
-                            f"flight width {ss['flight_width']}mm)"
-                        )
-                    else:
-                        parts.append(self._phase_msg("staircase elements", stair_new, stair_reused))
-                if parts:
-                    for p in parts:
-                        self.tracker.report(p)
+            if self.tracker and (core_new or core_reused):
+                self.tracker.report(
+                    f"{self._phase_msg('core elements', core_new, core_reused)} "
+                    f"(Unified Lifts, Stairs, and Fire Safety lobbies synced to core bounds)"
+                )
 
             # --- PHASE 2.9: AGGRESSIVE PRE-CLEANUP ---
             # Delete ALL old AI components (except protected cores handled in 2.5)
@@ -200,24 +204,19 @@ class RevitWorkers:
             setup_failure_handling(t_clean, use_nuclear=True)
             pre_del_count = 0
             
-            # Protected status: Lift/Stair enclosure walls are kept for additive sync
-            def _is_protected(el):
-                p = el.get_Parameter(DB.BuiltInParameter.ALL_MODEL_INSTANCE_COMMENTS)
-                if not p: p = el.LookupParameter("Comments")
-                if p and p.HasValue:
-                    t = p.AsString()
-                    if "LiftR" in t or "Stair_" in t: return True
-                return False
-
+            # Delete ALL old AI elements — no exceptions.
+            # Attempting to "update" old walls in place (moving their curve) is unreliable
+            # because Revit silently rejects the move when the wall has stale top-level
+            # constraints, join constraints, or room-boundary pins from the old build.
+            # Deleting everything and recreating fresh is both simpler and more robust.
             cats = [DB.BuiltInCategory.OST_Walls, DB.BuiltInCategory.OST_Floors, DB.BuiltInCategory.OST_Columns, DB.BuiltInCategory.OST_StructuralColumns]
             for c in cats:
                 for el in DB.FilteredElementCollector(doc).OfCategory(c).WhereElementIsNotElementType().ToElements():
                     try:
                         p = el.get_Parameter(DB.BuiltInParameter.ALL_MODEL_INSTANCE_COMMENTS)
                         if p and p.HasValue and p.AsString().startswith("AI_"):
-                            if not _is_protected(el):
-                                doc.Delete(el.Id)
-                                pre_del_count += 1
+                            doc.Delete(el.Id)
+                            pre_del_count += 1
                     except: pass
             t_clean.Commit()
             t_clean.Dispose()
@@ -236,6 +235,10 @@ class RevitWorkers:
             c0, r0 = created[0], reused[0]
             res_f = self._process_floors(current_levels, floor_dims, shell, registry, results, created, reused, affected_elements)
             if isinstance(res_f, dict) and res_f.get("status") == "CONFLICT":
+                try: t.RollBack(); t.Dispose()
+                except: pass
+                try: tg.RollBack()
+                except: pass
                 return res_f
             expanded_slab_dims = res_f
             floors_new, floors_reused = created[0] - c0, reused[0] - r0
@@ -282,11 +285,15 @@ class RevitWorkers:
             
             res_w = self._synthesize_structural_grid(max_w, dna_span, dna_offset)
             if isinstance(res_w, dict) and res_w.get("status") == "CONFLICT":
+                try: tg.RollBack()
+                except: pass
                 return res_w
             _, synth_span_w = res_w
-            
+
             res_l = self._synthesize_structural_grid(max_l, dna_span, dna_offset)
             if isinstance(res_l, dict) and res_l.get("status") == "CONFLICT":
+                try: tg.RollBack()
+                except: pass
                 return res_l
             _, synth_span_l = res_l
             
@@ -306,9 +313,14 @@ class RevitWorkers:
                 self.tracker.record_created("columns", cols_new)
                 col_spacing = shell.get("column_spacing", 10000)
                 offset_edge = shell.get("column_offset_from_edge", 500)
+                # col_spacing may be a list [x_spacing, y_spacing] from the AI
+                if isinstance(col_spacing, list):
+                    spacing_str = "x".join(f"{v/1000:.0f}" for v in col_spacing) + "m"
+                else:
+                    spacing_str = f"{col_spacing/1000:.0f}m"
                 self.tracker.report(
                     f"{self._phase_msg('structural columns', cols_new, cols_reused)} "
-                    f"(grid spacing {col_spacing/1000:.0f}m, {offset_edge}mm from edge)"
+                    f"(grid spacing {spacing_str}, {offset_edge}mm from edge)"
                 )
             t.Commit()
             t.Dispose()
@@ -334,6 +346,10 @@ class RevitWorkers:
             c0, r0 = created[0], reused[0]
             res_gf = self._process_granular_floors(manifest, current_levels, registry, results, created, reused, affected_elements)
             if isinstance(res_gf, dict) and res_gf.get("status") == "CONFLICT":
+                try: t.RollBack(); t.Dispose()
+                except: pass
+                try: tg.RollBack()
+                except: pass
                 return res_gf
             gf_new, gf_reused = created[0] - c0, reused[0] - r0
             c0, r0 = created[0], reused[0]
@@ -445,53 +461,35 @@ class RevitWorkers:
 
     def _synthesize_structural_grid(self, target_dim, span_range, min_offset):
         """
-        Synthesizes an optimal structural grid based on 1/3 cantilever rules.
-        Returns: (final_dim, final_span) or CONFLICT dict.
+        Synthesises an optimal structural grid span for the given building dimension.
+
+        The 1/3 cantilever rule governs the PERIMETER overhang (facade → first
+        column = min_offset), which is always satisfied for typical values.
+        It does NOT govern the inner zone between the last bay column and the
+        building centre — in a central-core building that zone is the core and
+        no structural columns are placed there.
+
+        Returns: (final_dim, final_span) — never returns CONFLICT.
         """
-        import math
         if isinstance(span_range, (int, float)):
             min_s, max_s = float(span_range), float(span_range)
         elif isinstance(span_range, list) and len(span_range) >= 2:
             min_s, max_s = float(span_range[0]), float(span_range[1])
         else:
             min_s, max_s = 10000.0, 12000.0
-            
-        target_half = target_dim / 2.0
-        n = int((target_half - min_offset) // min_s)
-        if n < 0: n = 0
-            
-        def check_rules(half_w, span, n_cols):
-            if n_cols == 0: return True
-            cant = half_w - (n_cols * span)
-            if cant < min_offset - 1.0: return False
-            if cant > (span / 3.0) + 1.0: return False
-            return True
 
-        # Priority 1: Check original span
-        if check_rules(target_half, min_s, n):
-            return target_dim, min_s
-            
-        # Priority 2: Add column and check range
-        n_plus = n + 1
-        s_min_c = target_half / (n_plus + 1.0/3.0)
-        s_max_o = (target_half - min_offset) / n_plus
-        low, high = max(min_s, s_min_c), min(max_s, s_max_o)
-        if low <= high + 1.0: return target_dim, high
-                
-        # Priority 3: Extend span
-        if n > 0:
-            s_min_c = target_half / (n + 1.0/3.0)
-            s_max_o = (target_half - min_offset) / n
-            low, high = max(min_s, s_min_c), min(max_s, s_max_o)
-            if low <= high + 1.0: return target_dim, high
-                
-        # Priority 4: Conflict (No valid grid within DNA constraints)
-        return {
-            "status": "CONFLICT",
-            "description": "Structural Conflict: Could not synthesize a valid grid for {}mm dimension with DNA span range {}mm. The 1/3 cantilever rule is violated.".format(
-                target_dim, span_range
-            )
-        }
+        mid_s = (min_s + max_s) / 2.0
+        target_half = target_dim / 2.0
+
+        for n in range(1, 20):
+            s_lo = target_half / (n + 0.5)
+            s_hi = (target_half - min_offset) / n if n > 0 else max_s
+            lo = max(min_s, s_lo)
+            hi = min(max_s, s_hi)
+            if lo <= hi + 1.0:
+                return target_dim, hi
+
+        return target_dim, mid_s
 
     def _process_levels(self, manifest, registry, created, reused):
         import Autodesk.Revit.DB as DB # type: ignore
@@ -513,7 +511,7 @@ class RevitWorkers:
         height_val = setup.get("level_height", default_height)
         height_overrides = setup.get("height_overrides", {})
 
-        # Expand range keys like '2-10' → {'2':v, '3':v, ..., '10':v}
+        # Expand range keys like '2-10' â†’ {'2':v, '3':v, ..., '10':v}
         expanded_overrides = {}
         for k, v in height_overrides.items():
             k_str = str(k).strip()
@@ -541,7 +539,7 @@ class RevitWorkers:
             for i in range(1, count + 1):
                 h_val = height_overrides.get(str(i), height_val)
                 raw_h = get_random_dim(h_val, default_height, variation=0.15) if h_val == "random" else safe_num(h_val, default_height)
-                h = staircase_logic.adjust_storey_height(raw_h, height_val, is_top_floor=(i == count))
+                h = staircase_logic.adjust_storey_height(raw_h, height_val, is_top_floor=False)
                 if self.tracker and abs(h - raw_h) > 1.0:
                     from revit_mcp import staircase_logic as _sc
                     _rpf = _sc._risers_per_flight_typical(height_val, 150)
@@ -581,8 +579,8 @@ class RevitWorkers:
         
         # ROBUSTNESS: Only preserve old AI levels when the manifest did NOT
         # provide an explicit level count (i.e. this is a partial/property edit,
-        # not a storey-count change).  On contractions (50 → 5 floors) keeping
-        # the surplus levels inflates current_levels → floor_dims → column grid,
+        # not a storey-count change).  On contractions (50 â†’ 5 floors) keeping
+        # the surplus levels inflates current_levels â†’ floor_dims â†’ column grid,
         # producing columns for every old floor span instead of just the new 5.
         # _cleanup_registry handles the actual deletion of surplus elements.
         explicit_level_count = setup.get("levels") or setup.get("storeys")
@@ -601,8 +599,8 @@ class RevitWorkers:
         shell = manifest.get("shell", {})
         # When the AI sets force_global_dimensions=true it means the user asked
         # for a full-building footprint change (e.g. "make it 80x100m").  Skip
-        # the PRESERVE EXISTING model-reading so every floor — including the ones
-        # that already have walls — adopts the new shell width/length.
+        # the PRESERVE EXISTING model-reading so every floor â€” including the ones
+        # that already have walls â€” adopts the new shell width/length.
         force_global = bool(shell.get("force_global_dimensions", False))
         w_def, l_def = 30000.0, 50000.0
         
@@ -839,7 +837,7 @@ class RevitWorkers:
         
         # 1. SIMPLE SHELTER RULE: slab[k] = max(floor_dims[k-1], floor_dims[k])
         # Each slab covers the max of its two adjacent storeys. No upward
-        # cascade — only transition levels get expanded slabs.
+        # cascade â€” only transition levels get expanded slabs.
         expanded_slab_dims = []
         g_c_depth = shell.get("cantilever_depth")
         overrides = shell.get("floor_overrides", {})
@@ -895,7 +893,7 @@ class RevitWorkers:
             import System.Collections.Generic as Generic # type: ignore
             floor_loops = Generic.List[DB.CurveLoop]()
             floor_loops.Add(loop)
-            # Combine lift voids + stair voids — skip on ground floor (k == 0)
+            # Combine lift voids + stair voids â€” skip on ground floor (k == 0)
             shaft_voids = getattr(self, '_shaft_voids', None) or []
             stair_voids = getattr(self, '_stair_voids', None) or []
             all_voids = (list(shaft_voids) + list(stair_voids)) if k > 0 else []
@@ -930,7 +928,7 @@ class RevitWorkers:
                     void_loop.Append(DB.Line.CreateBound(vp4, vp1))
                     floor_loops.Add(void_loop)
 
-            # Old floors were pre-deleted in PHASE 2.9 — always create fresh.
+            # Old floors were pre-deleted in PHASE 2.9 â€” always create fresh.
             # Force Regenerate at dimension transitions so Revit finalises
             # the previous floor's geometry before creating the next one.
             # Without this, Revit 2026 can carry forward the previous floor's
@@ -944,7 +942,7 @@ class RevitWorkers:
                 try:
                     floor = DB.Floor.Create(doc, floor_loops, ftype.Id, lvl.Id)
                 except Exception as e_void:
-                    # Void loops invalid — log actual error, retry without voids
+                    # Void loops invalid â€” log actual error, retry without voids
                     from .runner import log as _flog2
                     _flog2("[FloorDims] L{}: void loops invalid ({}), creating floor without voids".format(k+1, e_void))
                     fallback_loops = Generic.List[DB.CurveLoop]()
@@ -968,11 +966,11 @@ class RevitWorkers:
         return expanded_slab_dims
 
     def _process_columns_and_grids(self, current_levels, elevations, floor_dims, expanded_slab_dims, shell, registry, results, created, reused, affected_elements=[], core_bounds=None):
-        """Structural column layout — minimal columns, maximum span, core as structure.
+        """Structural column layout â€” minimal columns, maximum span, core as structure.
         Rules:
-        1. Core is structural — no columns inside the core footprint.
+        1. Core is structural â€” no columns inside the core footprint.
         2. Maximize column span (use max of preset range) to minimize column count.
-        3. Uniform grid from building center — edge column only if cantilever > max_span.
+        3. Uniform grid from building center â€” edge column only if cantilever > max_span.
         4. All columns inset by at least offset_from_edge from slab edge."""
         import Autodesk.Revit.DB as DB # type: ignore
         doc = self.doc
@@ -1027,7 +1025,7 @@ class RevitWorkers:
         if not exclusion_zones and core_bounds:
             exclusion_zones = [core_bounds]
 
-        # Lift core bounds for grid computation — use unbuffered bounds so grid
+        # Lift core bounds for grid computation â€” use unbuffered bounds so grid
         # lines align with the actual core wall edges, not the column buffer.
         lift_core_ft = getattr(self, '_lift_core_bounds_ft', None)
         if lift_core_ft is None and exclusion_zones:
@@ -1072,7 +1070,7 @@ class RevitWorkers:
         self._grid_max_w_ft = mm_to_ft(max_w) / 2.0
         self._grid_max_l_ft = mm_to_ft(max_l) / 2.0
 
-        # Anchor for column tagging — use lift core center (not merged core+stairs)
+        # Anchor for column tagging â€” use lift core center (not merged core+stairs)
         if lift_core_ft:
             anchor_ft_x = (lift_core_ft[0] + lift_core_ft[2]) / 2.0
             anchor_ft_y = (lift_core_ft[1] + lift_core_ft[3]) / 2.0
@@ -1095,10 +1093,13 @@ class RevitWorkers:
         max_level_for_grid = {}
         for ox in x_offsets:
             for oy in y_offsets:
-                # Cull columns strictly inside ANY core/staircase footprint
+                # Cull columns inside ANY core/staircase footprint (inclusive with 1mm tolerance).
+                # Tolerance ensures boundary-flush columns (offset_from_edge == wall thickness)
+                # are correctly excluded even with floating-point rounding.
+                _TOL_FT = mm_to_ft(1.0)
                 inside_zone = False
                 for zone in exclusion_zones:
-                    if (zone[0] < ox < zone[2]) and (zone[1] < oy < zone[3]):
+                    if (zone[0] - _TOL_FT < ox < zone[2] + _TOL_FT) and (zone[1] - _TOL_FT < oy < zone[3] + _TOL_FT):
                         inside_zone = True
                         break
                 if inside_zone:
@@ -1140,7 +1141,7 @@ class RevitWorkers:
                         except: pass
                         if comment.startswith("AI_Col_"):
                             if comment not in new_tags:
-                                # Stale column — no longer in the grid
+                                # Stale column â€” no longer in the grid
                                 try:
                                     doc.Delete(el.Id)
                                     del_count += 1
@@ -1173,7 +1174,7 @@ class RevitWorkers:
 
                 col = doc.GetElement(registry[tag]) if tag in registry else None
                 if not col:
-                    # Check spatial index — skip if a column already exists here
+                    # Check spatial index â€” skip if a column already exists here
                     pos_key = (round(ox, 2), round(oy, 2), k)
                     if pos_key in existing_col_positions:
                         # Reuse the existing column at this position
@@ -1232,7 +1233,7 @@ class RevitWorkers:
             is_changed = False
             if wall and isinstance(wall, DB.Wall):
                 w_curve = wall.Location.Curve
-                # Compare XY only — Revit stores wall Z at level elevation,
+                # Compare XY only â€” Revit stores wall Z at level elevation,
                 # but manifest walls use Z=0 (level handles elevation).
                 def _xy_eq(a, b):
                     return abs(a.X - b.X) < 0.001 and abs(a.Y - b.Y) < 0.001
@@ -1337,20 +1338,19 @@ class RevitWorkers:
                 loops.Add(loop)
                 floor = DB.Floor.Create(doc, loops, ftype.Id, lvl.Id)
                 safe_set_comment(floor, ai_id)
-                
+
                 # Set Height Offset if needed
                 if abs(offset_ft) > 0.001:
                     p_offset = floor.get_Parameter(DB.BuiltInParameter.FLOOR_HEIGHTABOVELEVEL_PARAM)
                     if p_offset: p_offset.Set(offset_ft)
-                    
+
                 created[0] += 1
                 results["elements"].append(str(floor.Id.Value))
             except Exception as e:
-                self.log(f"GEOMETRY ERROR during floor creation '{ai_id}': {e}")
-                return {
-                    "status": "CONFLICT",
-                    "description": f"Invalid Floor Geometry for '{ai_id}': The provided coordinates likely form a self-intersecting or open loop that Revit cannot process. Please check your vertices."
-                }
+                # Non-fatal: skip this landing slab and log — do NOT roll back the
+                # transaction (which would also wipe lift-core walls and shell floors).
+                self.log(f"GEOMETRY WARN (skipped) granular floor '{ai_id}': {e}")
+                continue
         return None
 
     def _process_granular_columns(self, manifest, current_levels, registry, results, created, reused):
@@ -1394,17 +1394,12 @@ class RevitWorkers:
         doc = self.doc
         touched = set(results["levels"]) | set(results["elements"])
 
-        # PERMANENT PROTECTION: Lift core walls are never deleted by cleanup.
-        # They are managed entirely by _expand_lifts_in_manifest (additive-only).
-        # We identify them by the 'LiftR' pattern in their AI_ tag comment.
-        def _is_protected_core_element(el):
-            p = el.get_Parameter(DB.BuiltInParameter.ALL_MODEL_INSTANCE_COMMENTS)
-            if not p: p = el.LookupParameter("Comments")
-            if p and p.HasValue:
-                tag = p.AsString()
-                if "LiftR" in tag or "Stair_" in tag:
-                    return True
-            return False
+        # Do not delete elements that were touched in this build (they are in `touched`).
+        # There are no additional permanent exceptions — the old pattern of protecting
+        # ALL "LiftR" and "Stair_" elements caused stale walls from a previous build to
+        # survive cleanup when the staircase count or positions changed.
+        def _is_protected_core_element(_el):
+            return False  # touched-set check above already handles reused elements
         
         # 1. Broad Scan for any element with "AI_" comment that wasn't touched
         cats = [DB.BuiltInCategory.OST_Walls, DB.BuiltInCategory.OST_Floors, DB.BuiltInCategory.OST_Levels, 
@@ -1492,7 +1487,7 @@ class RevitWorkers:
             except:
                 pass
 
-        # X-axis grids: vertical lines (constant X, varying Y) — labelled A, B, C, ...
+        # X-axis grids: vertical lines (constant X, varying Y) â€” labelled A, B, C, ...
         for idx, ox in enumerate(x_offsets):
             label = ""
             n = idx
@@ -1511,7 +1506,7 @@ class RevitWorkers:
             except Exception:
                 pass
 
-        # Y-axis grids: horizontal lines (constant Y, varying X) — labelled 1, 2, 3, ...
+        # Y-axis grids: horizontal lines (constant Y, varying X) â€” labelled 1, 2, 3, ...
         for idx, oy in enumerate(y_offsets):
             label = str(idx + 1)
             p1 = DB.XYZ(-half_w_ft - overshoot_ft, oy, 0)
@@ -1524,705 +1519,216 @@ class RevitWorkers:
             except Exception:
                 pass
 
-    def _expand_lifts_in_manifest(self, manifest, current_levels, elevations, floor_dims, affected_elements=[], results=None):
-        """Additive-only lift core generation.
-
-        DESIGN CONTRACT:
-        - NEVER moves or deletes existing lift walls. Floors that already have lift walls in
-          the registry are unconditionally skipped.
-        - Only generates walls for levels that DON'T have any existing lift walls.
-        - Core position is locked to the TYPICAL floor centroid (most common floor size).
-          Once set it is preserved across all subsequent partial edits.
-        - Lift count is locked once built; never recalculated unless the building is brand new.
+    def _expand_unified_vertical_circulation(self, manifest, current_levels, elevations, floor_dims, affected_elements=[], results=None):
         """
-        import Autodesk.Revit.DB as DB  # type: ignore
+        Unified expansion for all core elements (Lifts, Stairs, Lobbies).
+        Ensures a single cohesive layout and prevents spatial conflicts.
+        """
+        import Autodesk.Revit.DB as DB # type: ignore
+        from revit_mcp.utils import mm_to_ft, load_presets, safe_num
+        from revit_mcp import staircase_logic, fire_safety_logic, lift_logic
+        
+        setup = manifest.get("project_setup", {})
+        typology = setup.get("typology", "commercial_office").lower().replace(" ", "_")
+        presets = load_presets()
+        preset = presets.get(typology, presets.get("commercial_office", {}))
+        
+        # 1. Base Dimensions
+        num_storeys = len(elevations) - 1
+        # Use manifest level_height as the true typical floor height.
+        # DO NOT derive from elevations[1]-elevations[0]: that is the first storey (often a
+        # tall lobby, e.g. 8400mm), which is NOT representative of the typical floor.
+        # When the wrong value is passed to get_stair_run_data, the Smart Detection there
+        # overrides it with min(heights) — causing all regular floors to be computed against
+        # the MINIMUM height (e.g. 3000mm), producing too many flights and low headroom.
+        _preset_typical = safe_num(preset.get("floor_heights", {}).get("typical", 0), 0)
+        _manifest_level_h = safe_num(setup.get("level_height", 0), 0)
+        if _manifest_level_h > 0:
+            typical_h_mm = _manifest_level_h
+        elif _preset_typical > 0:
+            typical_h_mm = _preset_typical
+        elif len(elevations) > 2:
+            typical_h_mm = round((elevations[2] - elevations[1]) * 304.8)  # skip lobby (floor 1)
+        else:
+            typical_h_mm = round((elevations[1] - elevations[0]) * 304.8) if len(elevations) > 1 else 4000
+        
+        # 2. Lift Requirements
         lifts_config = manifest.get("lifts", {})
+        num_lifts = lifts_config.get("count")
         shell = manifest.get("shell", {})
-        setup = manifest.get("project_setup", {})
-
-        num_storeys = int(safe_num(setup.get("levels", setup.get("storeys", 0)), 0))
-        if num_storeys == 0:
-            num_storeys = len(elevations) - 1
-
-        if not lifts_config and not shell.get("include_lifts") and num_storeys < 3:
-            # Re-check bridge registry before returning. If lifts exist, we MUST
-            # set the voids even if the manifest doesn't mention them.
-            registry_check = getattr(self, '_registry_cache', {})
-            has_lifts_in_model = any("LiftR" in tag for tag in registry_check)
-            if not has_lifts_in_model:
-                return None
-
-        # --- 1. Load presets ---
-        presets = load_presets()
-        typology = setup.get("typology", "commercial_office").lower().replace(" ", "_")
-        preset = presets.get(typology, presets.get("commercial_office", {}))
-        efficiency = preset.get("building_identity", {}).get("target_efficiency", 0.82)
-        load_factor = preset.get("program_requirements", {}).get("occupancy_load_factor", 10.0)
-        lift_size = lifts_config.get("size", preset.get("core_logic", {}).get("lift_shaft_size", [2500, 2500]))
+        _fw = safe_num(shell.get("width", 30000), 30000)
+        _fl_dim = safe_num(shell.get("length", 50000), 50000)
+        _occ_density = safe_num(lifts_config.get("occupancy_density", 0.1), 0.1)
+        _total_occ = max(100, (_fw * _fl_dim / 1e6) * _occ_density * num_storeys)
+        _auto_lifts = lift_logic.calculate_lift_requirements(num_storeys, typical_h_mm, _total_occ)
+        if num_lifts is None or num_lifts == "random":
+            num_lifts = _auto_lifts
+        else:
+            num_lifts = min(int(num_lifts), _auto_lifts)
+        num_lifts = int(num_lifts)
+        self._last_num_lifts = num_lifts # Cache for later
+        
         lobby_w = lifts_config.get("lobby_width", preset.get("core_logic", {}).get("lift_lobby_width", 3000))
-
-        # --- 2. Detect existing lift state from registry ---
-        registry = getattr(self, '_registry_cache', {})
-        doc = self.doc
-
-        # Find which levels ALREADY have lift walls (keyed by "AI_Level_N" tag).
-        # We detect by looking for the primary Front wall ID pattern.
-        # Supports both old (AI_LiftR1_L1_W_Front_B1) and new (AI_LiftR1__AI_Level_1__W_Front_B1) formats.
-        def _level_has_lift_wall(level_idx):
-            """Returns True if level N already has any lift wall in the registry."""
-            n = level_idx + 1  # 1-based
-            old_pattern = "_L{}_W_".format(n)
-            new_pattern = "__AI_Level_{}_".format(n)
-            for tag in registry:
-                if "LiftR" in tag and (old_pattern in tag or new_pattern in tag):
-                    return True
-            return False
-
-        existing_levels_with_lifts = set()
-        manifest_level_count = len(elevations)
-        for i in range(manifest_level_count):
-            if _level_has_lift_wall(i):
-                existing_levels_with_lifts.add(i)
-
-        # --- 3. Detect existing lift count and center_pos from registry ---
-        anchor_tag_new = "AI_LiftR1__AI_Level_1_W_Front"
-        anchor_tag_old = "AI_LiftR1_L1_W_Front"
-        has_existing = any(anchor_tag_new in tag or anchor_tag_old in tag for tag in registry)
-
-        existing_lift_count = None
-        existing_center_pos = None
-        if has_existing:
-            # Infer lift count from divider walls for level 1 ONLY.
-            # IMPORTANT: use "__AI_Level_1__" (double-underscore both sides) so we never
-            # match Level 10, 11 … 19 which all contain the substring "AI_Level_1".
-            row1_divs = sum(1 for tag in registry if "AI_LiftR1" in tag
-                           and ("__Div" in tag or "_Div" in tag)
-                           and ("__AI_Level_1__" in tag or "_L1_" in tag))
-            row2_divs = sum(1 for tag in registry if "AI_LiftR2" in tag
-                           and ("__Div" in tag or "_Div" in tag)
-                           and ("__AI_Level_1__" in tag or "_L1_" in tag))
-            has_row2 = any("AI_LiftR2" in tag for tag in registry)
-            r1 = row1_divs + 1  # 0 dividers = 1 lift
-            r2 = (row2_divs + 1) if has_row2 else 0
-            if r1 > 0:
-                existing_lift_count = r1 + r2
-
-            # IMPORTANT: read the back wall midpoint for Y, not the front wall,
-            # to correctly reconstruct the logical centre between the two rows.
-            # However the simplest and most stable approach is: always use [0, 0]
-            # (building centre) since we never move the core after creation.
-            # The front-wall-midpoint approach causes Y drift (front wall Y ≠ center_pos Y).
-            existing_center_pos = [0.0, 0.0]  # Always origin - building is centred there
-
-        # --- 4. Determine mode: edit vs expansion vs contraction ---
-        # If ALL levels already have lift walls → this is a floor-plate-edit, skip.
-        # If SOME levels are missing walls → this is an expansion, recalculate for full building.
-        # If registry has walls for levels BEYOND manifest_level_count → contraction.
-        is_expansion = len(existing_levels_with_lifts) < manifest_level_count
-
-        # Detect contraction: check if registry has lift walls for levels above the manifest count
-        max_existing_level = 0
-        for tag in registry:
-            if "LiftR" not in tag:
-                continue
-            for n in range(200, 0, -1):  # scan from high to low
-                if "__AI_Level_{}_".format(n) in tag or "_L{}_W_".format(n) in tag:
-                    if n > max_existing_level:
-                        max_existing_level = n
-                    break
-        is_contraction = max_existing_level > manifest_level_count
-
-        if is_contraction:
-            # Delete all lift walls for levels above manifest_level_count
-            self.log("Lift Core: Contraction detected — {} levels down to {}. Removing surplus walls.".format(
-                max_existing_level, manifest_level_count))
-            for tag, eid in list(registry.items()):
-                if "LiftR" not in tag:
-                    continue
-                for n in range(manifest_level_count + 1, max_existing_level + 1):
-                    if "__AI_Level_{}_".format(n) in tag or "_L{}_W_".format(n) in tag:
-                        try:
-                            el = doc.GetElement(eid)
-                            if el and el.IsValidObject:
-                                doc.Delete(el.Id)
-                        except:
-                            pass
-                        break
-            # Force full regeneration so lift count is recalculated for the smaller building
-            is_expansion = True
-
-        # --- 5. Determine num_lifts ---
-        # For floor-plate edits: lock count from registry (geometry must not change).
-        # For expansions: ALWAYS recalculate for the FULL building so every floor gets the right count.
-        total_occ = sum((w * l * efficiency / 1000000.0) / load_factor
-                        for w, l in floor_dims[:num_storeys])
-        avg_h = (elevations[-1] / num_storeys * 304.8) if num_storeys > 0 else 4000
-
-        num_lifts_raw = lifts_config.get("count")
-        if is_expansion:
-            # EXPANSION: recalculate for the full building regardless of what AI says
-            if num_lifts_raw and num_lifts_raw not in ["random", "auto", "calculated", None]:
-                num_lifts_val = int(safe_num(num_lifts_raw, 2))
-            else:
-                num_lifts_val = int(safe_num(
-                    lift_logic.calculate_lift_requirements(num_storeys, avg_h, total_occ), 2))
-        else:
-            # FLOOR-PLATE EDIT: 
-            # We recalculate to see if the new occupancy warrants a change.
-            calculated_lifts = int(safe_num(lift_logic.calculate_lift_requirements(num_storeys, avg_h, total_occ), 2))
-            
-            if num_lifts_raw and num_lifts_raw not in ["random", "auto", "calculated"]:
-                num_lifts_val = int(safe_num(num_lifts_raw, 2))
-            elif existing_lift_count is not None:
-                # If calculated count has changed significantly (+/- 1), allow update
-                # but default to existing for small variations to avoid 'shivering'.
-                if abs(calculated_lifts - existing_lift_count) >= 1:
-                    num_lifts_val = calculated_lifts
-                    # Trigger full regeneration since count changed
-                    is_expansion = True 
-                    levels_to_generate = list(range(manifest_level_count))
-                else:
-                    num_lifts_val = existing_lift_count
-            else:
-                num_lifts_val = calculated_lifts
-
-        layout = lift_logic.get_total_core_layout(num_lifts_val, lift_size, lobby_w)
-        # CONSISTENCY GUARD: layout may round up total_lifts for even
-        # distribution across blocks (e.g. 13 → 14 for 2 blocks of 7).
-        # Also catch cases where the final adjusted count doesn't match
-        # what's physically in the model — both scenarios require full
-        # regeneration so walls and voids stay in sync.
-        if layout['total_lifts'] != num_lifts_val:
-            self.log("Lift Core: Layout adjusted lift count {} -> {} for even block distribution.".format(
-                num_lifts_val, layout['total_lifts']))
-        num_lifts_val = layout['total_lifts']
-        self._last_num_lifts = num_lifts_val
         self._last_lobby_w = lobby_w
-        if not is_expansion and existing_lift_count is not None and existing_lift_count != num_lifts_val:
-            self.log("Lift Core: Final count {} != existing {} — forcing regeneration.".format(
-                num_lifts_val, existing_lift_count))
-            is_expansion = True
-            levels_to_generate = list(range(manifest_level_count))
-
-        # --- 6. Determine center_pos ---
-        center_pos = shell.get("position", [0.0, 0.0])
-        if existing_center_pos and not is_expansion:
-             center_pos = existing_center_pos
-        elif lifts_config.get("position"):
-             center_pos = lifts_config["position"]
-
-        # --- 7. Identify which levels need walls ---
-        # For floor-plate edits: only skip (all covered); never touch existing.
-        # For expansions: regenerate ALL levels so every floor has consistent lift count.
-        if is_expansion:
-            # ALL levels get regenerated — existing walls will be matched by ID and reused
-            # (no movement) if geometry is the same, or updated if lift count changed.
-            levels_to_generate = list(range(manifest_level_count))
-            self.log("Lift Core: Expansion detected — regenerating all {} levels with {} lifts.".format(
-                manifest_level_count, num_lifts_val))
-
-            # If lift count changed, the old walls have wrong geometry (different width / divider
-            # count). Silently delete them for every affected level so new walls are created clean
-            # instead of overlapping. The cleanup phase's LiftR-protection would otherwise keep
-            # these ghost walls indefinitely.
-            if existing_lift_count is not None and existing_lift_count != num_lifts_val:
-                self.log("Lift Core: Lift count changed {} → {}. Removing stale walls.".format(
-                    existing_lift_count, num_lifts_val))
-                stale_deleted = 0
-                stale_failed = 0
-                for tag, eid in list(registry.items()):
-                    if "LiftR" not in tag:
-                        continue
-                    for i in levels_to_generate:
-                        level_tag_new = "_AI_Level_{}_".format(i + 1)
-                        level_tag_old = "_L{}_".format(i + 1)
-                        if level_tag_new in tag or level_tag_old in tag:
-                            try:
-                                el = doc.GetElement(eid)
-                                if el and el.IsValidObject:
-                                    doc.Delete(el.Id)
-                                    stale_deleted += 1
-                                # Remove from registry so new walls get clean IDs
-                                if tag in registry:
-                                    del registry[tag]
-                            except Exception as del_err:
-                                stale_failed += 1
-                                self.log("Lift Core: FAILED to delete stale wall '{}': {}".format(tag, del_err))
-                            break
-                self.log("Lift Core: Stale wall cleanup: {} deleted, {} failed.".format(
-                    stale_deleted, stale_failed))
-                if stale_failed > 0:
-                    self.log("WARNING: {} stale lift walls could not be deleted. "
-                             "Voids may not align with remaining old walls. "
-                             "Run 'delete everything' and rebuild if misalignment persists.".format(stale_failed))
-        else:
-            # Should not reach here since is_expansion=False means all covered → already returned above
-            levels_to_generate = []
-
-        new_levels_data = []
-        for i in levels_to_generate:
-            lvl_name = "AI Level {}".format(i + 1)
-            elev_mm = elevations[i] * 304.8
-            if i + 1 < manifest_level_count:
-                wall_h = elevations[i + 1] * 304.8 - elev_mm
-            else:
-                wall_h = 5000.0
-            new_levels_data.append({"id": lvl_name, "elevation": elev_mm, "_height": wall_h})
-
-        if not new_levels_data:
-            # All levels already covered.  Update wall heights DIRECTLY on existing
-            # walls — do NOT inject into manifest["walls"] (avoids _process_granular_walls
-            # which can lose walls via Revit's failure-preprocessor during commit).
-            self.log("Lift Core: All levels covered — direct height sync on existing walls.")
-
-            # 1. Compute target height (feet) per level index
-            level_heights_ft = {}
-            for i in range(manifest_level_count):
-                if i + 1 < manifest_level_count:
-                    level_heights_ft[i] = elevations[i + 1] - elevations[i]  # already feet
-                else:
-                    level_heights_ft[i] = mm_to_ft(5000)  # top-cap overrun
-
-            # 2. Walk every LiftR wall in the registry, update its height, register it
-            core_xs, core_ys = [], []
-            for tag, eid in registry.items():
-                if "LiftR" not in tag:
-                    continue
-                wall = doc.GetElement(eid)
-                if not wall:
-                    continue
-
-                # Determine which level this wall belongs to
-                for lvl_idx in range(manifest_level_count):
-                    level_pattern = "__AI_Level_{}_".format(lvl_idx + 1)
-                    if level_pattern in tag:
-                        target_h = level_heights_ft.get(lvl_idx)
-                        if target_h and isinstance(wall, DB.Wall):
-                            try:
-                                p_top = wall.get_Parameter(DB.BuiltInParameter.WALL_HEIGHT_TYPE)
-                                if p_top:
-                                    p_top.Set(DB.ElementId.InvalidElementId)
-                                p_h = wall.get_Parameter(DB.BuiltInParameter.WALL_USER_HEIGHT_PARAM)
-                                if p_h:
-                                    p_h.Set(target_h)
-                            except:
-                                pass
-                        break  # found the level, stop searching
-
-                # Register in results so cleanup never deletes it
-                if results is not None:
-                    results["elements"].append(str(eid.Value))
-
-                # Collect bounds for core_bounds / column culling
-                if isinstance(wall, DB.Wall) and "_W_" in tag:
-                    try:
-                        loc = wall.Location.Curve
-                        core_xs.extend([loc.GetEndPoint(0).X, loc.GetEndPoint(1).X])
-                        core_ys.extend([loc.GetEndPoint(0).Y, loc.GetEndPoint(1).Y])
-                    except:
-                        pass
-
-            # 3. Compute per-shaft voids using ACTUAL wall-geometry center.
-            #    This ensures voids always align with real wall positions.
-            #    NOTE: This reuse path only runs when existing_lift_count == num_lifts_val
-            #    (the layout-mismatch guard above forces regeneration otherwise).
-            if core_xs:
-                actual_cx_mm = ft_to_mm((min(core_xs) + max(core_xs)) / 2.0)
-                actual_cy_mm = ft_to_mm((min(core_ys) + max(core_ys)) / 2.0)
-                void_center = [actual_cx_mm, actual_cy_mm]
-            else:
-                void_center = center_pos
-
-            # FIX: Use existing_lift_count for void computation in the reuse path,
-            # since the physical walls were built for that count.  Re-derive the
-            # layout from the EXISTING count so block dimensions match the walls.
-            reuse_lift_count = existing_lift_count if existing_lift_count else num_lifts_val
-            reuse_layout = lift_logic.get_total_core_layout(reuse_lift_count, lift_size, lobby_w)
-            self.log("Lift Core: Reuse path — computing voids for {} lifts (existing={}, adjusted={})".format(
-                reuse_lift_count, existing_lift_count, num_lifts_val))
-
-            shaft_voids_ft = []
-            remaining_h = reuse_layout['total_lifts']
-            for b_idx in range(reuse_layout['num_blocks']):
-                b_lifts = min(remaining_h, reuse_layout['lifts_per_block'])
-                remaining_h -= b_lifts
-                b_y_offset = lift_logic.get_block_y_offset(b_idx, reuse_layout['num_blocks'], reuse_layout['block_d'])
-                b_center = [void_center[0], void_center[1] + b_y_offset]
-                for (x1, y1, x2, y2) in lift_logic.get_shaft_void_rectangles_mm(
-                        b_lifts, b_center, lift_size, lobby_w):
-                    shaft_voids_ft.append((mm_to_ft(x1), mm_to_ft(y1), mm_to_ft(x2), mm_to_ft(y2)))
-            self._shaft_voids = shaft_voids_ft
-
-            if core_xs:
-                return (min(core_xs), min(core_ys), max(core_xs), max(core_ys))
-            return None
-
-        # --- 7. Generate walls ONLY for new levels ---
-        lift_walls = []
-        remaining_lifts = num_lifts_val
-        for b_idx in range(layout['num_blocks']):
-            b_lifts = min(remaining_lifts, layout['lifts_per_block'])
-            remaining_lifts -= b_lifts
-
-            b_y_offset = lift_logic.get_block_y_offset(b_idx, layout['num_blocks'], layout['block_d'])
-            b_center_pos = [center_pos[0], center_pos[1] + b_y_offset]
-
-            b_manifest = lift_logic.generate_lift_shaft_manifest(
-                b_lifts, new_levels_data,
-                center_pos=b_center_pos,
-                internal_size=lift_size,
-                lobby_width=lobby_w
-            )
-            for w in b_manifest.get("walls", []):
-                w['id'] = "{}_B{}".format(w['id'], b_idx + 1)
-                lift_walls.append(w)
-
-            for f in b_manifest.get("floors", []):
-                f['id'] = "{}_B{}".format(f['id'], b_idx + 1)
-                if "floors" not in manifest:
-                    manifest["floors"] = []
-                manifest["floors"].append(f)
-
-        # --- 8. Inject new walls into manifest for granular processing ---
-        if "walls" not in manifest:
-            manifest["walls"] = []
-        manifest["walls"].extend(lift_walls)
-
-        # Per-shaft voids (one per lift car, sized to inner wall line)
-        # IMPORTANT: Use the SAME center_pos and num_lifts_val as wall generation
-        # to guarantee voids align perfectly with the walls being created.
-        shaft_voids_ft = []
-        remaining_lifts2 = num_lifts_val
-        for b_idx in range(layout['num_blocks']):
-            b_lifts = min(remaining_lifts2, layout['lifts_per_block'])
-            remaining_lifts2 -= b_lifts
-            b_y_offset = lift_logic.get_block_y_offset(b_idx, layout['num_blocks'], layout['block_d'])
-            b_center_pos2 = [center_pos[0], center_pos[1] + b_y_offset]
-            for (x1, y1, x2, y2) in lift_logic.get_shaft_void_rectangles_mm(
-                    b_lifts, b_center_pos2, lift_size, lobby_w):
-                shaft_voids_ft.append((mm_to_ft(x1), mm_to_ft(y1), mm_to_ft(x2), mm_to_ft(y2)))
-        self._shaft_voids = shaft_voids_ft
-        self.log("Lift Core: {} shaft voids computed for {} lifts at center ({:.0f}, {:.0f}).".format(
-            len(shaft_voids_ft), num_lifts_val, center_pos[0], center_pos[1]))
-
-        self.log("Lift Core: {} new walls injected for {} new levels.".format(
-            len(lift_walls), len(new_levels_data)))
-        # Store summary for detailed progress reporting
-        core_dims = lift_logic.get_core_dimensions(num_lifts_val, lift_size, lobby_w)
-        self._lift_summary = {
-            "count": num_lifts_val,
-            "shaft_w": lift_size[0], "shaft_h": lift_size[1],
-            "lobby_w": lobby_w,
-            "core_w": core_dims[0], "core_d": core_dims[1],
-            "levels": manifest_level_count,
-        }
-        if self.tracker:
-            self.tracker.record_created("lifts", num_lifts_val)
-            self.tracker.record_created("walls", len(lift_walls))
-
-        # --- 9. Compute core_bounds in feet for column culling (from all lift walls) ---
-        #    Store as INDIVIDUAL exclusion zone (just the lift core).
-        #    Staircases get their own zones later — merging into one giant bbox
-        #    would cull too many interior columns.
-        all_wall_bounds_xs, all_wall_bounds_ys = [], []
-        for w in lift_walls:
-            all_wall_bounds_xs.extend([mm_to_ft(w['start'][0]), mm_to_ft(w['end'][0])])
-            all_wall_bounds_ys.extend([mm_to_ft(w['start'][1]), mm_to_ft(w['end'][1])])
-        # Also include existing walls in bounds
-        for tag, eid in registry.items():
-            if "LiftR" in tag and "_W_" in tag:
-                wobj = doc.GetElement(eid)
-                if wobj and isinstance(wobj, DB.Wall):
-                    try:
-                        loc = wobj.Location.Curve
-                        all_wall_bounds_xs.extend([loc.GetEndPoint(0).X, loc.GetEndPoint(1).X])
-                        all_wall_bounds_ys.extend([loc.GetEndPoint(0).Y, loc.GetEndPoint(1).Y])
-                    except: pass
-        lift_bbox_ft = None
-        if all_wall_bounds_xs:
-            lift_bbox_ft = (min(all_wall_bounds_xs), min(all_wall_bounds_ys),
-                            max(all_wall_bounds_xs), max(all_wall_bounds_ys))
-            # Store UNBUFFERED lift core bounds for grid line alignment
-            # (grid lines should align with the actual core wall, not a buffer)
-            self._lift_core_bounds_ft = lift_bbox_ft
-            # Initialize individual exclusion zones list (lift core only for now)
-            # Buffer the exclusion zone by 500mm so columns don't land at core walls
-            _buf = mm_to_ft(500)
-            self._core_exclusion_zones = [(
-                lift_bbox_ft[0] - _buf, lift_bbox_ft[1] - _buf,
-                lift_bbox_ft[2] + _buf, lift_bbox_ft[3] + _buf,
-            )]
-        else:
-            self._lift_core_bounds_ft = None
-            self._core_exclusion_zones = []
-        return lift_bbox_ft
-
-    def _expand_staircases_in_manifest(self, manifest, current_levels, elevations,
-                                        floor_dims, core_bounds_ft,
-                                        affected_elements=[], results=None):
-        """Generate staircase walls, inject into manifest, compute voids.
-
-        Called right after _expand_lifts_in_manifest in Phase 2.
-        Returns updated core_bounds (feet) that includes staircase footprints.
-        """
-        import Autodesk.Revit.DB as DB  # type: ignore
-        setup = manifest.get("project_setup", {})
-
-        num_storeys = int(safe_num(setup.get("levels", setup.get("storeys", 0)), 0))
-        if num_storeys == 0:
-            num_storeys = len(elevations) - 1
-        if num_storeys < 2:
-            # Re-check bridge registry. If staircases exist, we MUST
-            # set the voids even for 1-storey edits to avoid losing them.
-            registry_check = getattr(self, '_registry_cache', {})
-            has_stairs_in_model = any("Stair_" in tag for tag in registry_check)
-            if not has_stairs_in_model:
-                return core_bounds_ft
-
-        # --- 1. Load presets ---
-        presets = load_presets()
-        typology = setup.get("typology", "commercial_office").lower().replace(" ", "_")
-        preset = presets.get(typology, presets.get("commercial_office", {}))
+        
+        # 3. Fire Safety & Staircase Spec
         preset_fs = preset.get("core_logic", {}).get("fire_safety", {})
-
-        p_num_stairs = preset_fs.get("fire_escape_staircases", 2)
-        p_stair_spec = preset_fs.get("staircase_spec", {})
-        max_travel = safe_num(preset_fs.get("max_travel_distance", 60000), 60000)
-
-        # --- 2. Manifest overrides ---
-        m_stair = manifest.get("staircases", {})
-        num_stairs = int(safe_num(m_stair.get("count", p_num_stairs), p_num_stairs))
-        num_stairs = max(num_stairs, 2)  # Rule (a): always at least 2
-
-        stair_spec = p_stair_spec.copy()
-        m_spec = m_stair.get("spec", {})
+        stair_spec = preset_fs.get("staircase_spec", {}).copy()
+        m_stair_config = manifest.get("staircases", {})
+        m_spec = m_stair_config.get("spec", {})
         for k in ["riser", "tread", "width_of_flight", "landing_width"]:
-            if k in m_spec:
-                stair_spec[k] = safe_num(m_spec[k], stair_spec.get(k))
+            if k in m_spec: stair_spec[k] = safe_num(m_spec[k], stair_spec.get(k))
+        self._stair_spec = stair_spec
 
-        # --- 3. Derive lift-core geometry in mm ---
-        core_center_mm = (0.0, 0.0)
-        lift_core_bounds_mm = None
-        lift_core_width_mm = 0.0
-
-        if core_bounds_ft:
-            lift_core_bounds_mm = (
-                ft_to_mm(core_bounds_ft[0]),
-                ft_to_mm(core_bounds_ft[1]),
-                ft_to_mm(core_bounds_ft[2]),
-                ft_to_mm(core_bounds_ft[3]),
-            )
-            lift_core_width_mm = lift_core_bounds_mm[2] - lift_core_bounds_mm[0]
-            core_center_mm = (
-                (lift_core_bounds_mm[0] + lift_core_bounds_mm[2]) / 2.0,
-                (lift_core_bounds_mm[1] + lift_core_bounds_mm[3]) / 2.0,
-            )
-
-        # --- 4. Typical floor height for shaft sizing ---
-        # Use the manifest's standard level_height (before overrides) —
-        # this is the TYPICAL storey, not the first (which is often
-        # taller).  Tall storeys get more flights, not longer flights.
-        manifest_level_h = safe_num(setup.get("level_height", 0), 0)
-        if manifest_level_h > 0:
-            typical_h_mm = manifest_level_h  # already in mm
-        else:
-            # Fallback: find the most common storey height
-            if len(elevations) >= 3:
-                storey_heights = []
-                for ei in range(len(elevations) - 1):
-                    sh = elevations[ei + 1] - elevations[ei]
-                    if sh > 0:
-                        storey_heights.append(round(sh * 304.8))
-                if storey_heights:
-                    # Mode — most common value
-                    typical_h_mm = float(max(set(storey_heights),
-                                             key=storey_heights.count))
-                else:
-                    typical_h_mm = 4000.0
-            elif len(elevations) >= 2:
-                typical_h_mm = (elevations[1] - elevations[0]) * 304.8
-            else:
-                typical_h_mm = 4000.0
-        self.log("Staircases: typical_h_mm={:.0f}".format(typical_h_mm))
-
-        # --- 5. Calculate positions [rules a-f] ---
-        num_lifts = getattr(self, '_last_num_lifts', None)
-        lobby_width = getattr(self, '_last_lobby_w', preset.get("core_logic", {}).get("lift_lobby_width", 3000))
-        positions = staircase_logic.calculate_staircase_positions(
-            floor_dims, core_center_mm, lift_core_bounds_mm,
-            typical_h_mm, stair_spec, max_travel,
-            num_lifts=num_lifts, lobby_width=lobby_width
-        )
-        # Enforce minimum from manifest count
-        if len(positions) < num_stairs and lift_core_bounds_mm:
-            _, shaft_d = staircase_logic.get_shaft_dimensions(typical_h_mm, stair_spec)
-            cx, cy = core_center_mm
-            # Add extra staircases at X-ends of core
-            extra_x_offset = lift_core_width_mm / 2.0 + shaft_d / 2.0 + 1000
-            extra_positions = [
-                (cx - extra_x_offset, cy),
-                (cx + extra_x_offset, cy),
-            ]
-            for ep in extra_positions:
-                if len(positions) >= num_stairs:
-                    break
-                positions.append(ep)
-
-        self.log("Staircases: {} positions calculated.".format(len(positions)))
-
-        # --- 6. Build levels_data for staircase_logic ---
-        levels_data = []
-        for i, elev_ft in enumerate(elevations):
-            levels_data.append({
-                "id": "AI Level {}".format(i + 1),
-                "elevation": elev_ft * 304.8,  # convert feet -> mm
-            })
-
-        # --- 7. Enclosure dimensions (fixed for all levels) ---
-        # Enclosure width = staircase shaft width (walls butt against stairs)
-        shaft_w_nat = staircase_logic.get_shaft_dimensions(typical_h_mm, stair_spec)[0]
-        enc_w = shaft_w_nat
-        enc_d = staircase_logic.get_max_shaft_depth(levels_data, stair_spec,
-                                                      typical_floor_height_mm=typical_h_mm)
-        typical_h = typical_h_mm
-        self._stair_run_data = staircase_logic.get_stair_run_data(
-            positions, levels_data, enc_w, stair_spec, typical_h, lift_core_bounds_mm,
-            floor_dims_mm=floor_dims, num_lifts=num_lifts, lobby_width=lobby_width
-        )
-
-        # --- 8. Generate manifest ---
-        stair_manifest = staircase_logic.generate_staircase_manifest(
-            positions, levels_data, enc_w, stair_spec,
-            typical_floor_height_mm=typical_h_mm,
-            lift_core_bounds_mm=lift_core_bounds_mm,
-            floor_dims_mm=floor_dims,
-            num_lifts=num_lifts, lobby_width=lobby_width
+        # 4. Calculate Unified Layout
+        f_center_mm = [0.0, 0.0] # Assume centered for building generator
+        
+        # Determine passenger lift bounds first for anchor
+        layout_lifts = lift_logic.get_total_core_layout(num_lifts, lobby_width=lobby_w)
+        lift_core_bounds_mm = (
+            f_center_mm[0] - layout_lifts["total_w"]/2, 
+            f_center_mm[1] - layout_lifts["total_d"]/2,
+            f_center_mm[0] + layout_lifts["total_w"]/2,
+            f_center_mm[1] + layout_lifts["total_d"]/2
         )
         
-        # Catch Spatial Conflicts
-        if isinstance(stair_manifest, dict) and stair_manifest.get("status") == "CONFLICT":
-            return stair_manifest
+        safety_sets = fire_safety_logic.calculate_fire_safety_requirements(
+            floor_dims, f_center_mm, lift_core_bounds_mm, 
+            typical_h_mm, preset_fs, num_lifts, lobby_w
+        )
+        
+        # 5. Build Manifest Data
+        levels_manifest = []
+        for i, elev_ft in enumerate(elevations):
+            levels_manifest.append({"id": "AI Level {}".format(i+1), "elevation": elev_ft * 304.8})
             
-        stair_walls = stair_manifest.get("walls", [])
-        stair_floors = stair_manifest.get("floors", [])
+        unified_man = fire_safety_logic.generate_fire_safety_manifest(
+            safety_sets, levels_manifest, stair_spec, typical_h_mm, preset_fs, lift_core_bounds_mm, num_lifts, lobby_w
+        )
+        
+        if isinstance(unified_man, dict) and unified_man.get("status") == "CONFLICT":
+            return unified_man
 
-        # --- 9. Delete ALL previous staircase walls/floors ---
-        # Always delete and recreate: staircase positions can change
-        # when the lift core resizes (e.g. 5→50 storeys), making old
-        # walls at old positions invalid.  Keeping them causes missing
-        # walls because _process_granular_walls fails to move them.
-        doc = self.doc
-        registry = getattr(self, '_registry_cache', {})
-        for tag, eid in list(registry.items()):
-            if "Stair_" not in tag:
-                continue
-            try:
-                el = doc.GetElement(eid)
-                if el and el.IsValidObject:
-                    doc.Delete(el.Id)
-                # Remove from registry so _process_granular_walls creates fresh
-                del registry[tag]
-            except:
-                pass
+        # 5.5 Precise Spatial Reservation + Column Exclusion Zones
+        # Use individual sub-boundary rects (not the merged core bounding rect) so
+        # the column-exclusion logic culls only columns that actually fall inside a
+        # core element — not everything inside the huge L-shaped merged bounding box.
+        sub_bounds = unified_man.get("sub_boundaries", [])
 
-        # --- 10. Inject into manifest for granular processing ---
-        if "walls" not in manifest:
-            manifest["walls"] = []
-        manifest["walls"].extend(stair_walls)
+        # Build per-element column exclusion zones (in ft) — pax lift core + every
+        # fire-safety sub-boundary.  This replaces the old single merged rect that
+        # wrongly excluded all internal columns when the layout had an L-shape.
+        _excl = []
+        _excl.append((
+            mm_to_ft(lift_core_bounds_mm[0]), mm_to_ft(lift_core_bounds_mm[1]),
+            mm_to_ft(lift_core_bounds_mm[2]), mm_to_ft(lift_core_bounds_mm[3])
+        ))
+        if sub_bounds:
+            for sb in sub_bounds:
+                rect = sb["rect"]
+                res_id = sb["id"]
+                _excl.append((mm_to_ft(rect[0]), mm_to_ft(rect[1]),
+                               mm_to_ft(rect[2]), mm_to_ft(rect[3])))
+                res, conflict = self.spatial_registry.reserve(res_id, (rect[0], rect[1], 0, rect[2], rect[3], typical_h_mm))
+                if not res:
+                    return {
+                        "status": "CONFLICT",
+                        "type": "GEOMETRIC_INTERFERENCE",
+                        "description": "Spatial Conflict detected in Central Core: '{}' overlaps with '{}'".format(res_id, conflict)
+                    }
+        else:
+            for i, cb in enumerate(unified_man.get("core_bounds", [])):
+                res_id = "Core_Set_{}".format(i)
+                self.spatial_registry.reserve(res_id, (cb[0], cb[1], 0, cb[2], cb[3], typical_h_mm))
+                _excl.append((mm_to_ft(cb[0]), mm_to_ft(cb[1]), mm_to_ft(cb[2]), mm_to_ft(cb[3])))
 
-        if "floors" not in manifest:
-            manifest["floors"] = []
-        manifest["floors"].extend(stair_floors)
+        self._core_exclusion_zones = _excl
+        # Lift-core bounds for column grid axis computation
+        self._lift_core_bounds_ft = _excl[0]
 
-        self.log("Staircases: {} walls, {} floors injected.".format(
-            len(stair_walls), len(stair_floors)))
-        # Store summary for detailed progress reporting
-        from revit_mcp import staircase_logic as _sc
-        _rpf = _sc._risers_per_flight_typical(typical_h_mm, stair_spec.get("riser", 150))
-        _num_flights_typical = _sc._calc_num_flights(typical_h_mm, typical_h_mm, stair_spec.get("riser", 150))
+        # 6. Inject into Build Pipeline
+        if "walls" not in manifest: manifest["walls"] = []
+        manifest["walls"].extend(unified_man.get("walls", []))
+        
+        if "floors" not in manifest: manifest["floors"] = []
+        manifest["floors"].extend(unified_man.get("floors", []))
+        
+        # ── Passenger Lift Shaft Walls (previously missing!) ──────────────────
+        # generate_lift_shaft_manifest produces the structural walls, internal
+        # dividers, and top-cap slabs for every passenger lift shaft. These are
+        # the actual lift car enclosure walls visible in plan and section.
+        try:
+            psgr_man = lift_logic.generate_lift_shaft_manifest(
+                num_lifts,
+                levels_manifest,
+                center_pos=(f_center_mm[0], f_center_mm[1]),
+                lobby_width=lobby_w
+            )
+            manifest["walls"].extend(psgr_man.get("walls", []))
+            manifest["floors"].extend(psgr_man.get("floors", []))
+            self.log("Passenger lift shaft: {} walls, {} floors generated.".format(
+                len(psgr_man.get("walls", [])), len(psgr_man.get("floors", []))))
+        except Exception as _psgr_e:
+            self.log("Passenger lift shaft generation failed (non-fatal): {}".format(_psgr_e))
+
+        # Voids
+        u_voids_ft = []
+        for (vx1, vy1, vx2, vy2) in unified_man.get("voids", []):
+            u_voids_ft.append((mm_to_ft(vx1), mm_to_ft(vy1), mm_to_ft(vx2), mm_to_ft(vy2)))
+        # Also add passenger lift shaft voids for floor slab cutouts
+        try:
+            psgr_void_rects = lift_logic.get_shaft_void_rectangles_mm(
+                num_lifts, center_pos=(f_center_mm[0], f_center_mm[1]), lobby_width=lobby_w
+            )
+            for (vx1, vy1, vx2, vy2) in psgr_void_rects:
+                u_voids_ft.append((mm_to_ft(vx1), mm_to_ft(vy1), mm_to_ft(vx2), mm_to_ft(vy2)))
+        except Exception as _pv_e:
+            self.log("Passenger lift void rects failed (non-fatal): {}".format(_pv_e))
+        self._stair_voids = u_voids_ft
+        
+        # Combined Bounds (ft)
+        bounds_ft = None
+        for cb in unified_man.get("core_bounds", []):
+            cb_ft = (mm_to_ft(cb[0]), mm_to_ft(cb[1]), mm_to_ft(cb[2]), mm_to_ft(cb[3]))
+            if bounds_ft is None:
+                bounds_ft = cb_ft
+            else:
+                bounds_ft = (min(bounds_ft[0], cb_ft[0]), min(bounds_ft[1], cb_ft[1]),
+                             max(bounds_ft[2], cb_ft[2]), max(bounds_ft[3], cb_ft[3]))
+        
+        # 7. Prepare Stair Run Data (Required for internal staircase geometry)
+        # Use the true staircase shaft centres returned by generate_fire_safety_manifest.
+        # safety_set["pos"] is the entry point at the lift-core boundary, NOT the shaft
+        # centre — using it directly places stair runs inside the lift core.
+        stair_center_data = unified_man.get("stair_centers", [])
+        if stair_center_data:
+            positions = [(sc[0], sc[1]) for sc in stair_center_data]
+            rotated_indices = [idx for idx, sc in enumerate(stair_center_data) if sc[2]]
+        else:
+            positions = [s["pos"] for s in safety_sets]
+            rotated_indices = [idx for idx, s in enumerate(safety_sets) if s.get("rotated")]
+        shaft_w_nat = staircase_logic.get_shaft_dimensions(typical_h_mm, stair_spec)[0]
+        enc_w = shaft_w_nat
+        
+        stair_overrides = unified_man.get("stair_overrides", [])
+        
+        self._stair_run_data = staircase_logic.get_stair_run_data(
+            positions, levels_manifest, enc_w, stair_spec, typical_h_mm, lift_core_bounds_mm,
+            floor_dims_mm=floor_dims, num_lifts=num_lifts, lobby_width=lobby_w,
+            rotated_indices=rotated_indices, base_y_overrides=stair_overrides
+        )
+        
+        # Summary for tracker
         self._stair_summary = {
             "count": len(positions),
-            "enc_w": enc_w, "enc_d": enc_d,
             "riser": stair_spec.get("riser", 150),
-            "tread": stair_spec.get("tread", 300),
-            "flight_width": stair_spec.get("width_of_flight", 1500),
-            "risers_per_flight": _rpf,
-            "flights_typical": _num_flights_typical,
+            "tread": stair_spec.get("tread", 280),
             "typical_h": typical_h_mm,
+            "flights_typical": staircase_logic._calc_num_flights(typical_h_mm, typical_h_mm, 150),
+            "risers_per_flight": staircase_logic._risers_per_flight_typical(typical_h_mm, 150)
         }
-        if self.tracker:
-            self.tracker.record_created("staircases", len(positions))
-            self.tracker.record_created("walls", len(stair_walls))
-            self.tracker.record_created("floors", len(stair_floors))
-
-        # --- 11. Compute staircase void rectangles [rule h] ---
-        # Staircase voids are stored separately so they can be SKIPPED
-        # on the 1st floor (no basement = no void needed at ground level).
-        stair_voids_mm = staircase_logic.get_void_rectangles_mm(
-            positions, enc_w, enc_d
-        )
-        stair_voids_ft = []
-        for (x1, y1, x2, y2) in stair_voids_mm:
-            stair_voids_ft.append((mm_to_ft(x1), mm_to_ft(y1),
-                                   mm_to_ft(x2), mm_to_ft(y2)))
-        self._stair_voids = stair_voids_ft
-
-        # --- 12. Store stair-run geometry + spec for Phase 5.5 ---
-        self._stair_run_data = staircase_logic.get_stair_run_data(
-            positions, levels_data, enc_w, stair_spec,
-            typical_floor_height_mm=typical_h_mm,
-            floor_dims_mm=floor_dims,
-            num_lifts=num_lifts, lobby_width=lobby_width
-        )
-        stair_spec['_typical_h'] = typical_h_mm
-        stair_spec['_rpf'] = staircase_logic._risers_per_flight_typical(
-            typical_h_mm, stair_spec.get("riser", 150))
-        self._stair_spec = stair_spec  # pass preset spec to _create_stair_runs
-        self.log("Staircases: {} stair runs queued.".format(
-            len(self._stair_run_data)))
-
-        # --- 13. Update core exclusion zones with INDIVIDUAL staircase footprints ---
-        #    Each staircase gets its own exclusion zone. We no longer merge into
-        #    one giant bbox because that culls all interior columns when staircases
-        #    are placed at building corners (60 m rule).
-        if not hasattr(self, '_core_exclusion_zones'):
-            self._core_exclusion_zones = []
-            if core_bounds_ft:
-                self._core_exclusion_zones.append(core_bounds_ft)
-
-        # Add each staircase void as an individual exclusion zone,
-        # buffered by offset_from_edge (500mm) so columns don't land
-        # right at staircase walls.
-        stair_voids_for_cols = getattr(self, '_stair_voids', [])
-        _buf = mm_to_ft(500)
-        for void_ft in stair_voids_for_cols:
-            self._core_exclusion_zones.append((
-                void_ft[0] - _buf, void_ft[1] - _buf,
-                void_ft[2] + _buf, void_ft[3] + _buf,
-            ))
-
-        # Still return a merged bbox for backward compat (used by staircase positioning)
-        if stair_walls:
-            s_xs = [w['start'][0] for w in stair_walls] + \
-                   [w['end'][0] for w in stair_walls]
-            s_ys = [w['start'][1] for w in stair_walls] + \
-                   [w['end'][1] for w in stair_walls]
-            stair_bounds_ft = (
-                mm_to_ft(min(s_xs)), mm_to_ft(min(s_ys)),
-                mm_to_ft(max(s_xs)), mm_to_ft(max(s_ys)),
-            )
-            if core_bounds_ft:
-                core_bounds_ft = (
-                    min(core_bounds_ft[0], stair_bounds_ft[0]),
-                    min(core_bounds_ft[1], stair_bounds_ft[1]),
-                    max(core_bounds_ft[2], stair_bounds_ft[2]),
-                    max(core_bounds_ft[3], stair_bounds_ft[3]),
-                )
-            else:
-                core_bounds_ft = stair_bounds_ft
-
-        return core_bounds_ft
-
+        
+        return bounds_ft
 
     def _build_dogleg_in_scope(self, doc, stair_id, rd, base_lvl, current_levels,
                               tread_ft, hw, landing_ft, spec_riser_mm, spec_tread_mm,
@@ -2265,30 +1771,56 @@ class RevitWorkers:
         f1_cx = mm_to_ft(f1_data['start'][0])
         f2_cx = mm_to_ft(f2_data['start'][0])
         flight_y_start_ft = mm_to_ft(f1_data['start'][1])
-        land_x_left = f1_cx - hw
-        land_x_right = f2_cx + hw
+
+        # Detect 180-degree rotation: after rotation f1 goes in -Y direction (south).
+        # Use min/max so left/right X is correct regardless of which flight rotated to which side.
+        f1_y_end = mm_to_ft(f1_data['end'][1])
+        is_rotated = (f1_y_end < flight_y_start_ft)
+        left_cx  = min(f1_cx, f2_cx)
+        right_cx = max(f1_cx, f2_cx)
+        land_x_left  = left_cx  - hw
+        land_x_right = right_cx + hw
 
         current_base_z = base_z
+
+        # Shaft back wall (far side from flight_y_start).
+        # f1_y_end is the flight-zone end (already rotated); adding dyn_landing_ft
+        # gives the inner face of the shaft back wall.  Pinning mid-landing to this
+        # constant ensures no gap regardless of per-pair riser count.
+        if is_rotated:
+            shaft_back_y = f1_y_end - dyn_landing_ft
+        else:
+            shaft_back_y = f1_y_end + dyn_landing_ft
+
         pair_idx = 0
         while pair_idx < num_pairs and pair_idx * 2 + 1 < len(flight_list):
             a_risers = flight_list[pair_idx * 2]
             b_risers = flight_list[pair_idx * 2 + 1]
 
-            # Run A
+            # Run A — direction depends on rotation
             a_run_len = max(a_risers - 1, 1) * tread_ft
             p_as = DB.XYZ(f1_cx, flight_y_start_ft, current_base_z)
-            p_ae = DB.XYZ(f1_cx, flight_y_start_ft + a_run_len, current_base_z)
+            if is_rotated:
+                p_ae = DB.XYZ(f1_cx, flight_y_start_ft - a_run_len, current_base_z)
+            else:
+                p_ae = DB.XYZ(f1_cx, flight_y_start_ft + a_run_len, current_base_z)
             _StairsRun.CreateStraightRun(doc, stair_id, DB.Line.CreateBound(p_as, p_ae), _StairsRunJust.Center)
 
             mid_z = current_base_z + a_risers * riser_h_ft
 
-            # Mid landing
-            land_y_bot = flight_y_start_ft + a_run_len
-            land_y_top = land_y_bot + dyn_landing_ft
-            lp1 = DB.XYZ(land_x_left, land_y_bot, mid_z)
+            # Mid landing — spans from Run A end to the shaft back wall.
+            # For pairs with fewer risers, Run A ends short of the max-riser flight zone;
+            # extending to shaft_back_y fills the gap so no void appears at the back wall.
+            if is_rotated:
+                land_y_top = flight_y_start_ft - a_run_len  # near edge = end of Run A
+                land_y_bot = shaft_back_y                   # far edge = shaft back wall
+            else:
+                land_y_bot = flight_y_start_ft + a_run_len  # near edge = end of Run A
+                land_y_top = shaft_back_y                   # far edge = shaft back wall
+            lp1 = DB.XYZ(land_x_left,  land_y_bot, mid_z)
             lp2 = DB.XYZ(land_x_right, land_y_bot, mid_z)
             lp3 = DB.XYZ(land_x_right, land_y_top, mid_z)
-            lp4 = DB.XYZ(land_x_left, land_y_top, mid_z)
+            lp4 = DB.XYZ(land_x_left,  land_y_top, mid_z)
             mid_loop = DB.CurveLoop()
             mid_loop.Append(DB.Line.CreateBound(lp1, lp2))
             mid_loop.Append(DB.Line.CreateBound(lp2, lp3))
@@ -2296,20 +1828,38 @@ class RevitWorkers:
             mid_loop.Append(DB.Line.CreateBound(lp4, lp1))
             _StairsLanding.CreateSketchedLanding(doc, stair_id, mid_loop, mid_z - base_z)
 
-            # Run B
+            # Run B — returns toward the starting side from where Run A ended
             b_run_len = max(b_risers - 1, 1) * tread_ft
             top_z = mid_z + b_risers * riser_h_ft
-            p_bs = DB.XYZ(f2_cx, flight_y_start_ft + a_run_len, mid_z)
-            p_be = DB.XYZ(f2_cx, flight_y_start_ft + a_run_len - b_run_len, mid_z)
+            if is_rotated:
+                p_bs = DB.XYZ(f2_cx, flight_y_start_ft - a_run_len, mid_z)
+                p_be = DB.XYZ(f2_cx, flight_y_start_ft - a_run_len + b_run_len, mid_z)
+            else:
+                p_bs = DB.XYZ(f2_cx, flight_y_start_ft + a_run_len, mid_z)
+                p_be = DB.XYZ(f2_cx, flight_y_start_ft + a_run_len - b_run_len, mid_z)
             _StairsRun.CreateStraightRun(doc, stair_id, DB.Line.CreateBound(p_bs, p_be), _StairsRunJust.Center)
 
-            # Intermediate landing
+            # Intermediate landing — connects Run B end to next pair's Run A start.
+            # When b_risers < a_risers, Run B ends short of flight_y_start; the landing
+            # is extended to cover that gap so the near-side shaft wall has no void.
             if pair_idx < num_pairs - 1:
                 inter_z = top_z
-                il1 = DB.XYZ(land_x_left, flight_y_start_ft - dyn_landing_ft, inter_z)
-                il2 = DB.XYZ(land_x_right, flight_y_start_ft - dyn_landing_ft, inter_z)
-                il3 = DB.XYZ(land_x_right, flight_y_start_ft, inter_z)
-                il4 = DB.XYZ(land_x_left, flight_y_start_ft, inter_z)
+                if is_rotated:
+                    # Run B ends at: flight_y_start_ft - a_run_len + b_run_len
+                    b_end_y = flight_y_start_ft - a_run_len + b_run_len
+                    inter_far_y = min(flight_y_start_ft, b_end_y)  # southernmost cover
+                    il1 = DB.XYZ(land_x_left,  inter_far_y, inter_z)
+                    il2 = DB.XYZ(land_x_right, inter_far_y, inter_z)
+                    il3 = DB.XYZ(land_x_right, flight_y_start_ft + dyn_landing_ft, inter_z)
+                    il4 = DB.XYZ(land_x_left,  flight_y_start_ft + dyn_landing_ft, inter_z)
+                else:
+                    # Run B ends at: flight_y_start_ft + a_run_len - b_run_len
+                    b_end_y = flight_y_start_ft + a_run_len - b_run_len
+                    inter_far_y = max(flight_y_start_ft, b_end_y)  # northernmost cover
+                    il1 = DB.XYZ(land_x_left,  flight_y_start_ft - dyn_landing_ft, inter_z)
+                    il2 = DB.XYZ(land_x_right, flight_y_start_ft - dyn_landing_ft, inter_z)
+                    il3 = DB.XYZ(land_x_right, inter_far_y, inter_z)
+                    il4 = DB.XYZ(land_x_left,  inter_far_y, inter_z)
                 iloop = DB.CurveLoop()
                 iloop.Append(DB.Line.CreateBound(il1, il2))
                 iloop.Append(DB.Line.CreateBound(il2, il3))
@@ -2541,7 +2091,7 @@ class RevitWorkers:
         existing_fps = getattr(self, '_stair_fps_cache', {})
 
         for core_tag, core_runs in sorted(cores.items()):
-            # ── ENRICH AND GROUP BY HEIGHT ──
+            # â”€â”€ ENRICH AND GROUP BY HEIGHT â”€â”€
             # We must enrich ALL runs with level references before grouping.
             target_runs = []
             for rd in core_runs:
@@ -2761,27 +2311,27 @@ class RevitWorkers:
             
         return results
 
-    # ── Legacy stair methods removed ─────────────────────────────────────
+    # â”€â”€ Legacy stair methods removed â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     # The following were replaced by the single _create_stair_runs above.
     # Stubs kept for compatibility if any external code references them.
 
     def _create_stair_runs_multistorey(self, current_levels, results):
-        """Deprecated — redirects to _create_stair_runs."""
+        """Deprecated â€” redirects to _create_stair_runs."""
         self._create_stair_runs(current_levels, results)
 
     def _create_stair_runs_batched(self, current_levels, results):
-        """Deprecated — redirects to _create_stair_runs."""
+        """Deprecated â€” redirects to _create_stair_runs."""
         self._create_stair_runs(current_levels, results)
 
     def _create_stair_runs_legacy(self, current_levels, results):
-        """Deprecated — redirects to _create_stair_runs."""
+        """Deprecated â€” redirects to _create_stair_runs."""
         self._create_stair_runs(current_levels, results)
 
     def _create_stair_runs_legacy_for_core(self, *args, **kwargs):
-        """Deprecated — no longer used."""
+        """Deprecated â€” no longer used."""
         pass
 
-    # ── End of stair run creation methods ─────────────────────────────────
+    # â”€â”€ End of stair run creation methods â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     def _REMOVED_create_stair_runs_multistorey(self, current_levels, results):
         """REMOVED: Old multistorey method kept as dead code reference.
@@ -2792,7 +2342,7 @@ class RevitWorkers:
           3. Call MultistoryStairs.Create(stairs) + ConnectLevels() to clone
           4. Handle non-standard floor heights as individual stairs
 
-        This is the fastest approach (~10-20s for 5 cores × 50 floors).
+        This is the fastest approach (~10-20s for 5 cores Ã— 50 floors).
         """
         import Autodesk.Revit.DB as DB  # type: ignore
         from Autodesk.Revit.DB.Architecture import MultistoryStairs as _MSS  # type: ignore
@@ -3017,7 +2567,7 @@ class RevitWorkers:
 
                 if level_ids_to_connect.Count > 0:
                     ms.ConnectLevels(level_ids_to_connect)
-                    self.log("  Core {}: ConnectLevels OK — {} typical floors cloned.".format(
+                    self.log("  Core {}: ConnectLevels OK â€” {} typical floors cloned.".format(
                         core_tag, level_ids_to_connect.Count))
 
                 t_ms.Commit()
@@ -3038,7 +2588,7 @@ class RevitWorkers:
                 # GetAllStairsIds() only returns one per height-group (prototype),
                 # NOT one per connected level.  GetStairsOnLevel returns the
                 # actual stair ElementId at each base level.
-                # Also verify each expected stair was created — any missing
+                # Also verify each expected stair was created â€” any missing
                 # ones get added to the individual-creation list.
                 expected_runs = [r for r in typical_runs if r not in skipped_typical_runs]
                 for rd in expected_runs:
@@ -3186,8 +2736,13 @@ class RevitWorkers:
         f1_cx = mm_to_ft(f1['start'][0])
         f2_cx = mm_to_ft(f2['start'][0])
         flight_y_start_ft = mm_to_ft(f1['start'][1])
-        land_x_left = f1_cx - hw
-        land_x_right = f2_cx + hw
+        # Detect 180° rotation: after rotation f1 goes -Y. Use min/max for left/right.
+        f1_y_end = mm_to_ft(f1['end'][1])
+        is_rotated = (f1_y_end < flight_y_start_ft)
+        left_cx  = min(f1_cx, f2_cx)
+        right_cx = max(f1_cx, f2_cx)
+        land_x_left  = left_cx  - hw
+        land_x_right = right_cx + hw
 
         flight_list = rd.get('flight_list', [])
         # --- Asymmetrical Riser Split Fix (Problem 1) ---
@@ -3225,11 +2780,14 @@ class RevitWorkers:
                     p_desired.Set(total_risers)
         except Exception: pass
 
-        # --- Run A: left side, going +Y ---
+        # --- Run A: direction depends on rotation ---
         a_run_len = max(a_risers - 1, 1) * tread_ft
         p_as = DB.XYZ(round(f1_cx, 8), round(flight_y_start_ft, 8), base_z)
-        p_ae = DB.XYZ(round(f1_cx, 8), round(flight_y_start_ft + a_run_len, 8), base_z)
-        
+        if is_rotated:
+            p_ae = DB.XYZ(round(f1_cx, 8), round(flight_y_start_ft - a_run_len, 8), base_z)
+        else:
+            p_ae = DB.XYZ(round(f1_cx, 8), round(flight_y_start_ft + a_run_len, 8), base_z)
+
         # Diagnostic Log
         if a_run_len < 0.001:
             self.log("  [Stair DIAGNOSTIC] {} - Run A length too short! a_risers={}, total_risers={}, total_h={:.4f}ft".format(
@@ -3253,16 +2811,19 @@ class RevitWorkers:
         else:
             dyn_landing_ft = landing_ft
 
-        # --- Mid-landing (U-turn at back of shaft) ---
-        # Ensure connectivity by USING Run A's end point exactly
-        land_y_bot = round(flight_y_start_ft + a_run_len, 8)
-        land_y_top = round(land_y_bot + dyn_landing_ft, 8)
-        
+        # --- Mid-landing (U-turn at far side of Run A) ---
+        if is_rotated:
+            land_y_top = round(flight_y_start_ft - a_run_len, 8)
+            land_y_bot = round(land_y_top - dyn_landing_ft, 8)
+        else:
+            land_y_bot = round(flight_y_start_ft + a_run_len, 8)
+            land_y_top = round(land_y_bot + dyn_landing_ft, 8)
+
         lp1 = DB.XYZ(round(land_x_left,  8), land_y_bot, mid_elev_abs)
         lp2 = DB.XYZ(round(land_x_right, 8), land_y_bot, mid_elev_abs)
         lp3 = DB.XYZ(round(land_x_right, 8), land_y_top, mid_elev_abs)
         lp4 = DB.XYZ(round(land_x_left,  8), land_y_top, mid_elev_abs)
-        
+
         mid_loop = DB.CurveLoop()
         mid_loop.Append(DB.Line.CreateBound(lp1, lp2))
         mid_loop.Append(DB.Line.CreateBound(lp2, lp3))
@@ -3270,10 +2831,16 @@ class RevitWorkers:
         mid_loop.Append(DB.Line.CreateBound(lp4, lp1))
         _StairsLanding.CreateSketchedLanding(doc, stair_id, mid_loop, mid_elev_rel)
 
-        # --- Run B: right side, going -Y ---
+        # --- Run B: returns toward starting side ---
         b_run_len = max(b_risers - 1, 1) * tread_ft
-        p_bs = DB.XYZ(round(f2_cx, 8), land_y_bot, mid_elev_abs)
-        p_be = DB.XYZ(round(f2_cx, 8), round(land_y_bot - b_run_len, 8), mid_elev_abs)
+        if is_rotated:
+            # Mid-landing is at lower Y; Run B goes back toward +Y (start side)
+            p_bs = DB.XYZ(round(f2_cx, 8), round(flight_y_start_ft - a_run_len, 8), mid_elev_abs)
+            p_be = DB.XYZ(round(f2_cx, 8), round(flight_y_start_ft - a_run_len + b_run_len, 8), mid_elev_abs)
+        else:
+            # Mid-landing is at higher Y; Run B goes back toward -Y (start side)
+            p_bs = DB.XYZ(round(f2_cx, 8), land_y_bot, mid_elev_abs)
+            p_be = DB.XYZ(round(f2_cx, 8), round(land_y_bot - b_run_len, 8), mid_elev_abs)
         
         # Diagnostic Log
         if b_run_len < 0.001:
@@ -3292,7 +2859,7 @@ class RevitWorkers:
             if p_nr_b and not p_nr_b.IsReadOnly: p_nr_b.Set(b_risers)
         except Exception: pass
 
-        # Detailed logging — what WE asked for AND what Revit actually set
+        # Detailed logging â€” what WE asked for AND what Revit actually set
         try:
             flight_w_mm = hw * 2.0 * 304.8
             tread_mm = tread_ft * 304.8
@@ -3431,7 +2998,7 @@ class RevitWorkers:
             self.log("Stair runs (batched): type pre-config note: {}".format(e))
 
         # --- Group run_data by staircase core ---
-        # Tag format: "AI_Stair_N_LX_Run" — core identifier is "Stair_N"
+        # Tag format: "AI_Stair_N_LX_Run" â€” core identifier is "Stair_N"
         import re
         cores = {}  # core_tag -> [run_data, ...] sorted by base_level_idx
         for rd in run_data_list:
@@ -3641,7 +3208,7 @@ class RevitWorkers:
                     except Exception: pass
 
             if not succeeded:
-                self.log("  Core {} failed — will attempt legacy fallback for this core.".format(core_tag))
+                self.log("  Core {} failed â€” will attempt legacy fallback for this core.".format(core_tag))
                 # Fall back to legacy per-floor for this specific core
                 try:
                     self._create_stair_runs_legacy_for_core(
@@ -3718,14 +3285,7 @@ class RevitWorkers:
             f2_cx = mm_to_ft(f2['start'][0])
             flight_y_start_ft = mm_to_ft(f1['start'][1])
             land_x_left = f1_cx - hw
-            land_x_right = f2_cx + hw
-
-            floor_h_mm = round(floor_h_ft * 304.8)
-            total_risers = int(math.ceil(floor_h_mm / float(spec_riser_mm)))
-            rpf = rd.get('risers_per_flight', max(total_risers // 2, 1))
-
-            scope = None
-            t = None
+            land_x_right = f2_cx
             try:
                 scope = _StairsEditScope(doc, "AI Stair Legacy")
                 stair_id = scope.Start(base_lvl.Id, top_lvl.Id)
@@ -3733,6 +3293,20 @@ class RevitWorkers:
                 t = DB.Transaction(doc, "AI Stair Dogleg Legacy")
                 t.Start()
                 setup_failure_handling(t)
+
+                # --- NEW: Use manifestation points directly to support rotation ---
+                p1_start = DB.Point(mm_to_ft(f1['start'][0]), mm_to_ft(f1['start'][1]), base_z)
+                p1_end   = DB.Point(mm_to_ft(f1['end'][0]),   mm_to_ft(f1['end'][1]),   base_z)
+                p2_start = DB.Point(mm_to_ft(f2['start'][0]), mm_to_ft(f2['start'][1]), base_z)
+                p2_end   = DB.Point(mm_to_ft(f2['end'][0]),   mm_to_ft(f2['end'][1]),   base_z)
+
+                run1 = _StairsRun.CreateStraightRun(doc, stair_id, base_lvl.Id, 
+                        DB.Line.CreateBound(p1_start, p1_end),
+                        _StairsRunJust.Center)
+                
+                run2 = _StairsRun.CreateStraightRun(doc, stair_id, base_lvl.Id, 
+                        DB.Line.CreateBound(p2_start, p2_end),
+                        _StairsRunJust.Center)
 
                 # --- FORCE PERFECT RISER PARITY (Revit 2026 Fix) ---
                 # Any remainder in riser distribution creates a Y-gap between flights. 
@@ -3779,7 +3353,7 @@ class RevitWorkers:
                 for p_idx, (a_risers, b_risers) in enumerate(flight_pairs):
                     current_elev_abs = base_z + current_elev_rel
 
-                    # No explicit intermediate landing — Revit auto-generates
+                    # No explicit intermediate landing â€” Revit auto-generates
                     # landings between consecutive runs (avoids overlap warning).
 
                     a_run_len = max(a_risers - 1, 1) * tread_ft
@@ -3860,17 +3434,17 @@ class RevitWorkers:
         Kept as fallback if the batched multi-storey approach fails.
 
         Layout per dogleg pair (plan view, Y-axis up):
-            Main landing (front of shaft) — CreateSketchedLanding
+            Main landing (front of shaft) â€” CreateSketchedLanding
             Flight A: left side, going +Y
-            Mid-landing (U-turn, back of shaft) — CreateSketchedLanding
+            Mid-landing (U-turn, back of shaft) â€” CreateSketchedLanding
             Flight B: right side, going -Y
-            [Intermediate landing at front — repeat for more pairs]
+            [Intermediate landing at front â€” repeat for more pairs]
 
         Riser height is FIXED at spec value.  Revit computes the number
         of risers from the floor height and the fixed riser height.
         Taller floors get more flights (same run length each).
 
-        Stairs are always DELETED and RECREATED — never reused — because
+        Stairs are always DELETED and RECREATED â€” never reused â€” because
         Revit stair elements cannot be edited after StairsEditScope.Commit.
         """
         import Autodesk.Revit.DB as DB  # type: ignore
@@ -3933,7 +3507,7 @@ class RevitWorkers:
         # --- Pre-configure stair type BEFORE creating any stairs ---
         # The first stair in a fresh session uses the template's default
         # riser (e.g. 178mm), not our spec (150mm).  Setting the type
-        # param inside StairsEditScope is too late — Revit already
+        # param inside StairsEditScope is too late â€” Revit already
         # allocated risers with the old value.  Fix: commit the type
         # change in a separate transaction first.
         try:
@@ -4028,28 +3602,28 @@ class RevitWorkers:
                         self.log("  Stair type param set note: {}".format(e))
 
                 # --- Geometry from SPEC values (NOT Revit readback) ---
-                # Use spec riser to compute total_risers — must match the
+                # Use spec riser to compute total_risers â€” must match the
                 # num_pairs from staircase_logic which also uses spec riser.
                 # Round to nearest mm to avoid float precision errors
-                # (e.g. 4200mm stored as 13.7795…ft * 304.8 = 4199.9999…mm)
+                # (e.g. 4200mm stored as 13.7795â€¦ft * 304.8 = 4199.9999â€¦mm)
                 floor_h_mm = round(floor_h_ft * 304.8)
                 total_risers = int(math.ceil(floor_h_mm / float(spec_riser_mm)))
                 rpf = rd.get('risers_per_flight', max(total_risers // 2, 1))
 
-                # Convert mm → ft
+                # Convert mm â†’ ft
                 f1_cx = mm_to_ft(f1_cx_mm)
                 f2_cx = mm_to_ft(f2_cx_mm)
                 flight_y_start_ft = mm_to_ft(flight_y_start_mm)
                 hw = mm_to_ft(width_mm) / 2.0
                 landing_ft = mm_to_ft(landing_mm)
 
-                # Landing X bounds — span both flights
+                # Landing X bounds â€” span both flights
                 land_x_left = f1_cx - hw
                 land_x_right = f2_cx + hw
 
                 # --- Distribute risers across flights ---
                 # Each flight gets min(rpf, remaining). Last flights may
-                # be shorter — their run_len is computed individually.
+                # be shorter â€” their run_len is computed individually.
                 flight_risers_list = []
                 remaining = total_risers
                 for _ in range(num_pairs * 2):

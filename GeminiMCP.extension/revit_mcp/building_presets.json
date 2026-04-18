@@ -44,10 +44,13 @@
           "landing_width": 1800
         },
         "fire_fighting_lifts": 2,
-        "fire_fighting_lift_lobby": [
-          2000,
-          3000
-        ]
+        "fire_fighting_lift_lobby": {
+          "min_width": 2000,
+          "min_area": 6000000
+        },
+        "smoke_stop_lobby": {
+          "min_area": 3000000
+        }
       }
     }
   }

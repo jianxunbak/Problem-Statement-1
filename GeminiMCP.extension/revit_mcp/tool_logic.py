@@ -98,15 +98,41 @@ def get_doc_info_ui():
                         "bounds": [ex1, ey1, ex2, ey2]
                     })
 
+    # 4. Generate 3D Occupancy Map
+    occupancy_map = []
+    
+    # Process Cores (Lifts/Stairs)
+    for ai_id, eid in registry.items():
+        if "Lift" in ai_id or "Stair" in ai_id or "SafetySet" in ai_id:
+            el = doc.GetElement(eid)
+            if el:
+                bb = el.get_BoundingBox(None)
+                if bb:
+                    occupancy_map.append({
+                        "id": ai_id,
+                        "type": "CORE",
+                        "bbox": [ft_to_mm(bb.Min.X), ft_to_mm(bb.Min.Y), ft_to_mm(bb.Min.Z),
+                                 ft_to_mm(bb.Max.X), ft_to_mm(bb.Max.Y), ft_to_mm(bb.Max.Z)]
+                    })
+
+    # Process unmanaged obstructions in 3D
+    for obs in unmanaged_obstructions:
+        occupancy_map.append({
+            "id": obs["id"],
+            "type": "OBSTRUCTION",
+            "category": obs["category"],
+            "bbox": [obs["bounds"][0], obs["bounds"][1], 0, obs["bounds"][2], obs["bounds"][3], 4000] # Default height if unknown
+        })
+
     return {
         "title": doc.Title,
         "path": doc.PathName or "Unsaved Document",
-        "vision": {
+        "vision_3d": {
+            "occupancy_map": occupancy_map[:30], # Top 30 for token efficiency
             "floor_boundaries": floor_boundaries,
-            "core_bounds": unified_core,
-            "all_core_elements": core_bounds,
-            "unmanaged_spatial_obstructions": unmanaged_obstructions[:20] # Limit to 20 for prompt tokens
-        }
+            "overall_core_bounds": unified_core
+        },
+        "system_status": "Spatial Clearinghouse ACTIVE. Global Geometric Constraints enforced."
     }
 
 def create_wall_ui(params):
