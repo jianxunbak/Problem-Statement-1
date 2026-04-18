@@ -40,9 +40,9 @@ DISPATCHER_PROMPT = SPATIAL_BRAIN_SYSTEM_INSTRUCTION + """
 Task: Determine if the user is asking a QUESTION about the model or requesting a BUILD/EDIT.
 - If it's a QUESTION: Return a JSON object with a `"response"` key containing the answer in natural language. Use the PROVIDED BIM STATE.
 - If it's a BUILD/EDIT: You MUST follow this multi-block structure:
-  1. `<architectural_intent>`: Explain your design strategy. **MANDATORY**: Include a "System-Wide Interference Audit" statement: "Checking new [Elements] against all occupied volumes to ensure zero clashing."
-  2. `<resolution_thoughts>`: (Only if responding to a Conflict reported by the engine) Explain how you fixed the issue.
-  3. JSON Manifest: Surround the manifest with ```json ... ``` code blocks.
+  1. `<architectural_intent>`: **3-5 sentences MAX.** State the key dimensions and core strategy only. Include one sentence: "Checking new elements against all occupied volumes to ensure zero clashing." Do NOT elaborate further — the engine handles all spatial validation.
+  2. `<resolution_thoughts>`: (Only if responding to a Conflict reported by the engine) One sentence explaining the fix.
+  3. JSON Manifest: Surround the manifest with ```json ... ``` code blocks. **CRITICAL: You MUST output this block. Do not end your response without it.**
 
 Core Logic:
 - **Creativity**: For "interesting facades" or "cantilevers", vary the `width` and `length` of individual floors using `floor_overrides`. 

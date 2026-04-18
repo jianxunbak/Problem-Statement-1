@@ -136,7 +136,7 @@ class GeminiClient:
             "contents": [{"role": "user", "parts": [{"text": prompt}]}],
             "generationConfig": {
                 "temperature": 0.1,
-                "maxOutputTokens": 16384,
+                "maxOutputTokens": 32768,
                 "thinkingConfig": {"thinkingBudget": thinking_budget},
             }
         }

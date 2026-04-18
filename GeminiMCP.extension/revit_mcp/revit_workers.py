@@ -390,6 +390,24 @@ class RevitWorkers:
             except Exception as stair_err:
                 self.log("Stair phase failed (non-fatal): {}".format(stair_err))
 
+            # --- PHASE 5.6: DOORS ---
+            if self.tracker: self.tracker.report("Placing doors in staircases, lobbies and lift shafts...")
+            try:
+                t = DB.Transaction(doc, "AI Build: Doors")
+                t.Start()
+                from revit_mcp.utils import setup_failure_handling
+                setup_failure_handling(t, use_nuclear=False)
+                doors_placed = self._process_doors(current_levels, results)
+                t.Commit()
+                t.Dispose()
+                if self.tracker and doors_placed:
+                    self.tracker.report(f"Placed {doors_placed} doors (staircases, fire lobbies, lift shafts).")
+            except Exception as door_err:
+                import traceback
+                self.log("Door phase failed (non-fatal): {}\n{}".format(door_err, traceback.format_exc()))
+                try: t.RollBack()
+                except: pass
+
             # --- PHASE 6: CLEANUP & DOC ---
             if self.tracker: self.tracker.report("Finalizing and cleaning up...")
             t = DB.Transaction(doc, "AI Build: Cleanup")
@@ -1205,6 +1223,260 @@ class RevitWorkers:
                 results["elements"].append(str(col.Id.Value))
                 affected_elements.append(col)
 
+    def _find_core_wall_type(self, doc):
+        """Return a WallType whose compound-structure thickness is closest to 350mm.
+        Falls back to the first available WallType if none match within 100mm."""
+        import Autodesk.Revit.DB as DB  # type: ignore
+        best_type = None
+        best_diff = float('inf')
+        fallback  = None
+        target_mm = 350.0
+        for wt in DB.FilteredElementCollector(doc).OfClass(DB.WallType):
+            if fallback is None:
+                fallback = wt
+            try:
+                cs = wt.GetCompoundStructure()
+                if cs:
+                    width_mm = cs.GetWidth() * 304.8  # internal units → mm
+                    diff = abs(width_mm - target_mm)
+                    if diff < best_diff:
+                        best_diff = diff
+                        best_type = wt
+            except:
+                pass
+        if best_type and best_diff <= 100.0:
+            return best_type
+        return fallback or best_type
+
+    def _get_door_type(self, doc, min_width_mm=1000, category_hint=""):
+        """Return the best available door FamilySymbol matching category_hint and ≥ min_width_mm.
+
+        category_hint:
+          "lift"        — prefer families whose name contains lift/elevator/shutter/sliding
+          "single_leaf" — prefer families whose name contains single/solid/flush
+          ""            — no preference, just find first with sufficient width
+        """
+        import Autodesk.Revit.DB as DB  # type: ignore
+        syms = list(DB.FilteredElementCollector(doc)
+                    .OfCategory(DB.BuiltInCategory.OST_Doors)
+                    .OfClass(DB.FamilySymbol).ToElements())
+        if not syms:
+            return None
+
+        hint = category_hint.lower()
+        if hint == "lift":
+            keywords = ["lift", "elevator", "shutter", "sliding"]
+        elif hint == "single_leaf":
+            keywords = ["single", "solid", "flush"]
+        else:
+            keywords = []
+
+        def _name(sym):
+            parts = []
+            try: parts.append(sym.Name or "")
+            except: pass
+            try: parts.append(sym.Family.Name or "")
+            except: pass
+            return " ".join(parts).lower()
+
+        def _width_ok(sym):
+            try:
+                wp = sym.get_Parameter(DB.BuiltInParameter.DOOR_WIDTH)
+                if not wp:
+                    wp = sym.LookupParameter("Width")
+                if wp:
+                    return wp.AsDouble() * 304.8 >= min_width_mm
+            except:
+                pass
+            return True  # unknown width → accept
+
+        # Pass 1: name match + width
+        if keywords:
+            for sym in syms:
+                n = _name(sym)
+                if any(kw in n for kw in keywords) and _width_ok(sym):
+                    return sym
+            # Pass 2: name match only (ignore width)
+            for sym in syms:
+                n = _name(sym)
+                if any(kw in n for kw in keywords):
+                    return sym
+
+        # Pass 3: width match only
+        for sym in syms:
+            if _width_ok(sym):
+                return sym
+
+        return syms[0]
+
+    def _find_wall_for_door(self, doc, pos_mm, level=None, max_dist_mm=600):
+        """Find the wall whose centreline is closest to pos_mm at the given level."""
+        import Autodesk.Revit.DB as DB  # type: ignore
+        tol_ft = mm_to_ft(max_dist_mm)
+        px, py  = mm_to_ft(pos_mm[0]), mm_to_ft(pos_mm[1])
+        outline = DB.Outline(
+            DB.XYZ(px - tol_ft, py - tol_ft, -1000.0),
+            DB.XYZ(px + tol_ft, py + tol_ft,  1000.0)
+        )
+        bbf      = DB.BoundingBoxIntersectsFilter(outline)
+        walls    = (DB.FilteredElementCollector(doc)
+                    .OfClass(DB.Wall)
+                    .WherePasses(bbf)
+                    .ToElements())
+        target   = DB.XYZ(px, py, 0.0)
+        best_wall, best_dist = None, float('inf')
+        for wall in walls:
+            try:
+                # Match level if provided
+                if level and not self._wall_matches_level(wall, level):
+                    continue
+                loc = wall.Location
+                if not isinstance(loc, DB.LocationCurve):
+                    continue
+                res = loc.Curve.Project(target)
+                if res and res.Distance < best_dist:
+                    best_dist = res.Distance
+                    best_wall = wall
+            except:
+                pass
+        return best_wall if best_dist < tol_ft else None
+
+    def _wall_matches_level(self, wall, level):
+        """Return True if wall's base constraint matches the given level.
+
+        Uses .Value (Revit 2024+ / Revit 2026 API) to compare ElementId values.
+        """
+        import Autodesk.Revit.DB as DB  # type: ignore
+        try:
+            base_p = wall.get_Parameter(DB.BuiltInParameter.WALL_BASE_CONSTRAINT)
+            if base_p:
+                wall_lvl_id = base_p.AsElementId()
+                # Revit 2024+ replaced IntegerValue with Value (Int64)
+                try:
+                    return wall_lvl_id.Value == level.Id.Value
+                except AttributeError:
+                    return wall_lvl_id.IntegerValue == level.Id.IntegerValue
+        except:
+            pass
+        return False
+
+    def _process_doors(self, current_levels, results):
+        """Place doors in staircase, fire-lobby and lift-shaft walls (Phase 5.6)."""
+        import Autodesk.Revit.DB as DB  # type: ignore
+        doc       = self.doc
+        door_data = getattr(self, '_door_data', [])
+        if not door_data:
+            self.log("Door phase: no door specs, skipping.")
+            return 0
+
+        # Build level map
+        level_map = {l.Name: l for l in current_levels}
+        for l in current_levels:
+            p = l.get_Parameter(DB.BuiltInParameter.ALL_MODEL_INSTANCE_COMMENTS)
+            if p and p.HasValue:
+                level_map[p.AsString()] = l
+
+        # Cache door symbols by category to avoid re-querying for every spec
+        _door_sym_cache = {}
+        def _get_sym(cat, width_mm):
+            key = (cat, width_mm)
+            if key not in _door_sym_cache:
+                sym = self._get_door_type(doc, min_width_mm=width_mm, category_hint=cat)
+                if sym and not sym.IsActive:
+                    sym.Activate()
+                    doc.Regenerate()
+                _door_sym_cache[key] = sym
+            return _door_sym_cache[key]
+
+        # Pre-check that at least one door family is available
+        if not self._get_door_type(doc, min_width_mm=0):
+            self.log("Door phase: no door families loaded in project, skipping.")
+            return 0
+
+        # Refresh registry now — walls created in this build are not in the start-of-build cache
+        try:
+            from revit_mcp.building_generator import get_model_registry  # type: ignore
+            registry = get_model_registry(doc)
+            wall_keys = [k for k in registry if "Stair" in k or "LB" in k or "FL" in k]
+            self.log("  Door registry: {} total, {} wall keys (sample: {})".format(
+                len(registry), len(wall_keys), wall_keys[:3]))
+        except Exception as _reg_err:
+            self.log("  Door registry refresh failed: {}".format(_reg_err))
+            registry = getattr(self, '_registry_cache', {})
+
+        placed = 0
+        for spec in door_data:
+            spec_id       = spec.get("id", "AI_Door")
+            pos_mm        = spec.get("position_mm")
+            lvl_ids       = spec.get("levels", [])
+            swing_in      = spec.get("swing_in", True)
+            flip_hand      = spec.get("flip_hand", False)
+            door_cat       = spec.get("door_category", "")
+            min_w          = spec.get("min_width_mm", 1000)
+            wall_ai_id_map = spec.get("wall_ai_id_map", {})
+            swing_out_l1   = spec.get("swing_out_level1", False)
+            if not pos_mm or not lvl_ids:
+                continue
+
+            door_sym = _get_sym(door_cat, min_w)
+            if not door_sym:
+                self.log("  Door {}: no symbol found, skipping spec.".format(spec_id))
+                continue
+
+            for li, level_id in enumerate(lvl_ids):
+                level = level_map.get(level_id)
+                if not level:
+                    continue
+                try:
+                    # 1. Registry-first: look up wall by deterministic AI ID
+                    wall = None
+                    wall_ai_id = wall_ai_id_map.get(level_id) if wall_ai_id_map else None
+                    if wall_ai_id and wall_ai_id in registry:
+                        import Autodesk.Revit.DB as DB  # type: ignore
+                        elem = doc.GetElement(registry[wall_ai_id])
+                        if elem and isinstance(elem, DB.Wall):
+                            wall = elem
+
+                    # 2. Geometry fallback (level-constrained)
+                    if not wall:
+                        wall = self._find_wall_for_door(doc, pos_mm, level=level)
+                    if not wall:
+                        self.log("  Door {} @ level {}: no wall found".format(spec_id, level_id))
+                        continue
+
+                    ins_pt = DB.XYZ(
+                        mm_to_ft(pos_mm[0]),
+                        mm_to_ft(pos_mm[1]),
+                        level.ProjectElevation
+                    )
+                    door_inst = doc.Create.NewFamilyInstance(
+                        ins_pt, door_sym, wall, level,
+                        DB.Structure.StructuralType.NonStructural
+                    )
+                    # Flip facing so external doors (and level-1 staircase doors) swing OUT
+                    effective_swing_in = swing_in and not (li == 0 and swing_out_l1)
+                    if not effective_swing_in:
+                        try:
+                            if door_inst.CanFlipFacing:
+                                door_inst.FlipFacing()
+                        except:
+                            pass
+                    # Flip hand so door leaf rests against the nearest perpendicular wall
+                    if flip_hand:
+                        try:
+                            if door_inst.CanFlipHand:
+                                door_inst.FlipHand()
+                        except:
+                            pass
+                    safe_set_comment(door_inst, "{}_L{}".format(spec_id, li + 1))
+                    results["elements"].append(str(door_inst.Id.Value))
+                    placed += 1
+                except Exception as _de:
+                    self.log("  Door {} @ level {}: {}".format(spec_id, level_id, _de))
+
+        self.log("Door phase complete: {} doors placed.".format(placed))
+        return placed
+
     def _process_granular_walls(self, manifest, current_levels, registry, results, created, reused, affected_elements=[]):
         import Autodesk.Revit.DB as DB # type: ignore
         doc = self.doc
@@ -1212,8 +1484,8 @@ class RevitWorkers:
         for l in current_levels:
             p = l.get_Parameter(DB.BuiltInParameter.ALL_MODEL_INSTANCE_COMMENTS)
             if p and p.HasValue: level_map[p.AsString()] = l
-        # Pre-fetch a default WallType to ensure new granular walls match the building shell
-        wall_type = DB.FilteredElementCollector(doc).OfClass(DB.WallType).FirstElement()
+        # Pre-fetch a 350mm WallType for core walls (user requirement); fall back to first available
+        wall_type = self._find_core_wall_type(doc)
 
         granular_walls = []
         for w_data in manifest.get("walls", []):
@@ -1584,6 +1856,9 @@ class RevitWorkers:
         m_spec = m_stair_config.get("spec", {})
         for k in ["riser", "tread", "width_of_flight", "landing_width"]:
             if k in m_spec: stair_spec[k] = safe_num(m_spec[k], stair_spec.get(k))
+        # Only widen the entry (door-side) landing: 1000mm door + 1800mm clear = 2800mm.
+        # The opposite landing stays at the preset width.
+        stair_spec["entry_landing_width"] = max(stair_spec.get("landing_width", 1500), 2800)
         self._stair_spec = stair_spec
 
         # 4. Calculate Unified Layout
@@ -1614,6 +1889,18 @@ class RevitWorkers:
         
         if isinstance(unified_man, dict) and unified_man.get("status") == "CONFLICT":
             return unified_man
+
+        # Collect door specs from fire-safety manifest + passenger lift doors
+        _door_specs = list(unified_man.get("door_specs", []))
+        try:
+            psgr_doors = lift_logic.get_passenger_lift_door_positions(
+                num_lifts, center_pos=(f_center_mm[0], f_center_mm[1]),
+                lobby_width=lobby_w, levels_data=levels_manifest
+            )
+            _door_specs.extend(psgr_doors)
+        except Exception as _pd_e:
+            self.log("Passenger lift door positions failed (non-fatal): {}".format(_pd_e))
+        self._door_data = _door_specs
 
         # 5.5 Precise Spatial Reservation + Column Exclusion Zones
         # Use individual sub-boundary rects (not the merged core bounding rect) so
@@ -1647,6 +1934,15 @@ class RevitWorkers:
                 res_id = "Core_Set_{}".format(i)
                 self.spatial_registry.reserve(res_id, (cb[0], cb[1], 0, cb[2], cb[3], typical_h_mm))
                 _excl.append((mm_to_ft(cb[0]), mm_to_ft(cb[1]), mm_to_ft(cb[2]), mm_to_ft(cb[3])))
+
+        # Always add composite cluster bounds (core_bounds) as column exclusion zones.
+        # sub_boundaries covers individual sub-components but each covers only part of
+        # the lift bank width; core_bounds has the full-width cluster rect so columns
+        # in the gap between the staircase east edge and the lift core east wall are culled.
+        for cb in unified_man.get("core_bounds", []):
+            cb_ft = (mm_to_ft(cb[0]), mm_to_ft(cb[1]), mm_to_ft(cb[2]), mm_to_ft(cb[3]))
+            if cb_ft not in _excl:
+                _excl.append(cb_ft)
 
         self._core_exclusion_zones = _excl
         # Lift-core bounds for column grid axis computation

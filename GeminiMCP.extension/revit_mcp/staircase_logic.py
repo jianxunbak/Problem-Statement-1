@@ -23,9 +23,9 @@ import math
 import hashlib
 
 # BUILD_VERSION is read by _create_stair_runs to verify fresh code is loaded
-_BUILD_VERSION = "v2026-04-18-LANDING-GAP-FIX"
+_BUILD_VERSION = "v2026-04-18-ENTRY-LANDING-ALIGN"
 
-_WALL_THICKNESS = 200  # mm
+_WALL_THICKNESS = 350  # mm — 350mm structural core walls (user requirement)
 _OVERRUN_HEIGHT = 5000  # mm — staircase overrun above roof (matches lift core)
 
 
@@ -162,9 +162,10 @@ def get_shaft_dimensions(floor_height_mm, spec=None):
     flight_2_risers = max(num_risers - flight_1_risers, 1)
     max_treads = max(flight_1_risers - 1, flight_2_risers - 1, 1)
 
+    w_entry_landing = spec.get("entry_landing_width", w_landing)  # door-side landing; may be wider
     flight_length = max_treads * tread
     shaft_width = 2 * w_flight + 3 * t
-    shaft_depth = flight_length + 2 * w_landing + 2 * t  # main + mid landing
+    shaft_depth = flight_length + w_landing + w_entry_landing + 2 * t  # entry + mid landing
 
     return shaft_width, shaft_depth
 
@@ -781,15 +782,19 @@ def generate_staircase_manifest(positions, levels_data, _enclosure_width_mm=None
                 def _get_flight_arr(li):
                     # Returns (f_y_start, arr_left, arr_right) for level li+1
                     f_h = levels_data[li+1]['elevation'] - levels_data[li]['elevation']
-                    if f_h <= 0: return base_y + t + w_landing, base_y + t + w_landing, base_y + t + w_landing
-                    
+                    # Use entry_landing_width to match get_stair_run_data's ml_depth.
+                    # w_landing (1500mm) was previously used here, but get_stair_run_data
+                    # uses w_entry_landing (2800mm), creating a visible gap in the model.
+                    _w_ent = spec.get("entry_landing_width", w_landing)
+                    if f_h <= 0: return base_y + t + _w_ent, base_y + t + _w_ent, base_y + t + _w_ent
+
                     is_top_f = (li == len(levels_data) - 2)
                     typ_h = typical_floor_height_mm or 4000.0
                     f_list = _get_flight_list(f_h, typ_h, riser, is_top_floor=is_top_f)
-                    
+
                     trd = spec.get("tread", 300)
                     r_len = max(f_list[0] - 1, 1) * trd
-                    dyn_w = max(w_landing, (enc_d - 2*t - r_len) / 2.0)
+                    dyn_w = max(_w_ent, (enc_d - 2*t - r_len) / 2.0)
                     fy_s = base_y + t + dyn_w
                     
                     l_a = f_list[-2] if len(f_list) >= 2 else f_list[-1]
@@ -991,19 +996,21 @@ def get_stair_run_data(positions, levels_data, shaft_width_mm, spec, typical_flo
             # [wall (t)] [main_landing (ml_depth)] [flight (run_len)] [mid_landing (mid_d)] [wall (t)]
             
             ml_y_bot = base_y + t
-            ml_depth = w_landing
+            # Main landing (door-side) uses entry_landing_width if provided; mid landing uses landing_width
+            w_entry_landing = spec.get("entry_landing_width", w_landing)
+            ml_depth = w_entry_landing
             if len(flight_list) >= 2 and flight_list[1] > flight_list[0]:
                 extra_treads = flight_list[1] - flight_list[0]
                 proposed_extra = extra_treads * tread
                 # Only extend ml_depth if there is enough shaft space to still
                 # fit run_len + w_landing (mid-landing minimum) without overflow.
                 available = enc_d - 2 * t - run_len - w_landing
-                if w_landing + proposed_extra <= available:
+                if w_entry_landing + proposed_extra <= available:
                     ml_depth += proposed_extra
             ml_y_top = ml_y_bot + ml_depth
 
-            # Mid-landing depth is whatever remains
-            mid_d = max(w_landing, enc_d - 2*t - ml_depth - run_len)
+            # Mid-landing depth is whatever remains (capped to w_landing — never bloated)
+            mid_d = max(w_landing, min(w_landing, enc_d - 2*t - ml_depth - run_len))
             
             # Flights start after main landing and end before mid landing
             # We add a 20mm safety buffer to ensure NO wall clashing

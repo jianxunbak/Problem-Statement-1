@@ -3,7 +3,7 @@ import math
 from . import staircase_logic
 from .utils import safe_num
 
-_WALL_THICKNESS = 200  # mm
+_WALL_THICKNESS = 350  # mm — 350mm structural core walls (user requirement)
 _OVERRUN_HEIGHT = 5000  # mm  (must match staircase_logic._OVERRUN_HEIGHT)
 
 # Rule 3: fire lift car matches passenger lift car (2500 mm internal)
@@ -242,6 +242,11 @@ def generate_fire_safety_manifest(safety_sets, levels_data, stair_spec,
     voids = []
     core_bounds = []
     stair_centers = []
+    door_specs = []
+
+    # Level lists for door spec generation (exclude final roof/overrun level)
+    _all_lvl_ids = [lvl['id'] for lvl in levels_data[:-1]] if len(levels_data) > 1 else [levels_data[0]['id']] if levels_data else []
+    _first_lvl_id = _all_lvl_ids[0] if _all_lvl_ids else None
 
     sw_nat = staircase_logic.get_shaft_dimensions(typical_floor_height_mm, stair_spec)[0]
     sd_nat = staircase_logic.get_max_shaft_depth(levels_data, stair_spec, typical_floor_height_mm)
@@ -329,14 +334,18 @@ def generate_fire_safety_manifest(safety_sets, levels_data, stair_spec,
                     if lvl_h <= 0:
                         continue
                 common = {"level_id": lvl['id'], "height": lvl_h, "type": "AI_Wall_Core"}
+                # Skip lobby face shared with staircase W_Back/W_Front to avoid duplicate wall
+                _perim_skip = "S" if is_south_p else "N"
                 walls.append({"id": "AI_{}_W_L{}".format(lobby_tag, l_idx + 1),
                               "start": [lb_x1_w, lb_y1_w, 0], "end": [lb_x1_w, lb_y2_w, 0], **common})
                 walls.append({"id": "AI_{}_E_L{}".format(lobby_tag, l_idx + 1),
                               "start": [lb_x2_w, lb_y1_w, 0], "end": [lb_x2_w, lb_y2_w, 0], **common})
-                walls.append({"id": "AI_{}_N_L{}".format(lobby_tag, l_idx + 1),
-                              "start": [lb_x1_w, lb_y2_w, 0], "end": [lb_x2_w, lb_y2_w, 0], **common})
-                walls.append({"id": "AI_{}_S_L{}".format(lobby_tag, l_idx + 1),
-                              "start": [lb_x1_w, lb_y1_w, 0], "end": [lb_x2_w, lb_y1_w, 0], **common})
+                if _perim_skip != "N":
+                    walls.append({"id": "AI_{}_N_L{}".format(lobby_tag, l_idx + 1),
+                                  "start": [lb_x1_w, lb_y2_w, 0], "end": [lb_x2_w, lb_y2_w, 0], **common})
+                if _perim_skip != "S":
+                    walls.append({"id": "AI_{}_S_L{}".format(lobby_tag, l_idx + 1),
+                                  "start": [lb_x1_w, lb_y1_w, 0], "end": [lb_x2_w, lb_y1_w, 0], **common})
             if levels_data:
                 last_lvl = levels_data[-1]
                 floors.append({
@@ -362,6 +371,72 @@ def generate_fire_safety_manifest(safety_sets, levels_data, stair_spec,
                 base_y_override=st_base_y,
                 rotated_indices=([0] if is_rotated_suit else [])
             ))
+
+            # ── Door specs for perimeter smoke-stop ─────────────────────────
+            # stair_global_idx already incremented above → stair_num = stair_global_idx
+            _sn_p = stair_global_idx
+            if is_south_p:
+                # Staircase main landing faces NORTH (is_rotated=True), external door on SOUTH wall
+                _ext_y = st_base_y          # south wall of staircase = W_Front
+                _lby_conn = st_y2           # shared wall between staircase and lobby = W_Back
+                door_specs.append({
+                    "id": tag + "_Stair_ExtDoor",
+                    "position_mm": [st_x1 + 900, _ext_y],
+                    "wall_line_mm": [[st_x1, _ext_y], [st_x2, _ext_y]],
+                    "levels": [_first_lvl_id] if _first_lvl_id else [],
+                    "swing_in": False, "flip_hand": True, "min_width_mm": 1000,
+                    "door_category": "single_leaf",
+                    "wall_ai_id_map": ({_all_lvl_ids[0]: "AI_Stair_{}_L1_W_Front".format(_sn_p)} if _all_lvl_ids else {}),
+                })
+                door_specs.append({
+                    "id": tag + "_Stair_LobbyDoor",
+                    "position_mm": [st_x1 + 900, _lby_conn],
+                    "wall_line_mm": [[st_x1, _lby_conn], [st_x2, _lby_conn]],
+                    "levels": _all_lvl_ids, "swing_in": True, "flip_hand": True, "min_width_mm": 1000,
+                    "door_category": "single_leaf",
+                    "swing_out_level1": True,
+                    "wall_ai_id_map": {_all_lvl_ids[k]: "AI_Stair_{}_L{}_W_Back".format(_sn_p, k + 1) for k in range(len(_all_lvl_ids))},
+                })
+                door_specs.append({
+                    "id": tag + "_Lobby_EntryDoor",
+                    "position_mm": [st_x1 + 900, lb_y2],
+                    "wall_line_mm": [[lb_box[0], lb_y2], [lb_box[2], lb_y2]],
+                    "levels": _all_lvl_ids, "swing_in": True, "flip_hand": True, "min_width_mm": 1000,
+                    "door_category": "single_leaf",
+                    "swing_out_level1": True,
+                    "wall_ai_id_map": {_all_lvl_ids[k]: "AI_SafetySet_{}_LB_N_L{}".format(i + 1, k + 1) for k in range(len(_all_lvl_ids))},
+                })
+            else:
+                # Main landing faces SOUTH (is_rotated=False), external door on NORTH wall
+                _ext_y = st_y2              # north wall of staircase = W_Back
+                _lby_conn = st_base_y       # shared wall between staircase and lobby = W_Front
+                door_specs.append({
+                    "id": tag + "_Stair_ExtDoor",
+                    "position_mm": [st_x1 + 900, _ext_y],
+                    "wall_line_mm": [[st_x1, _ext_y], [st_x2, _ext_y]],
+                    "levels": [_first_lvl_id] if _first_lvl_id else [],
+                    "swing_in": False, "flip_hand": True, "min_width_mm": 1000,
+                    "door_category": "single_leaf",
+                    "wall_ai_id_map": ({_all_lvl_ids[0]: "AI_Stair_{}_L1_W_Back".format(_sn_p)} if _all_lvl_ids else {}),
+                })
+                door_specs.append({
+                    "id": tag + "_Stair_LobbyDoor",
+                    "position_mm": [st_x1 + 900, _lby_conn],
+                    "wall_line_mm": [[st_x1, _lby_conn], [st_x2, _lby_conn]],
+                    "levels": _all_lvl_ids, "swing_in": True, "flip_hand": True, "min_width_mm": 1000,
+                    "door_category": "single_leaf",
+                    "swing_out_level1": True,
+                    "wall_ai_id_map": {_all_lvl_ids[k]: "AI_Stair_{}_L{}_W_Front".format(_sn_p, k + 1) for k in range(len(_all_lvl_ids))},
+                })
+                door_specs.append({
+                    "id": tag + "_Lobby_EntryDoor",
+                    "position_mm": [st_x1 + 900, lb_y1],
+                    "wall_line_mm": [[lb_box[0], lb_y1], [lb_box[2], lb_y1]],
+                    "levels": _all_lvl_ids, "swing_in": True, "flip_hand": True, "min_width_mm": 1000,
+                    "door_category": "single_leaf",
+                    "swing_out_level1": True,
+                    "wall_ai_id_map": {_all_lvl_ids[k]: "AI_SafetySet_{}_LB_S_L{}".format(i + 1, k + 1) for k in range(len(_all_lvl_ids))},
+                })
             continue  # skip the normal orientation detection below
 
         # ── Orientation detection ────────────────────────────────────────────
@@ -502,6 +577,91 @@ def generate_fire_safety_manifest(safety_sets, levels_data, stair_spec,
                     st_base_y = st_box[1]
                     st_rect   = [entry_x - sw_h, entry_y, entry_x + sw_h, st_box[3]]
                 is_rotated_suit = is_south
+                # ── Door specs: NS sequential ────────────────────────────────
+                # stair_global_idx not yet incremented → stair_num = stair_global_idx + 1
+                _sn_seq = stair_global_idx + 1
+                if is_south:
+                    # Staircase main landing faces NORTH (is_rotated=True)
+                    # ExtDoor on south face (W_Front); LobbyDoor on north face (W_Back)
+                    # Doors tucked 900mm from west end (= t + half-door + 50mm clearance)
+                    # FireLiftDoor centered on fire shaft (issue 1)
+                    _fl_cx_s = (fl_box[0] + fl_box[2]) / 2.0 if fl_box else (lb_box[0] + lb_box[2]) / 2.0
+                    door_specs.append({
+                        "id": tag + "_Stair_ExtDoor",
+                        "position_mm": [st_box[0] + 900, st_box[1]],
+                        "wall_line_mm": [[st_box[0], st_box[1]], [st_box[2], st_box[1]]],
+                        "levels": [_first_lvl_id] if _first_lvl_id else [],
+                        "swing_in": False, "flip_hand": True, "min_width_mm": 1000,
+                        "door_category": "single_leaf",
+                        "wall_ai_id_map": ({_all_lvl_ids[0]: "AI_Stair_{}_L1_W_Front".format(_sn_seq)} if _all_lvl_ids else {}),
+                    })
+                    door_specs.append({
+                        "id": tag + "_Stair_LobbyDoor",
+                        "position_mm": [st_box[0] + 900, st_box[3]],
+                        "wall_line_mm": [[st_box[0], st_box[3]], [st_box[2], st_box[3]]],
+                        "levels": _all_lvl_ids, "swing_in": True, "flip_hand": True, "min_width_mm": 1000,
+                        "door_category": "single_leaf", "swing_out_level1": True,
+                        "wall_ai_id_map": {_all_lvl_ids[k]: "AI_Stair_{}_L{}_W_Back".format(_sn_seq, k + 1) for k in range(len(_all_lvl_ids))},
+                    })
+                    # Lobby entry from office floor: on EAST wall (side accessible from open floor plate)
+                    # tucked 900mm from south end so hinge is near the staircase perpendicular wall
+                    door_specs.append({
+                        "id": tag + "_Lobby_EntryDoor",
+                        "position_mm": [lb_box[2], lb_box[1] + 900],
+                        "wall_line_mm": [[lb_box[2], lb_box[1]], [lb_box[2], lb_box[3]]],
+                        "levels": _all_lvl_ids, "swing_in": True, "flip_hand": True, "min_width_mm": 1000,
+                        "door_category": "single_leaf", "swing_out_level1": True,
+                        "wall_ai_id_map": {_all_lvl_ids[k]: "AI_SafetySet_{}_LB_E_L{}".format(i + 1, k + 1) for k in range(len(_all_lvl_ids))},
+                    })
+                    if is_fl and fl_box:
+                        door_specs.append({
+                            "id": tag + "_FireLift_Door",
+                            "position_mm": [_fl_cx_s, fl_box[1]],
+                            "wall_line_mm": [[fl_box[0], fl_box[1]], [fl_box[2], fl_box[1]]],
+                            "levels": _all_lvl_ids, "swing_in": True, "flip_hand": True, "min_width_mm": 1000,
+                            "door_category": "lift",
+                            "wall_ai_id_map": {_all_lvl_ids[k]: "AI_SafetySet_{}_FL_S_L{}".format(i + 1, k + 1) for k in range(len(_all_lvl_ids))},
+                        })
+                else:
+                    # Main landing faces SOUTH (is_rotated=False)
+                    # ExtDoor on north face (W_Back); LobbyDoor on south face (W_Front)
+                    _fl_cx_n = (fl_box[0] + fl_box[2]) / 2.0 if fl_box else (lb_box[0] + lb_box[2]) / 2.0
+                    door_specs.append({
+                        "id": tag + "_Stair_ExtDoor",
+                        "position_mm": [st_box[0] + 900, st_box[3]],
+                        "wall_line_mm": [[st_box[0], st_box[3]], [st_box[2], st_box[3]]],
+                        "levels": [_first_lvl_id] if _first_lvl_id else [],
+                        "swing_in": False, "flip_hand": True, "min_width_mm": 1000,
+                        "door_category": "single_leaf",
+                        "wall_ai_id_map": ({_all_lvl_ids[0]: "AI_Stair_{}_L1_W_Back".format(_sn_seq)} if _all_lvl_ids else {}),
+                    })
+                    door_specs.append({
+                        "id": tag + "_Stair_LobbyDoor",
+                        "position_mm": [st_box[0] + 900, st_box[1]],
+                        "wall_line_mm": [[st_box[0], st_box[1]], [st_box[2], st_box[1]]],
+                        "levels": _all_lvl_ids, "swing_in": True, "flip_hand": True, "min_width_mm": 1000,
+                        "door_category": "single_leaf", "swing_out_level1": True,
+                        "wall_ai_id_map": {_all_lvl_ids[k]: "AI_Stair_{}_L{}_W_Front".format(_sn_seq, k + 1) for k in range(len(_all_lvl_ids))},
+                    })
+                    # Lobby entry from office floor: on EAST wall (side accessible from open floor plate)
+                    # tucked 900mm from north end so hinge is near the staircase perpendicular wall
+                    door_specs.append({
+                        "id": tag + "_Lobby_EntryDoor",
+                        "position_mm": [lb_box[2], lb_box[3] - 900],
+                        "wall_line_mm": [[lb_box[2], lb_box[1]], [lb_box[2], lb_box[3]]],
+                        "levels": _all_lvl_ids, "swing_in": True, "flip_hand": True, "min_width_mm": 1000,
+                        "door_category": "single_leaf", "swing_out_level1": True,
+                        "wall_ai_id_map": {_all_lvl_ids[k]: "AI_SafetySet_{}_LB_E_L{}".format(i + 1, k + 1) for k in range(len(_all_lvl_ids))},
+                    })
+                    if is_fl and fl_box:
+                        door_specs.append({
+                            "id": tag + "_FireLift_Door",
+                            "position_mm": [_fl_cx_n, fl_box[3]],
+                            "wall_line_mm": [[fl_box[0], fl_box[3]], [fl_box[2], fl_box[3]]],
+                            "levels": _all_lvl_ids, "swing_in": True, "flip_hand": True, "min_width_mm": 1000,
+                            "door_category": "lift",
+                            "wall_ai_id_map": {_all_lvl_ids[k]: "AI_SafetySet_{}_FL_N_L{}".format(i + 1, k + 1) for k in range(len(_all_lvl_ids))},
+                        })
             else:
                 # ── Parallel layout ──────────────────────────────────────────
                 use_parallel = True
@@ -524,7 +684,10 @@ def generate_fire_safety_manifest(safety_sets, levels_data, stair_spec,
                     st_cy     = (st_box[1] + st_box[3]) / 2.0
                     st_base_y = st_box[1]     # south face = outer (floor plate side)
                     is_rotated_suit = False   # people enter from south face, flights go north
-                    st_rect   = [l_xmin, l_ymin - cluster_d_p, st_x2, l_ymin]
+                    # Use full lift bank width so the column grid excludes the entire
+                    # cluster zone, including any gap between the staircase east edge
+                    # and the lift core east wall (l_xmax).
+                    st_rect   = [l_xmin, l_ymin - cluster_d_p, l_xmax, l_ymin]
                 else:
                     # North cluster: extends northward from l_ymax
                     # Fire zone EAST, staircase WEST (pinwheel)
@@ -544,7 +707,105 @@ def generate_fire_safety_manifest(safety_sets, levels_data, stair_spec,
                     st_cy     = (st_box[1] + st_box[3]) / 2.0
                     st_base_y = st_box[1]     # south face = inner (adjacent to lift bank)
                     is_rotated_suit = True    # people enter from north face, so rotate 180°
-                    st_rect   = [st_x1, l_ymax, fz_x2, l_ymax + cluster_d_p]
+                    # Use full lift bank width so the column grid excludes the entire
+                    # cluster zone, including any gap between the fire zone east edge
+                    # and the lift core east wall (l_xmax).
+                    st_rect   = [l_xmin, l_ymax, l_xmax, l_ymax + cluster_d_p]
+
+                # ── Door specs: NS parallel ──────────────────────────────────
+                # stair_global_idx not yet incremented → stair_num = stair_global_idx + 1
+                _sn_par = stair_global_idx + 1
+                if is_south:
+                    # South cluster: ExtDoor on south outer wall, tucked 900mm from west end.
+                    # LobbyDoor on west wall (W_Left), at midpoint of the lobby wall section
+                    # (away from both the south corner and the fire shaft boundary) to prevent
+                    # door swing clash with the ExtDoor at the south-west corner.
+                    # EntryDoor and FireLiftDoor centered on respective shaft south walls.
+                    _fl_cx = (fz_x1 + fz_x2) / 2.0  # fire lift shaft center X
+                    door_specs.append({
+                        "id": tag + "_Stair_ExtDoor",
+                        "position_mm": [st_x1 + 900, lb_y1],
+                        "wall_line_mm": [[st_x1, lb_y1], [st_x2, lb_y1]],
+                        "levels": [_first_lvl_id] if _first_lvl_id else [],
+                        "swing_in": False, "flip_hand": True, "min_width_mm": 1000,
+                        "door_category": "single_leaf",
+                        "wall_ai_id_map": ({_all_lvl_ids[0]: "AI_Stair_{}_L1_W_Front".format(_sn_par)} if _all_lvl_ids else {}),
+                    })
+                    door_specs.append({
+                        "id": tag + "_Stair_LobbyDoor",
+                        "position_mm": [st_x1, (lb_y1 + lb_y2) / 2.0],
+                        "wall_line_mm": [[st_x1, lb_y1], [st_x1, lb_y2]],
+                        "levels": _all_lvl_ids, "swing_in": True, "flip_hand": True, "min_width_mm": 1000,
+                        "door_category": "single_leaf", "swing_out_level1": True,
+                        "wall_ai_id_map": {_all_lvl_ids[k]: "AI_Stair_{}_L{}_W_Left".format(_sn_par, k + 1) for k in range(len(_all_lvl_ids))},
+                    })
+                    door_specs.append({
+                        "id": tag + "_Lobby_EntryDoor",
+                        "position_mm": [_fl_cx, lb_y1],
+                        "wall_line_mm": [[fz_x1, lb_y1], [fz_x2, lb_y1]],
+                        "levels": _all_lvl_ids, "swing_in": True, "flip_hand": True, "min_width_mm": 1000,
+                        "door_category": "single_leaf", "swing_out_level1": True,
+                        "wall_ai_id_map": {_all_lvl_ids[k]: "AI_SafetySet_{}_LB_S_L{}".format(i + 1, k + 1) for k in range(len(_all_lvl_ids))},
+                    })
+                    if is_fl and fl_box:
+                        door_specs.append({
+                            "id": tag + "_FireLift_Door",
+                            "position_mm": [_fl_cx, fl_y1],
+                            "wall_line_mm": [[fz_x1, fl_y1], [fz_x2, fl_y1]],
+                            "levels": _all_lvl_ids, "swing_in": True, "flip_hand": True, "min_width_mm": 1000,
+                            "door_category": "lift",
+                            "wall_ai_id_map": {_all_lvl_ids[k]: "AI_SafetySet_{}_FL_S_L{}".format(i + 1, k + 1) for k in range(len(_all_lvl_ids))},
+                        })
+                else:
+                    # North cluster: ExtDoor on north outer wall, tucked 900mm from east end.
+                    # LobbyDoor on east wall (W_Right), at midpoint of the lobby wall section
+                    # (away from both the north corner and the fire shaft boundary) to prevent
+                    # door swing clash with the ExtDoor at the north-east corner.
+                    # EntryDoor and FireLiftDoor centered on respective shaft north walls.
+                    _fl_cx = (fz_x1 + fz_x2) / 2.0  # fire lift shaft center X
+                    door_specs.append({
+                        "id": tag + "_Stair_ExtDoor",
+                        "position_mm": [st_x2 - 900, l_ymax + cluster_d_p],
+                        "wall_line_mm": [[st_x1, l_ymax + cluster_d_p], [st_x2, l_ymax + cluster_d_p]],
+                        "levels": [_first_lvl_id] if _first_lvl_id else [],
+                        "swing_in": False, "flip_hand": True, "min_width_mm": 1000,
+                        "door_category": "single_leaf",
+                        "wall_ai_id_map": ({_all_lvl_ids[0]: "AI_Stair_{}_L1_W_Back".format(_sn_par)} if _all_lvl_ids else {}),
+                    })
+                    door_specs.append({
+                        "id": tag + "_Stair_LobbyDoor",
+                        "position_mm": [st_x2, (lb_y1 + lb_y2) / 2.0],
+                        "wall_line_mm": [[st_x2, lb_y1], [st_x2, lb_y2]],
+                        "levels": _all_lvl_ids, "swing_in": True, "flip_hand": True, "min_width_mm": 1000,
+                        "door_category": "single_leaf", "swing_out_level1": True,
+                        "wall_ai_id_map": {_all_lvl_ids[k]: "AI_Stair_{}_L{}_W_Right".format(_sn_par, k + 1) for k in range(len(_all_lvl_ids))},
+                    })
+                    door_specs.append({
+                        "id": tag + "_Lobby_EntryDoor",
+                        "position_mm": [_fl_cx, lb_y2],
+                        "wall_line_mm": [[fz_x1, lb_y2], [fz_x2, lb_y2]],
+                        "levels": _all_lvl_ids, "swing_in": True, "flip_hand": True, "min_width_mm": 1000,
+                        "door_category": "single_leaf", "swing_out_level1": True,
+                        "wall_ai_id_map": {_all_lvl_ids[k]: "AI_SafetySet_{}_LB_N_L{}".format(i + 1, k + 1) for k in range(len(_all_lvl_ids))},
+                    })
+                    if is_fl and fl_box:
+                        door_specs.append({
+                            "id": tag + "_FireLift_Door",
+                            "position_mm": [_fl_cx, fl_y2],
+                            "wall_line_mm": [[fz_x1, fl_y2], [fz_x2, fl_y2]],
+                            "levels": _all_lvl_ids, "swing_in": True, "flip_hand": True, "min_width_mm": 1000,
+                            "door_category": "lift",
+                            "wall_ai_id_map": {_all_lvl_ids[k]: "AI_SafetySet_{}_FL_N_L{}".format(i + 1, k + 1) for k in range(len(_all_lvl_ids))},
+                        })
+
+        # ── Determine which lobby face is shared with the fire shaft (to avoid duplicate wall) ──
+        if is_fl:
+            if is_ew:
+                _skip_lobby_face = "W" if is_east_ew else "E"
+            else:
+                _skip_lobby_face = "N" if is_south else "S"
+        else:
+            _skip_lobby_face = None
 
         # ── Sub-boundary reservations ────────────────────────────────────────
         sub_boundaries.append({"id": tag + "_Shaft", "rect": fl_box} if is_fl else None)
@@ -578,14 +839,19 @@ def generate_fire_safety_manifest(safety_sets, levels_data, stair_spec,
                 if lvl_h <= 0:
                     continue
             common = {"level_id": lvl['id'], "height": lvl_h, "type": "AI_Wall_Core"}
-            walls.append({"id": "AI_{}_W_L{}".format(lobby_tag, l_idx + 1),
-                          "start": [lb_x1_w, lb_y1_w, 0], "end": [lb_x1_w, lb_y2_w, 0], **common})
-            walls.append({"id": "AI_{}_E_L{}".format(lobby_tag, l_idx + 1),
-                          "start": [lb_x2_w, lb_y1_w, 0], "end": [lb_x2_w, lb_y2_w, 0], **common})
-            walls.append({"id": "AI_{}_N_L{}".format(lobby_tag, l_idx + 1),
-                          "start": [lb_x1_w, lb_y2_w, 0], "end": [lb_x2_w, lb_y2_w, 0], **common})
-            walls.append({"id": "AI_{}_S_L{}".format(lobby_tag, l_idx + 1),
-                          "start": [lb_x1_w, lb_y1_w, 0], "end": [lb_x2_w, lb_y1_w, 0], **common})
+            # Skip the face shared with the fire shaft — the shaft wall already covers it
+            if _skip_lobby_face != "W":
+                walls.append({"id": "AI_{}_W_L{}".format(lobby_tag, l_idx + 1),
+                              "start": [lb_x1_w, lb_y1_w, 0], "end": [lb_x1_w, lb_y2_w, 0], **common})
+            if _skip_lobby_face != "E":
+                walls.append({"id": "AI_{}_E_L{}".format(lobby_tag, l_idx + 1),
+                              "start": [lb_x2_w, lb_y1_w, 0], "end": [lb_x2_w, lb_y2_w, 0], **common})
+            if _skip_lobby_face != "N":
+                walls.append({"id": "AI_{}_N_L{}".format(lobby_tag, l_idx + 1),
+                              "start": [lb_x1_w, lb_y2_w, 0], "end": [lb_x2_w, lb_y2_w, 0], **common})
+            if _skip_lobby_face != "S":
+                walls.append({"id": "AI_{}_S_L{}".format(lobby_tag, l_idx + 1),
+                              "start": [lb_x1_w, lb_y1_w, 0], "end": [lb_x2_w, lb_y1_w, 0], **common})
 
         # ── Lobby TOPCAP — closing slab above overrun (matches lift shaft / staircase) ──
         if levels_data:
@@ -631,6 +897,7 @@ def generate_fire_safety_manifest(safety_sets, levels_data, stair_spec,
         "stair_centers":  stair_centers,
         "sub_boundaries": [s for s in sub_boundaries if s],
         "stair_overrides": stair_overrides,
+        "door_specs":     door_specs,
     }
 
 
