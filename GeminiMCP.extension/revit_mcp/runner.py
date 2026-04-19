@@ -168,6 +168,18 @@ def start_mcp_server():
             log("Main: init_bridge failed: " + str(e))
 
         log("Main: All components pre-loaded.")
+
+        # Pre-warm RAG imports in background so first query_vertex_rag() call is instant
+        try:
+            from revit_mcp.config import RAG_ENABLED
+            if RAG_ENABLED:
+                from revit_mcp.rag.vertex_rag import _ensure_imported
+                _warmup = threading.Thread(target=_ensure_imported, args=(10.0,), daemon=True, name="RAG_Warmup")
+                _warmup.start()
+                log("Main: RAG import warmup thread started.")
+        except Exception as _e:
+            log("Main: RAG warmup skipped: " + str(_e))
+
     except Exception as e:
         log("Main Init ERROR: " + str(e))
         log(traceback.format_exc())

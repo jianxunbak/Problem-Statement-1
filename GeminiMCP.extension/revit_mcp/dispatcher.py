@@ -40,12 +40,46 @@ class Orchestrator:
         _c_fire   = load_compliance("fire_safety")
         _c_struct = load_compliance("structural")
         compliance_text = ""
-        if _c_lift or _c_fire or _c_struct:
+
+        # --- START RAG INTEGRATION ---
+        # Dynamically retrieve SCDF fire codes via Vertex AI RAG when enabled.
+        # Falls back silently to static _c_fire if RAG is disabled or fails.
+        import time as _time
+        rag_rules = None
+        try:
+            from revit_mcp.config import RAG_ENABLED
+            self.log(f"[RAG] RAG_ENABLED={RAG_ENABLED}")
+            if RAG_ENABLED:
+                from revit_mcp.agents.main_agent import extract_intent
+                from revit_mcp.agents.sub_agent import run_retrieve_rules
+                self.log("[RAG] Extracting building intent (regex)...")
+                if tracker: tracker.report("🔎 Extracting building intent for authority code lookup...")
+                intent = extract_intent(user_prompt)
+                self.log(f"[RAG] Intent extracted: {intent}")
+                if tracker: tracker.report(f"📐 Building intent: {intent.get('building_type', '?')}, {intent.get('storeys', '?')} storeys, topics: {intent.get('topics', [])}")
+                _t_rag = _time.time()
+                self.log("[RAG] Calling run_retrieve_rules...")
+                rag_rules = run_retrieve_rules(intent, report=tracker.report if tracker else None)
+                self.log(f"[RAG] run_retrieve_rules returned in {_time.time()-_t_rag:.2f}s — result={rag_rules}")
+                if rag_rules:
+                    topics_found = list(rag_rules.get("rules", {}).keys())
+                    self.log(f"[RAG] Rules retrieved for topics: {topics_found}")
+        except Exception as _rag_err:
+            self.log(f"[RAG] FAILED — {type(_rag_err).__name__}: {_rag_err}")
+            if tracker: tracker.report(f"⚠️ Authority code retrieval failed, using static rules. ({_rag_err})")
+            rag_rules = None
+        # --- END RAG INTEGRATION ---
+
+        if _c_lift or _c_fire or _c_struct or rag_rules:
             compliance_text = "\nAUTHORITY COMPLIANCE RULES (MANDATORY — embed values used into manifest compliance_parameters):\n"
             if _c_lift:
                 compliance_text += "## Lift Engineering — BS EN 81-20 / CIBSE Guide D:\n"
                 compliance_text += json.dumps(_c_lift, indent=2) + "\n"
-            if _c_fire:
+            # Use dynamic RAG fire rules when available; fall back to static file otherwise
+            if rag_rules:
+                compliance_text += f"## Fire Safety (DYNAMIC RAG - {rag_rules.get('authority', 'SCDF')}):\n"
+                compliance_text += json.dumps(rag_rules.get("rules", {}), indent=2) + "\n"
+            elif _c_fire:
                 compliance_text += "## Fire Safety — BS EN 81-72 / BS 9999 / Approved Doc B:\n"
                 compliance_text += json.dumps(_c_fire, indent=2) + "\n"
             if _c_struct:
