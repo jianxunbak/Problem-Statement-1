@@ -1,30 +1,186 @@
 import asyncio
 import json
+import os
 import time
+import threading
 import concurrent.futures
 from revit_mcp.gemini_client import client
 from revit_mcp.rag.vertex_rag import query_vertex_rag
-from revit_mcp.rag.query_builder import build_query
+from revit_mcp.rag.query_builder import build_queries
+
+# Maps each RAG topic to the GCS folder path of the authoritative source document.
+# Use the folder name (e.g. "knowledge_base/SCDF") so any new PDF added under
+# that folder is automatically included — no document-ID maintenance needed.
+_TOPIC_SOURCE: dict[str, str] = {
+    "staircase":        "knowledge_base/SCDF",
+    "fire_lift":        "knowledge_base/SCDF",
+    "fire_lift_lobby":  "knowledge_base/SCDF",
+    "smoke_stop_lobby": "knowledge_base/SCDF",
+    "occupant_load":    "knowledge_base/SCDF",
+    "exit_width":       "knowledge_base/SCDF",
+    "travel_distance":  "knowledge_base/SCDF",
+    "corridor":         "knowledge_base/SCDF",
+}
+
+# ── Chunk cache ────────────────────────────────────────────────────────────────
+# Persists raw Vertex AI chunks to disk so subsequent builds skip Vertex entirely.
+# Structure: { "SCDF": { "staircase": [ {chunk}, ... ], ... }, "BCA": { ... } }
+# Key: (authority, topic) — authority derived from _TOPIC_SOURCE folder name.
+# Building type is NOT part of the key: raw PDF text is the same regardless of
+# building type; only Gemini synthesis (handled upstream) varies by building type.
+
+from revit_mcp.utils import get_appdata_path as _get_appdata_path
+_CHUNK_CACHE_PATH = os.path.join(_get_appdata_path("cache"), "chunk_cache.json")
+_chunk_cache: dict = {}
+_chunk_cache_lock = threading.Lock()
+
+
+def _authority_from_source(source: str) -> str:
+    """Extract authority name from GCS folder path, e.g. 'knowledge_base/SCDF' → 'SCDF'."""
+    return source.rstrip("/").split("/")[-1] if source else "UNKNOWN"
+
+
+def _load_chunk_cache() -> None:
+    global _chunk_cache
+    try:
+        if os.path.isfile(_CHUNK_CACHE_PATH):
+            with open(_CHUNK_CACHE_PATH, "r", encoding="utf-8") as fh:
+                _chunk_cache = json.load(fh)
+            total = sum(len(chunks) for auth in _chunk_cache.values() for chunks in auth.values())
+            _log(f"[ChunkCache] Loaded {total} chunks from {_CHUNK_CACHE_PATH}")
+        else:
+            _chunk_cache = {}
+            _log(f"[ChunkCache] No cache file found — starting fresh")
+    except Exception as e:
+        _chunk_cache = {}
+        _log(f"[ChunkCache] Load failed ({e}) — starting fresh")
+
+
+def _save_chunk_cache() -> None:
+    try:
+        with open(_CHUNK_CACHE_PATH, "w", encoding="utf-8") as fh:
+            json.dump(_chunk_cache, fh, indent=2, ensure_ascii=False)
+        _log(f"[ChunkCache] Saved to {_CHUNK_CACHE_PATH}")
+    except Exception as e:
+        _log(f"[ChunkCache] Save failed: {e}")
+
+
+def _get_cached_chunks(authority: str, topic: str) -> list | None:
+    """Return cached chunks for (authority, topic), or None if not cached."""
+    return _chunk_cache.get(authority, {}).get(topic)
+
+
+def _merge_and_cache_chunks(authority: str, topic: str, new_chunks: list) -> list:
+    """Merge new_chunks into cache for (authority, topic), dedup, save, return merged list."""
+    with _chunk_cache_lock:
+        existing = _chunk_cache.setdefault(authority, {}).get(topic, [])
+        seen = {c["content"][:120] for c in existing if c.get("content")}
+        added = 0
+        for chunk in new_chunks:
+            key = chunk.get("content", "")[:120]
+            if key and key not in seen:
+                seen.add(key)
+                existing.append(chunk)
+                added += 1
+        _chunk_cache[authority][topic] = existing
+        _log(f"[ChunkCache] {authority}/{topic}: +{added} new chunks ({len(existing)} total)")
+        _save_chunk_cache()
+        return existing
+
 
 SUB_AGENT_PROMPT = """
-You are a Singapore SCDF fire code rules specialist.
-Extract spatial dimensions and requirements relevant to the building intent below.
-If there are conflicting values, use the STRICTER requirement. Normalise units to mm/m2.
-Include the clause reference as the source. Return ONLY raw JSON. No markdown blocks.
+You are an SCDF fire code specialist. Extract ALL spatial requirements from the RETRIEVED EXCERPTS ONLY.
+
+STRICT RULES:
+1. Use ONLY the text in the excerpts below. Do NOT use outside knowledge.
+2. Do NOT invent or guess any value. If a value is not stated in the excerpts, omit that key entirely.
+3. Do NOT invent clause numbers. Extract the exact clause/section reference that appears in the text (e.g. "3.2.1", "Section 4.5.2"). Pre-extracted clause refs are listed in [refs: ...] after each excerpt — use them.
+4. If a value conflicts between excerpts, use the STRICTER requirement (larger minimum, smaller maximum).
+5. Each dimension value MUST be an object: {{"dimension": <number>, "clause": "<ref or null>"}}.
+6. Booleans also use the same format: {{"dimension": true, "clause": "<ref>"}}.
+7. Each topic must have a "source" key naming the document and version (e.g. "SCDF Fire Code 2023").
+8. Include ALL requirements found — do not limit to a fixed list of keys.
+9. Return ONLY a raw JSON object. No markdown, no explanation.
+
+UNIT RULES (strictly enforced):
+- Lengths, widths, heights, depths: always mm. Convert m → mm by multiplying by 1000.
+- Areas: always mm2. Convert m2 → mm2 by multiplying by 1,000,000. Example: 4m × 2m lobby = 8,000,000mm2. Example: 6m2 lobby = 6,000,000mm2.
+- Speeds: m/s. Loads: kg.
+
+SCDF TABLE 2.2A COLUMN ORDER (left to right, 12 data columns after the occupancy name):
+Col 1: One-way travel non-spr (m)
+Col 2: One-way travel spr (m)
+Col 3: Two-way travel non-spr (m)   ← "max_travel_distance_mm" = this value × 1000
+Col 4: Two-way travel spr (m)        ← "max_travel_distance_sprinklered_mm" = this value × 1000
+Col 5: Persons/unit — door opening exiting to OUTDOORS at ground level, non-spr
+Col 6: Persons/unit — door opening exiting to OUTDOORS at ground level, spr
+Col 7: Persons/unit — STAIRCASES and exit passageways, non-spr  ← "persons_per_unit_width" = this value
+Col 8: Persons/unit — STAIRCASES and exit passageways, spr
+Col 9: Persons/unit — Ramps, corridors, other exits
+Col 10: Min width (m)
+Col 11: Max dead end non-spr (m)
+Col 12: Max dead end spr (m)
+
+Example row from the table: "| Offices | 15 | 30 | 45 | 75 | 100 | 80 | 60 | 100 | 1 | 1.2 | 15 | 20 |"
+→ max_travel_distance_mm = 45 × 1000 = 45000
+→ max_travel_distance_sprinklered_mm = 75 × 1000 = 75000
+→ persons_per_unit_width (staircase, non-spr) = Col 7 = 60  (NOT Col 5=100 which is door-to-outdoors)
+
+- "exit_width_per_unit_mm": per Cl.2.2.5a one unit of width = 500mm. Always output 500.
+- Match the occupancy row using the building type in Building Intent (e.g. "commercial office" → "Offices" row).
+
+For occupant_load: occupant_load_factor_m2 is m2 per person from the occupancy load table (NOT from Table 2.2A).
 
 Building Intent:
 {intent_json}
 
-Retrieved Excerpts:
+Retrieved Excerpts (with pre-extracted clause refs):
 {chunks_text}
 
-Expected JSON format:
+Required JSON format:
 {{
   "authority": "SCDF",
   "rules": {{
-    "staircase": {{ "min_width_mm": <int>, "min_count": <int>, "pressurisation_required": <bool>, "source": "<clause>" }},
-    "fire_lift": {{ "min_car_width_mm": <int>, "source": "<clause>" }},
-    "fire_lift_lobby": {{ "min_area_m2": <float>, "source": "<clause>" }}
+    "staircase": {{
+      "min_flight_width_mm":      {{"dimension": <number>, "clause": "<ref or null>"}},
+      "min_landing_width_mm":     {{"dimension": <number>, "clause": "<ref or null>"}},
+      "max_riser_mm":             {{"dimension": <number>, "clause": "<ref or null>"}},
+      "min_tread_mm":             {{"dimension": <number>, "clause": "<ref or null>"}},
+      "min_headroom_mm":          {{"dimension": <number>, "clause": "<ref or null>"}},
+      "min_overrun_mm":           {{"dimension": <number>, "clause": "<ref or null>"}},
+      "max_travel_distance_mm":   {{"dimension": <number>, "clause": "<ref or null>"}},
+      "max_travel_distance_sprinklered_mm": {{"dimension": <number>, "clause": "<ref or null>"}},
+      "min_count":                {{"dimension": <number>, "clause": "<ref or null>"}},
+      "source": "<document name and version>"
+    }},
+    "fire_lift": {{
+      "<rule_key>": {{"dimension": <number_or_bool>, "clause": "<ref or null>"}},
+      "source": "<document name and version>"
+    }},
+    "fire_lift_lobby": {{
+      "min_area_mm2":  {{"dimension": <number>, "clause": "<ref or null>"}},
+      "min_width_mm":  {{"dimension": <number>, "clause": "<ref or null>"}},
+      "source": "<document name and version>"
+    }},
+    "smoke_stop_lobby": {{
+      "min_area_mm2":      {{"dimension": <number>, "clause": "<ref or null>"}},
+      "min_width_mm":      {{"dimension": <number>, "clause": "<ref or null>"}},
+      "min_clear_depth_mm": {{"dimension": <number>, "clause": "<ref or null>"}},
+      "source": "<document name and version>"
+    }},
+    "occupant_load": {{
+      "occupant_load_factor_m2":  {{"dimension": <number>, "clause": "<ref or null>"}},
+      "source": "<document name and version>"
+    }},
+    "exit_width": {{
+      "persons_per_unit_width":   {{"dimension": <number>, "clause": "<ref or null>"}},
+      "exit_width_per_unit_mm":   {{"dimension": <number>, "clause": "<ref or null>"}},
+      "source": "<document name and version>"
+    }},
+    "corridor": {{
+      "min_corridor_width_mm":    {{"dimension": <number>, "clause": "<ref or null>"}},
+      "source": "<document name and version>"
+    }}
   }}
 }}
 """
@@ -34,24 +190,59 @@ def _log(msg):
     client.log(f"[RAG] {msg}")
 
 
+# Load cache at module import time (after _log is defined)
+_load_chunk_cache()
+
+
 async def _fetch_topic(topic: str, intent: dict) -> dict:
+    from revit_mcp.cancel_manager import check_cancelled
+    check_cancelled("RAG fetch {}".format(topic))
     t0 = time.time()
-    _log(f"_fetch_topic START: {topic}")
-    query = build_query(topic, intent)
-    _log(f"_fetch_topic query built for {topic}: {query}")
+    source = _TOPIC_SOURCE.get(topic)
+    authority = _authority_from_source(source)
+    _log(f"_fetch_topic START: {topic} (authority={authority})")
+
+    # ── Cache hit: skip Vertex entirely ───────────────────────────────────────
+    cached = _get_cached_chunks(authority, topic)
+    if cached:
+        _log(f"_fetch_topic CACHE HIT: {authority}/{topic} — {len(cached)} chunks (skipping Vertex) in {time.time()-t0:.2f}s")
+        return {"topic": topic, "results": cached}
+
+    # ── Cache miss: query Vertex and update cache ──────────────────────────────
+    _log(f"_fetch_topic CACHE MISS: {authority}/{topic} — querying Vertex AI")
+    queries = build_queries(topic, intent)
+    _log(f"_fetch_topic {len(queries)} sub-queries for {topic} | source_filter={source}")
     loop = asyncio.get_running_loop()
-    try:
-        results = await loop.run_in_executor(
-            None, lambda: query_vertex_rag(query=query, topic_filter=topic, top_k=5)
-        )
-        _log(f"_fetch_topic DONE: {topic} — {len(results)} results in {time.time()-t0:.2f}s")
-    except Exception as e:
-        _log(f"_fetch_topic ERROR: {topic} — {e} ({time.time()-t0:.2f}s)")
-        results = []
+
+    async def _run_one(q):
+        try:
+            return await loop.run_in_executor(
+                None, lambda: query_vertex_rag(query=q, top_k=2, source_filter=source)
+            )
+        except Exception as e:
+            _log(f"_fetch_topic sub-query ERROR ({q[:60]}): {e}")
+            return []
+
+    all_batches = await asyncio.gather(*[_run_one(q) for q in queries])
+
+    # Deduplicate within this fetch by content prefix
+    seen_content = set()
+    fresh_chunks = []
+    for batch in all_batches:
+        for chunk in batch:
+            key = chunk.get("content", "")[:120]
+            if key and key not in seen_content:
+                seen_content.add(key)
+                fresh_chunks.append(chunk)
+
+    # Merge into persistent cache (handles dedup against previously cached chunks)
+    results = _merge_and_cache_chunks(authority, topic, fresh_chunks)
+
+    _log(f"_fetch_topic DONE: {topic} — {len(results)} chunks ({len(fresh_chunks)} fresh) in {time.time()-t0:.2f}s")
     return {"topic": topic, "results": results}
 
 
-async def retrieve_rules(intent: dict, report=None) -> dict:
+async def retrieve_rules(intent: dict, report=None, set_status=None) -> dict:
     t0 = time.time()
     topics = intent.get("topics", [])
     _log(f"retrieve_rules START — intent={intent}")
@@ -60,13 +251,18 @@ async def retrieve_rules(intent: dict, report=None) -> dict:
         _log("retrieve_rules: no topics in intent, skipping")
         return {}
 
-    if report:
-        report(f"🔍 **Authority Code Sub-Agent** — querying Vertex AI RAG for: {', '.join(topics)}")
+    _log(f"retrieve_rules: querying Vertex AI RAG for: {', '.join(topics)}")
+    if set_status:
+        set_status("Sub-agent: searching authority code library for {} topic(s)...".format(len(topics)))
 
     _log(f"retrieve_rules: firing {len(topics)} parallel Vertex queries...")
     t_vertex = time.time()
     raw_results = await asyncio.gather(*[_fetch_topic(t, intent) for t in topics])
-    _log(f"retrieve_rules: all Vertex queries done in {time.time()-t_vertex:.2f}s")
+    _t_v = time.time() - t_vertex
+    _log(f"retrieve_rules: all Vertex queries done in {_t_v:.2f}s")
+    if set_status:
+        set_status("Sub-agent: {} code excerpts retrieved in {:.0f}s — synthesising rules...".format(
+            sum(len(r["results"]) for r in raw_results), _t_v))
 
     chunks_text = ""
     retrieved_summary = []
@@ -75,20 +271,25 @@ async def retrieve_rules(intent: dict, report=None) -> dict:
         chunks_text += f"\n\n--- {item['topic'].upper()} ---\n"
         top_chunks = []
         for chunk in item["results"]:
-            clause = chunk["metadata"].get("clause", "unknown clause")
-            content = chunk["content"]
-            chunks_text += f"[{clause}] {content}\n"
+            meta       = chunk["metadata"]
+            clause     = meta.get("clause", "unknown clause")
+            clause_refs = meta.get("clause_refs", [])
+            content    = chunk["content"]
+            source_uri = chunk.get("source_uri", "")
+            # Include pre-extracted clause refs inline so synthesis can use them
+            refs_str = f" [refs: {', '.join(clause_refs)}]" if clause_refs else ""
+            chunks_text += f"[{clause}{refs_str}] {content}\n"
+            _log(f"  chunk [{clause}] refs={clause_refs} source={source_uri} | content={content}")
             if content:
-                top_chunks.append(f"_{clause}_: {content[:120]}...")
+                top_chunks.append(f"_{clause}_: {content}")
         if top_chunks:
             retrieved_summary.append(f"**{topic_label}**\n" + "\n".join(f"  • {c}" for c in top_chunks[:2]))
 
-    if report and retrieved_summary:
-        report("📋 **Retrieved SCDF excerpts:**\n" + "\n\n".join(retrieved_summary), is_narrative=True)
+    # Raw excerpts are intentionally NOT reported to the user — they are verbose
+    # internal data. The clean synthesised summary is reported after Gemini synthesis.
 
+    _log(f"=== RAW CHUNKS SENT TO SYNTHESIS ({len(chunks_text)} chars) ===\n{chunks_text}\n=== END CHUNKS ===")
     _log(f"retrieve_rules: chunks assembled ({len(chunks_text)} chars), calling Gemini for synthesis...")
-    if report:
-        report("🤖 **Authority Code Sub-Agent** — synthesising rules into structured JSON...")
 
     prompt = SUB_AGENT_PROMPT.format(
         intent_json=json.dumps(intent, indent=2),
@@ -97,8 +298,11 @@ async def retrieve_rules(intent: dict, report=None) -> dict:
 
     t_gemini = time.time()
     try:
-        raw_text = client.generate_content(prompt, thinking_budget=0)
-        _log(f"retrieve_rules: Gemini synthesis done in {time.time()-t_gemini:.2f}s, response len={len(raw_text)}")
+        raw_text = client.generate_content(prompt, thinking_budget=0, temperature=0.3)
+        _t_g = time.time() - t_gemini
+        _log(f"retrieve_rules: Gemini synthesis done in {_t_g:.2f}s, response len={len(raw_text)}")
+        if set_status:
+            set_status("Sub-agent: rules synthesised in {:.0f}s — passing to main agent...".format(_t_g))
     except Exception as e:
         _log(f"retrieve_rules: Gemini synthesis FAILED in {time.time()-t_gemini:.2f}s — {e}")
         if report:
@@ -112,15 +316,22 @@ async def retrieve_rules(intent: dict, report=None) -> dict:
 
     try:
         rules = json.loads(raw_text.strip())
+
+        # Sanity-check area values — if any _mm2 key is unreasonably small it was
+        # returned in m2 instead of mm2. Threshold: anything < 100,000 mm2 (0.1 m2)
+        # for a lobby/room is physically impossible, so multiply by 1,000,000.
+        _AREA_KEYS = {"min_area_mm2", "min_floor_area_mm2"}
+        for topic_vals in rules.get("rules", {}).values():
+            for k, v in topic_vals.items():
+                if k in _AREA_KEYS and isinstance(v, dict) and "dimension" in v:
+                    dim = v["dimension"]
+                    if isinstance(dim, (int, float)) and 0 < dim < 100000:
+                        corrected = int(dim * 1_000_000)
+                        _log(f"[AreaFix] {k}={dim} looks like m2 — converting to {corrected} mm2")
+                        v["dimension"] = corrected
+
         _log(f"retrieve_rules: JSON parsed OK — topics={list(rules.get('rules', {}).keys())} total={time.time()-t0:.2f}s")
-        if report and rules.get("rules"):
-            lines = []
-            for topic, vals in rules["rules"].items():
-                label = topic.replace("_", " ").title()
-                source = vals.get("source", "")
-                nums = {k: v for k, v in vals.items() if k != "source"}
-                lines.append(f"**{label}**: {json.dumps(nums)} _{source}_")
-            report("✅ **Authority codes resolved:**\n" + "\n".join(f"  • {l}" for l in lines), is_narrative=True)
+        _log(f"=== SUB-AGENT OUTPUT (passed to main AI) ===\n{json.dumps(rules, indent=2)}\n=== END SUB-AGENT OUTPUT ===")
         return rules
     except Exception as e:
         _log(f"retrieve_rules: JSON parse FAILED — {e} | raw={raw_text[:200]}")
@@ -143,25 +354,119 @@ def _run_in_new_loop(coro):
         loop.close()
 
 
-def run_retrieve_rules(intent: dict, report=None) -> dict:
+def run_retrieve_rules(intent: dict, report=None, set_status=None) -> dict:
     """Synchronous entry point for dispatcher.py."""
+    from revit_mcp.cancel_manager import is_cancelled
     t0 = time.time()
     _log(f"run_retrieve_rules START — intent={intent}")
+    # Use explicit executor (not context manager) so shutdown(wait=False) can be
+    # called immediately on cancel without waiting for the running thread to finish.
+    executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
     try:
-        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
-            _log("run_retrieve_rules: submitting to ThreadPoolExecutor...")
-            future = executor.submit(_run_in_new_loop, retrieve_rules(intent, report=report))
-            _log("run_retrieve_rules: waiting for result (timeout=15s)...")
-            result = future.result(timeout=15)
-            _log(f"run_retrieve_rules DONE in {time.time()-t0:.2f}s")
-            return result
-    except concurrent.futures.TimeoutError:
-        _log(f"run_retrieve_rules TIMEOUT after {time.time()-t0:.2f}s — falling back to static rules")
+        _log("run_retrieve_rules: submitting to ThreadPoolExecutor...")
+        future = executor.submit(_run_in_new_loop, retrieve_rules(intent, report=report, set_status=set_status))
+        _log("run_retrieve_rules: waiting for result (timeout=150s)...")
+        deadline = time.time() + 150
+        while True:
+            try:
+                result = future.result(timeout=0.5)
+                _log(f"run_retrieve_rules DONE in {time.time()-t0:.2f}s")
+                return result
+            except concurrent.futures.TimeoutError:
+                if is_cancelled():
+                    raise RuntimeError("Build cancelled by user.")
+                if time.time() >= deadline:
+                    _log(f"run_retrieve_rules TIMEOUT after {time.time()-t0:.2f}s — falling back to static rules")
+                    if report:
+                        report("⚠️ Authority code retrieval timed out (>150s), using static rules.")
+                    return {}
+    except RuntimeError as e:
+        if "cancelled" in str(e).lower():
+            raise
+        _log(f"run_retrieve_rules ERROR after {time.time()-t0:.2f}s — {e}")
         if report:
-            report("⚠️ Authority code retrieval timed out (>15s), using static rules.")
+            report(f"⚠️ Authority code retrieval error: {e}")
         return {}
     except Exception as e:
         _log(f"run_retrieve_rules ERROR after {time.time()-t0:.2f}s — {e}")
         if report:
             report(f"⚠️ Authority code retrieval error: {e}")
         return {}
+    finally:
+        executor.shutdown(wait=False)  # don't block on in-flight thread after cancel
+
+
+def format_rules_for_display(rules: dict) -> str:
+    """Build a markdown table string from the final merged rules dict. Returns '' if no rows."""
+    _TOPIC_ORDER = ["occupant_load", "exit_width", "staircase", "smoke_stop_lobby", "fire_lift_lobby", "fire_lift", "corridor"]
+    _TOPIC_LABELS = {
+        "staircase":        "Staircases",
+        "fire_lift_lobby":  "Fire Lift Lobby",
+        "smoke_stop_lobby": "Smoke Stop Lobby",
+        "fire_lift":        "Fire Lift",
+        "occupant_load":    "Occupant Load",
+        "exit_width":       "Exit Width",
+        "corridor":         "Corridor",
+    }
+    _KEY_LABELS = {
+        "min_flight_width_mm":                "Min flight width",
+        "min_landing_width_mm":               "Min landing width",
+        "max_riser_mm":                       "Max riser",
+        "min_tread_mm":                       "Min tread",
+        "min_headroom_mm":                    "Min headroom",
+        "min_overrun_mm":                     "Min overrun",
+        "max_travel_distance_mm":             "Max travel distance",
+        "max_travel_distance_sprinklered_mm": "Max travel distance (sprinklered)",
+        "min_count":                          "Min staircase count",
+        "min_car_width_mm":                   "Min car width",
+        "min_car_depth_mm":                   "Min car depth",
+        "min_car_size_mm":                    "Min car size",
+        "min_door_width_mm":                  "Min door width",
+        "min_load_kg":                        "Min load",
+        "min_speed_m_s":                      "Min speed",
+        "min_area_mm2":                       "Min area",
+        "min_width_mm":                       "Min width",
+        "min_depth_mm":                       "Min depth",
+        "min_clear_depth_mm":                 "Min clear depth",
+        "pressurisation_required":            "Pressurisation required",
+        "occupant_load_factor_m2":            "Occupant load factor",
+        "persons_per_unit_width":             "Persons per unit width",
+        "exit_width_per_unit_mm":             "Exit width per unit",
+        "min_corridor_width_mm":              "Min corridor width",
+    }
+    all_rules = rules.get("rules", {})
+    if not all_rules:
+        return ""
+    rows = []
+    ordered = [t for t in _TOPIC_ORDER if t in all_rules]
+    ordered += [t for t in all_rules if t not in ordered]
+    for topic in ordered:
+        vals   = all_rules[topic]
+        label  = _TOPIC_LABELS.get(topic, topic.replace("_", " ").title())
+        source = vals.get("source", "")
+        first  = True
+        for key, val in vals.items():
+            if key == "source" or val is None:
+                continue
+            pretty = _KEY_LABELS.get(key, key.replace("_", " ").capitalize())
+            if isinstance(val, dict):
+                dim    = val.get("dimension", "")
+                clause = val.get("clause") or ""
+                if isinstance(dim, bool):
+                    dim_str = "Yes" if dim else "No"
+                elif isinstance(dim, (int, float)):
+                    dim_str = str(int(dim)) if float(dim) == int(dim) else str(dim)
+                else:
+                    dim_str = str(dim)
+                clause_str = f"Cl. {clause}" if clause else "—"
+            else:
+                dim_str    = str(val)
+                clause_str = "—"
+            topic_cell  = f"**{label}**" if first else ""
+            source_cell = source if first else ""
+            rows.append(f"| {topic_cell} | {pretty} | {dim_str} | {clause_str} | {source_cell} |")
+            first = False
+    if not rows:
+        return ""
+    header = "| Topic | Parameter | Value | Clause | Source |\n| --- | --- | --- | --- | --- |"
+    return header + "\n" + "\n".join(rows)

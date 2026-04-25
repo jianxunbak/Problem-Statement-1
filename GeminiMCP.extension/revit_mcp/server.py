@@ -20,6 +20,14 @@ _uiapp = None
 def set_revit_app(uiapp):
     global _uiapp
     _uiapp = uiapp
+    # Scope build_options.json to the currently open Revit project
+    try:
+        from revit_mcp.build_memory import set_active_project_path
+        doc = uiapp.ActiveUIDocument.Document if uiapp and uiapp.ActiveUIDocument else None
+        rvt_path = doc.PathName if doc and doc.PathName else None
+        set_active_project_path(rvt_path)
+    except Exception:
+        pass  # non-fatal — falls back to the generic build_options.json
 
 def _get_revit_app():
     return _uiapp
@@ -233,10 +241,24 @@ def edit_type(type_name: str = "", type_id: str = "", parameters: dict = None) -
 async def orchestrate_build(prompt: str, ctx: Context = None) -> str:
     from . import dispatcher
     from revit_mcp.runner import log
+    from revit_mcp import cancel_manager
     log(f"DEBUG: orchestrate_build called. ctx={bool(ctx)}")
+    cancel_manager.clear_cancel()
     loop = asyncio.get_running_loop()
     tracker = BuildProgressTracker(ctx, loop)
-    return await asyncio.to_thread(dispatcher.orchestrator.run_full_stack, _uiapp, prompt, tracker)
+    try:
+        return await asyncio.to_thread(dispatcher.orchestrator.run_full_stack, _uiapp, prompt, tracker)
+    except asyncio.CancelledError:
+        cancel_manager.request_cancel()
+        raise
+
+
+@mcp.tool()
+def cancel_build() -> str:
+    """Immediately stop any in-progress orchestrate_build execution."""
+    from revit_mcp import cancel_manager
+    cancel_manager.request_cancel()
+    return '{"status": "cancelled"}'
 
 @mcp.tool()
 async def edit_entire_building_dimensions(ctx: Context = None, **kwargs) -> str:
@@ -286,3 +308,37 @@ def heartbeat() -> str:
 @mcp.tool()
 def get_building_presets() -> str:
     return json.dumps(logic.get_building_presets_ui())
+
+@mcp.tool()
+def list_build_options() -> str:
+    """List all saved building design options and their revisions.
+    Use when the user asks what options they have, wants to see build history,
+    or is deciding which design to continue from.
+    """
+    from revit_mcp.build_memory import get_options_manager
+    return get_options_manager().list_options()
+
+@mcp.tool()
+async def rollback_to_option(option_number: int = 1, revision_number: int = None) -> str:
+    """Restore a previously saved building design option to Revit.
+    Deletes all current Revit elements and re-applies the saved manifest.
+    option_number: the option number (e.g. 1 for Opt-001).
+    revision_number: optional revision number (e.g. 1 for Rev01); omit for the base option.
+    Use when the user says 'rollback to option 2', 'revert to option 1 revision 3', etc.
+    WARNING: This is destructive — it wipes the current model before restoring.
+    """
+    from revit_mcp.dispatcher import orchestrator
+    rev_str = str(revision_number) if revision_number is not None else None
+    return await asyncio.to_thread(orchestrator._execute_rollback, str(option_number), rev_str)
+
+@mcp.tool()
+def export_option_to_notion(option_number: int = 1, revision_number: int = None) -> str:
+    """Export a saved design option or revision to Notion as a new database page.
+    Uploads the manifest JSON and design metadata (name, typology, duration, etc.).
+    option_number: the option number (e.g. 1 for Opt-001).
+    revision_number: optional; omit to export the base option.
+    Use when the user says 'export option 1 to Notion' or 'upload design 2 to Notion'.
+    """
+    from revit_mcp.build_memory import get_options_manager
+    rev_str = str(revision_number) if revision_number is not None else None
+    return get_options_manager().export_to_notion(str(option_number), rev_str)

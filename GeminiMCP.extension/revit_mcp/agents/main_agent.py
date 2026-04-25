@@ -37,10 +37,10 @@ def extract_intent(user_prompt: str) -> dict:
             building_type = btype
             break
 
-    # --- Topics — SCDF mandates fire safety systems above 4 storeys ---
+    # --- Topics — always retrieve occupant load, exit width, corridor, travel distance for any building.
+    # SCDF mandates fire safety systems above 4 storeys.
+    topics = ["staircase", "occupant_load", "exit_width", "travel_distance", "corridor", "smoke_stop_lobby"]
     if storey > 4:
-        topics = ["staircase", "fire_lift", "fire_lift_lobby"]
-    else:
-        topics = ["staircase"]
+        topics += ["fire_lift", "fire_lift_lobby"]
 
     return {"topics": topics, "building_type": building_type, "storeys": storey}

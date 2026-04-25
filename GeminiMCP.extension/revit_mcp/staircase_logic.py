@@ -232,11 +232,18 @@ def get_max_shaft_depth(levels_data, spec=None, typical_floor_height_mm=None):
 #  Position calculation (fire-safety rules)
 # ─────────────────────────────────────────────────────────────────────
 
-def get_safety_set_dimensions(typical_floor_height_mm, spec=None, is_fire_lift=False, levels_data=None):
+def get_safety_set_dimensions(typical_floor_height_mm, spec=None, is_fire_lift=False, levels_data=None,
+                              compliance_overrides=None):
     """Return width/depth for a fire safety suite (lobby + stairs).
 
     Uses get_max_shaft_depth to robustly identify the true typical depth.
+    compliance_overrides: dict of RAG-derived values that override static module constants.
     """
+    co = compliance_overrides or {}
+    fire_lb_area = co.get("fire_lobby_min_area_mm2",  _FIRE_LB_AREA)
+    smoke_lb_area = co.get("smoke_lobby_min_area_mm2", _SMOKE_LB_AREA)
+    min_lb_depth  = co.get("smoke_lobby_min_depth_mm", _MIN_LB_DEPTH)
+
     net_w = get_shaft_dimensions(4000, spec)[0]
     # Identify typical depth across all levels if data is provided, else fallback
     if levels_data:
@@ -246,10 +253,9 @@ def get_safety_set_dimensions(typical_floor_height_mm, spec=None, is_fire_lift=F
         net_d = get_shaft_dimensions(typical_floor_height_mm, spec)[1]
     t = _WALL_THICKNESS
     # Minimum required lobby area (e.g. 6.0 m2 for fire lift)
-    # Minimum required lobby area (e.g. 6.0 m2 for fire lift)
-    target_net_area = _FIRE_LB_AREA if is_fire_lift else _SMOKE_LB_AREA
+    target_net_area = fire_lb_area if is_fire_lift else smoke_lb_area
     # Minimum required lobby clear dimension (as per compliance rules)
-    min_net_depth = _MIN_LB_DEPTH
+    min_net_depth = min_lb_depth
     
     # Add depth to accommodate lobby area
     # net_d already includes 2*w_landing. We need to ADD a dedicated lobby depth.
@@ -276,32 +282,38 @@ def calculate_staircase_positions(floor_dims_mm, core_center_mm,
                                   typical_floor_height_mm, spec=None,
                                   max_travel_mm=_MAX_TRAVEL,
                                   num_lifts=None, lobby_width=3000,
-                                  levels_data=None):
+                                  levels_data=None, orientation="NS"):
     """Determine staircase centre positions.
+
+    orientation: "NS" — stairs at north/south ends of lift core (default).
+                 "EW" — stairs at east/west ends of lift core.
     """
     if levels_data:
         shaft_d = get_max_shaft_depth(levels_data, spec, typical_floor_height_mm)
     else:
-        # Fallback smart detection
         _, shaft_d = get_shaft_dimensions(typical_floor_height_mm, spec)
     cx, cy = core_center_mm
 
     if lift_core_bounds_mm:
-        _, core_ymin, _, core_ymax = lift_core_bounds_mm
+        core_xmin, core_ymin, core_xmax, core_ymax = lift_core_bounds_mm
     else:
-        # No lift core — leave a small gap from centre
-        core_ymin = cy - 2500
-        core_ymax = cy + 2500
+        core_xmin = cx - 2500; core_xmax = cx + 2500
+        core_ymin = cy - 2500; core_ymax = cy + 2500
 
-    # --- Primary pair: abutt Y-ends of lift core [rules b, c, d] ---
-    stair_south_y = core_ymin - shaft_d / 2.0
-    stair_north_y = core_ymax + shaft_d / 2.0
-
-    # Rule: for single row lifts (<4), south staircase (front/door side) must be set back for lobby
-    if num_lifts is not None and num_lifts < 4:
-        stair_south_y -= lobby_width
-
-    positions = [(cx, stair_south_y), (cx, stair_north_y)]
+    if orientation == "EW":
+        # --- Primary pair: abutt X-ends of lift core ---
+        stair_west_x = core_xmin - shaft_d / 2.0
+        stair_east_x = core_xmax + shaft_d / 2.0
+        if num_lifts is not None and num_lifts < 4:
+            stair_west_x -= lobby_width
+        positions = [(stair_west_x, cy), (stair_east_x, cy)]
+    else:
+        # --- Primary pair: abutt Y-ends of lift core (NS default) ---
+        stair_south_y = core_ymin - shaft_d / 2.0
+        stair_north_y = core_ymax + shaft_d / 2.0
+        if num_lifts is not None and num_lifts < 4:
+            stair_south_y -= lobby_width
+        positions = [(cx, stair_south_y), (cx, stair_north_y)]
 
     # --- 60 m rule [rules e, f] ---
     if _check_travel_distance(positions, floor_dims_mm, max_travel_mm):
@@ -385,17 +397,38 @@ def calculate_staircase_positions(floor_dims_mm, core_center_mm,
     return positions
 
 
+def _point_in_polygon(px, py, polygon_pts):
+    """Ray-casting point-in-polygon test. Returns True if (px, py) is inside the polygon."""
+    n = len(polygon_pts)
+    inside = False
+    j = n - 1
+    for i in range(n):
+        xi, yi = polygon_pts[i][0], polygon_pts[i][1]
+        xj, yj = polygon_pts[j][0], polygon_pts[j][1]
+        if ((yi > py) != (yj > py)) and (px < (xj - xi) * (py - yi) / (yj - yi) + xi):
+            inside = not inside
+        j = i
+    return inside
+
+
 def _check_travel_distance(stair_positions, floor_dims_mm,
-                           max_dist_mm, num_required=2):
+                           max_dist_mm, num_required=2, footprint_pts=None):
     """Return True if every sampled floor-plate point can reach at least
-    *num_required* staircases within *max_dist_mm* (Euclidean)."""
+    *num_required* staircases within *max_dist_mm* (Euclidean).
+
+    footprint_pts: optional list of [x, y] polygon vertices (mm, centred at
+    origin) describing the actual floor shape.  When provided, rectangular
+    grid test-points that fall outside the polygon are discarded, and polygon
+    vertices (slightly inset toward the centroid) are added to guarantee
+    coverage of each actual corner — which is the worst-case travel point for
+    non-rectangular shapes such as L, H, U, or T floor plates.
+    """
     if len(stair_positions) < num_required:
         return False
 
     # Collect all unique floor dimensions to test
     to_test = []
     if isinstance(floor_dims_mm, list):
-        # Filter duplicates to save time
         seen = set()
         for d in floor_dims_mm:
             w, l = d[0], d[1]
@@ -403,8 +436,41 @@ def _check_travel_distance(stair_positions, floor_dims_mm,
                 to_test.append((w, l))
                 seen.add((w, l))
     else:
-        # Fallback if it's just one dimension pair
         to_test = [(floor_dims_mm[0], floor_dims_mm[1])]
+
+    # When a polygon is supplied, build sample points from a regular grid over the
+    # polygon bounding box, keeping only those whose centres fall inside the shape.
+    # Sampling at cell centres (not edges/vertices) avoids the boundary ambiguity
+    # of ray-casting, so no point lands exactly on a polygon edge.
+    # This replaces the rectangular 12-point grid entirely for organic shapes.
+    if footprint_pts and len(footprint_pts) >= 3:
+        _fp_xs = [p[0] for p in footprint_pts]
+        _fp_ys = [p[1] for p in footprint_pts]
+        _fp_xmin, _fp_xmax = min(_fp_xs), max(_fp_xs)
+        _fp_ymin, _fp_ymax = min(_fp_ys), max(_fp_ys)
+        _N = 8  # 8×8 grid → ~64 candidates, cell centres avoid polygon edges
+        _dx = (_fp_xmax - _fp_xmin) / float(_N)
+        _dy = (_fp_ymax - _fp_ymin) / float(_N)
+        poly_test_pts = [
+            (_fp_xmin + (_ix + 0.5) * _dx, _fp_ymin + (_iy + 0.5) * _dy)
+            for _ix in range(_N)
+            for _iy in range(_N)
+            if _point_in_polygon(
+                _fp_xmin + (_ix + 0.5) * _dx,
+                _fp_ymin + (_iy + 0.5) * _dy,
+                footprint_pts
+            )
+        ]
+        if not poly_test_pts:
+            poly_test_pts = [(0.0, 0.0)]
+        for px, py in poly_test_pts:
+            dists = sorted(
+                math.sqrt((px - sx) ** 2 + (py - sy) ** 2)
+                for sx, sy in stair_positions
+            )
+            if dists[num_required - 1] > max_dist_mm:
+                return False
+        return True
 
     for floor_w_mm, floor_l_mm in to_test:
         hw = floor_w_mm / 2.0
@@ -547,7 +613,7 @@ def generate_staircase_manifest(positions, levels_data, _enclosure_width_mm=None
                                 lift_core_bounds_mm=None, floor_dims_mm=None,
                                 num_lifts=None, lobby_width=3000,
                                 base_y_override=None, rotated_indices=[],
-                                stair_idx_offset=0):
+                                stair_idx_offset=0, compliance_overrides=None):
     """Generate wall and floor manifest entries for all staircases.
 
     The enclosure footprint (plan size) is **fixed** for every level,
@@ -578,6 +644,9 @@ def generate_staircase_manifest(positions, levels_data, _enclosure_width_mm=None
     Returns:
         ``{"walls": [...], "floors": [...]}``
     """
+    co = compliance_overrides or {}
+    overrun_height = co.get("overrun_height_mm", _OVERRUN_HEIGHT)
+
     spec = spec or {}
     riser = spec.get("riser", _STD_RISER)
     tread = spec.get("tread", _STD_TREAD)
@@ -749,7 +818,7 @@ def generate_staircase_manifest(positions, levels_data, _enclosure_width_mm=None
 
             # --- Determine wall height ---
             if is_roof:
-                wall_height = _OVERRUN_HEIGHT
+                wall_height = overrun_height
             else:
                 next_lvl = levels_data[i + 1]
                 wall_height = next_lvl['elevation'] - lvl['elevation']
@@ -912,7 +981,7 @@ def generate_staircase_manifest(positions, levels_data, _enclosure_width_mm=None
 
             if is_roof:
                 # — TOPCAP: closing slab above overrun (matches lift core) —
-                cap_elev = lvl['elevation'] + _OVERRUN_HEIGHT
+                cap_elev = lvl['elevation'] + overrun_height
                 floors.append({
                     "id": "AI_{}_TOPCAP".format(s_tag),
                     "level_id": lvl_id,

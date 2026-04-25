@@ -13,11 +13,64 @@
 
         <!-- Header -->
         <Border Grid.Row="0" BorderBrush="#333333" BorderThickness="0,0,0,1" Padding="0,0,0,10">
-            <StackPanel Orientation="Horizontal">
-                <TextBlock Text="Gemini MCP Chat" FontSize="20" FontWeight="SemiBold" VerticalAlignment="Center" Foreground="#E0E0E0"/>
-                <TextBlock x:Name="StatusDot" Text=" ●" FontSize="14" VerticalAlignment="Center" Foreground="#4CAF50" Margin="10,0,0,0"/>
-                <TextBlock x:Name="StatusText" Text="MCP Server Active" FontSize="12" VerticalAlignment="Center" Foreground="#AAAAAA" Margin="5,0,0,0"/>
-            </StackPanel>
+            <Grid>
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="*"/>
+                    <ColumnDefinition Width="Auto"/>
+                </Grid.ColumnDefinitions>
+                <StackPanel Grid.Column="0" Orientation="Horizontal" VerticalAlignment="Center">
+                    <TextBlock Text="Gemini MCP Chat" FontSize="20" FontWeight="SemiBold" VerticalAlignment="Center" Foreground="#E0E0E0"/>
+                    <TextBlock x:Name="StatusDot" Text=" ●" FontSize="14" VerticalAlignment="Center" Foreground="#4CAF50" Margin="10,0,0,0"/>
+                    <TextBlock x:Name="StatusText" Text="MCP Server Active" FontSize="12" VerticalAlignment="Center" Foreground="#AAAAAA" Margin="5,0,0,0"/>
+                </StackPanel>
+                <Button x:Name="MenuButton"
+                        Grid.Column="1"
+                        VerticalAlignment="Center"
+                        Width="32" Height="32"
+                        Background="#1E1E1E"
+                        BorderThickness="0"
+                        Foreground="#AAAAAA"
+                        FontSize="18"
+                        FontWeight="Bold"
+                        Content="⋮"
+                        Cursor="Hand"
+                        ToolTip="Options">
+                    <Button.ContextMenu>
+                        <ContextMenu Background="#2D2D2D" BorderBrush="#555555" BorderThickness="1"
+                                     HasDropShadow="True">
+                            <ContextMenu.Resources>
+                                <Style TargetType="MenuItem">
+                                    <Setter Property="Background" Value="#2D2D2D"/>
+                                    <Setter Property="Foreground" Value="#E0E0E0"/>
+                                    <Setter Property="FontSize" Value="13"/>
+                                    <Setter Property="Padding" Value="12,8"/>
+                                    <Setter Property="Template">
+                                        <Setter.Value>
+                                            <ControlTemplate TargetType="MenuItem">
+                                                <Border x:Name="Bg"
+                                                        Background="{TemplateBinding Background}"
+                                                        Padding="{TemplateBinding Padding}">
+                                                    <ContentPresenter ContentSource="Header"
+                                                                      RecognizesAccessKey="True"/>
+                                                </Border>
+                                                <ControlTemplate.Triggers>
+                                                    <Trigger Property="IsHighlighted" Value="True">
+                                                        <Setter TargetName="Bg" Property="Background" Value="#3E3E3E"/>
+                                                    </Trigger>
+                                                    <Trigger Property="IsPressed" Value="True">
+                                                        <Setter TargetName="Bg" Property="Background" Value="#505050"/>
+                                                    </Trigger>
+                                                </ControlTemplate.Triggers>
+                                            </ControlTemplate>
+                                        </Setter.Value>
+                                    </Setter>
+                                </Style>
+                            </ContextMenu.Resources>
+                            <MenuItem x:Name="ClearChatMenuItem" Header="Clear Chat"/>
+                        </ContextMenu>
+                    </Button.ContextMenu>
+                </Button>
+            </Grid>
         </Border>
 
         <!-- Chat History Area -->

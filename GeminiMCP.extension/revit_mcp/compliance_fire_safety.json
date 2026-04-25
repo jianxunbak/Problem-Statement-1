@@ -1,5 +1,6 @@
 {
   "_standard": "SCDF Fire Code 2023",
+  "_note": "Keys prefixed '_disabled_' are intentionally suppressed — their values must come from live RAG retrieval. Remove the prefix to re-enable as a static fallback.",
   "fire_lift": {
     "min_car_width_mm": 1100,
     "min_car_depth_mm": 2100,
@@ -9,23 +10,33 @@
     "min_count": 2
   },
   "fire_lift_lobby": {
-    "min_area_mm2": 6000000,
-    "min_width_mm": 1200,
-    "min_depth_mm": 1400
+    "_disabled_min_area_mm2": 6000000,
+    "_disabled_min_width_mm": 1200,
+    "_disabled_min_depth_mm": 1400
   },
   "smoke_stop_lobby": {
-    "min_area_mm2": 4000000,
-    "min_clear_depth_mm": 2000
+    "_disabled_min_area_mm2": 4000000,
+    "_disabled_min_clear_depth_mm": 2000
   },
   "staircase": {
-    "min_count": 2,
-    "max_travel_distance_mm": 60000,
-    "min_flight_width_mm": 1000,
+    "_disabled_min_count": 2,
+    "_disabled_max_travel_distance_mm": 60000,
+    "_disabled_min_flight_width_mm": 1000,
     "min_headroom_mm": 2400,
     "overrun_height_mm": 5000,
     "min_riser_mm": 100,
     "max_riser_mm": 220,
     "min_tread_mm": 250
+  },
+  "occupant_load": {
+    "_disabled_occupant_load_factor_m2": 10.0
+  },
+  "exit_width": {
+    "_disabled_persons_per_unit_width": 100,
+    "_disabled_exit_width_per_unit_mm": 500
+  },
+  "corridor": {
+    "_disabled_min_corridor_width_mm": 1200
   },
   "perimeter_staircase": {
     "edge_inset_gap_mm": 500,

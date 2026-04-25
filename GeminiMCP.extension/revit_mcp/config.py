@@ -9,7 +9,7 @@ except Exception:
     pass
 
 GOOGLE_CLOUD_PROJECT = os.environ.get("GOOGLE_CLOUD_PROJECT", "your-project-id")
-GOOGLE_CLOUD_LOCATION = "global"
+GOOGLE_CLOUD_LOCATION = os.environ.get("GOOGLE_CLOUD_LOCATION", "us")
 VERTEX_DATASTORE_ID = os.environ.get("VERTEX_DATASTORE_ID", "scdf-fire-codes-poc")
 
 # Full Vertex AI Search serving config path

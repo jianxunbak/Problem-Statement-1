@@ -362,7 +362,28 @@ class BuildingSystem:
         """Converts Architectural Intent (Storeys/Shell) into concrete element lists."""
         setup = manifest.get("project_setup", {})
         shell = manifest.get("shell", {})
-        
+
+        # --- SVG FOOTPRINT EXPANSION ---
+        # If Gemini provided a footprint_svg string, convert it to footprint_points
+        # (and optionally footprint_holes for multi-subpath courtyard/void SVGs).
+        # footprint_svg takes priority over any manually specified footprint_points.
+        svg_path = shell.get("footprint_svg")
+        if svg_path:
+            try:
+                from revit_mcp.svg_to_footprint import svg_path_to_multiloop
+                multi = svg_path_to_multiloop(svg_path)
+                shell = dict(shell)          # shallow copy so we don't mutate the original
+                shell["footprint_points"] = multi["outer"]
+                if multi["holes"]:
+                    shell["footprint_holes"] = multi["holes"]
+                shell.pop("footprint_svg", None)
+                manifest = dict(manifest)
+                manifest["shell"] = shell
+                self.log("[SVG] footprint_svg converted: {} outer vertices, {} hole(s)".format(
+                    len(multi["outer"]), len(multi["holes"])))
+            except Exception as _svg_err:
+                self.log("[SVG] footprint_svg conversion FAILED: {} — building will be rectangular".format(_svg_err))
+
         # --- RESET SPATIAL REGISTRY ---
         self.spatial_registry.clear()
         
@@ -498,6 +519,7 @@ class BuildingSystem:
         # Initial core center based on floor center
         center_pos = [f_center_x, f_center_y]
         all_voids = []
+        exposed_stair_info = []  # populated after fire-safety manifest generation
         # Calculate Unified Core (Passenger Lifts + Fire Safety Sets)
         preset_fs = preset.get("core_logic", {}).get("fire_safety", {})
         stair_spec = preset_fs.get("staircase_spec", {}).copy()
@@ -519,11 +541,41 @@ class BuildingSystem:
         # 2. Generate the Unified Manifest
         unified_man = fire_safety_logic.generate_fire_safety_manifest(
             safety_sets, new_levels, stair_spec, base_height, preset_fs, None, num_lifts, lobby_w,
-            center_pos_mm=center_pos
+            all_floor_dims=all_floor_dims
         )
         
         if isinstance(unified_man, dict) and unified_man.get("status") == "CONFLICT":
             return unified_man
+
+        # 2b. Exposed staircase floor-widening (Step 2 of design intent)
+        # If any perimeter staircases extend outside smaller floor plates, optionally
+        # widen those floors to enclose the stairs — controlled by the manifest flag
+        # `enclose_exposed_stairs` (default: True unless user sets it to False).
+        # The AI can set this to false to leave stairs exposed as a design choice.
+        enclose_exposed = manifest.get("enclose_exposed_stairs", True)
+        exposed_stair_info = unified_man.get("exposed_stair_info", [])
+        if exposed_stair_info and enclose_exposed:
+            for exposure in exposed_stair_info:
+                for lvl_exp in exposure["exposed_levels"]:
+                    lvl_key = str(lvl_exp["level_index"])
+                    cur_w, cur_l = all_floor_dims[lvl_exp["level_index"] - 1]
+                    new_w = max(cur_w, lvl_exp["min_width_to_enclose"])
+                    new_l = max(cur_l, lvl_exp["min_length_to_enclose"])
+                    if new_w == cur_w and new_l == cur_l:
+                        continue  # already large enough; no change needed
+                    # Update floor_overrides so Phase 3 shell walls use new dims
+                    ovr = floor_overrides.get(lvl_key, {})
+                    ovr["width"] = new_w
+                    ovr["length"] = new_l
+                    floor_overrides[lvl_key] = ovr
+                    # Patch all_floor_dims so column logic sees updated dims
+                    all_floor_dims[lvl_exp["level_index"] - 1] = (new_w, new_l)
+                    # Patch the floor slab points already assembled in new_floors
+                    for fl in new_floors:
+                        if fl.get("id") == "AI_Floor_{}".format(lvl_key):
+                            hw2, hl2 = new_w / 2.0, new_l / 2.0
+                            fl["points"] = [[-hw2, -hl2], [hw2, -hl2], [hw2, hl2], [-hw2, hl2]]
+                            break
 
         # 3. Precise Mental Model Reservation
         core_bounds_list = unified_man.get("core_bounds", [])
@@ -721,7 +773,10 @@ class BuildingSystem:
             len([o for o in occupancy if "Shell" not in o['id'] and "Core" not in o['id'] and "Safety" not in o['id']])
         ))
 
-        return {"levels": new_levels, "walls": new_walls, "floors": new_floors, "columns": new_columns, "core_bounds": core_bounds_list, "voids": all_voids}
+        result = {"levels": new_levels, "walls": new_walls, "floors": new_floors, "columns": new_columns, "core_bounds": core_bounds_list, "voids": all_voids}
+        if exposed_stair_info:
+            result["exposed_stair_info"] = exposed_stair_info
+        return result
 
     def _curb_wall_segment(self, p1, p2, bounds, tolerance=100.0):
         xmin, ymin, xmax, ymax = bounds

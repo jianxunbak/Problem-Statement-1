@@ -24,6 +24,13 @@ def pump_commands(uiapp):
         try:
             func, args, kwargs, event, result_wrapper, queued_at = _work_queue.get_nowait()
 
+            from revit_mcp.cancel_manager import is_cancelled
+            if is_cancelled():
+                result_wrapper['error'] = RuntimeError("Build cancelled by user.")
+                event.set()
+                _work_queue.task_done()
+                continue
+
             latency = (datetime.datetime.now() - queued_at).total_seconds()
             if latency > 1.0:
                 with open(LOG_PATH, "a") as f:
@@ -51,17 +58,25 @@ def pump_commands(uiapp):
 
 def run_on_main_thread(func, *args, **kwargs):
     """Submit a function for execution on the Revit main thread. Blocks until done."""
+    from revit_mcp.cancel_manager import is_cancelled
+    if is_cancelled():
+        raise RuntimeError("Build cancelled by user.")
+
     event = threading.Event()
     result_wrapper = {'data': None, 'error': None}
     queued_at = datetime.datetime.now()
 
     _work_queue.put((func, args, kwargs, event, result_wrapper, queued_at))
 
-    if not event.wait(1200):
-        with open(LOG_PATH, "a") as f:
-            f.write("[{}] Bridge: TIMEOUT waiting for main thread execution of {}\n".format(
-                datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"), str(func)))
-        raise TimeoutError("Revit main thread did not respond within 1200s.")
+    deadline = queued_at + datetime.timedelta(seconds=1200)
+    while not event.wait(0.5):
+        if is_cancelled():
+            raise RuntimeError("Build cancelled by user.")
+        if datetime.datetime.now() >= deadline:
+            with open(LOG_PATH, "a") as f:
+                f.write("[{}] Bridge: TIMEOUT waiting for main thread execution of {}\n".format(
+                    datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"), str(func)))
+            raise TimeoutError("Revit main thread did not respond within 1200s.")
 
     if result_wrapper['error']:
         raise result_wrapper['error']

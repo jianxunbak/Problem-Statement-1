@@ -174,7 +174,7 @@ def start_mcp_server():
             from revit_mcp.config import RAG_ENABLED
             if RAG_ENABLED:
                 from revit_mcp.rag.vertex_rag import _ensure_imported
-                _warmup = threading.Thread(target=_ensure_imported, args=(10.0,), daemon=True, name="RAG_Warmup")
+                _warmup = threading.Thread(target=_ensure_imported, args=(30.0,), daemon=True, name="RAG_Warmup")
                 _warmup.start()
                 log("Main: RAG import warmup thread started.")
         except Exception as _e:

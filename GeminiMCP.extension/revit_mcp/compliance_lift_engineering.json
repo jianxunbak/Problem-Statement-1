@@ -18,7 +18,7 @@
   "capacity_limits": {
     "min_lifts": 2,
     "max_lifts_per_block": 12,
-    "max_total_lifts": 24
+    "max_total_lifts": 16
   },
   "car_dimensions_mm": {
     "min_width": 1100,

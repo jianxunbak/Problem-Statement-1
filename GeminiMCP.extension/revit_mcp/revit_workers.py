@@ -55,46 +55,101 @@ def _merge_void_rects(rects):
     return merged
 
 
-def _make_circle_footprint(radius_mm):
-    """Generate a 4-arc footprint_points approximating a circle of given radius.
-    Uses 4 cardinal points + arc mid-points at 45° intervals (CCW winding).
-    The 3-point arc API requires the mid-point to lie ON the arc (not at chord mid)."""
-    r = radius_mm
-    m = radius_mm / math.sqrt(2.0)  # radius * cos(45deg) = point at 45deg on circle
-    return [
-        [0,  -r, {"mid_x":  m, "mid_y": -m}],   # south -> mid SE -> east
-        [r,   0, {"mid_x":  m, "mid_y":  m}],   # east  -> mid NE -> north
-        [0,   r, {"mid_x": -m, "mid_y":  m}],   # north -> mid NW -> west
-        [-r,  0, {"mid_x": -m, "mid_y": -m}],   # west  -> mid SW -> south
-    ]
+def _make_circle_footprint(radius_mm, n=48):
+    """Generate an n-vertex polygon approximating a circle (CCW winding).
+    No arc mid-points — polygon floors work reliably in Revit; walls with many
+    short straight segments look smooth at architectural scale."""
+    pts = []
+    for i in range(n):
+        angle = math.pi / 2.0 + 2.0 * math.pi * i / n  # start north, go CCW
+        pts.append([radius_mm * math.cos(angle), radius_mm * math.sin(angle)])
+    return pts
 
 
-def _make_ellipse_footprint(rx_mm, ry_mm):
-    """4-arc footprint approximating an ellipse (semi-axes rx, ry)."""
-    mx = rx_mm / math.sqrt(2.0)
-    my = ry_mm / math.sqrt(2.0)
-    return [
-        [0,    -ry_mm, {"mid_x":  mx, "mid_y": -my}],
-        [rx_mm, 0,     {"mid_x":  mx, "mid_y":  my}],
-        [0,     ry_mm, {"mid_x": -mx, "mid_y":  my}],
-        [-rx_mm, 0,    {"mid_x": -mx, "mid_y": -my}],
-    ]
+def _make_ellipse_footprint(rx_mm, ry_mm, n=48):
+    """Generate an n-vertex polygon approximating an ellipse (CCW winding)."""
+    pts = []
+    for i in range(n):
+        angle = math.pi / 2.0 + 2.0 * math.pi * i / n  # start north, go CCW
+        pts.append([rx_mm * math.cos(angle), ry_mm * math.sin(angle)])
+    return pts
 
 
 def _expand_shape_shorthand(shell):
     """Expand shell['shape'] into shell['footprint_points'] if not already present.
-    Supports 'circle', 'ellipse', 'oval'. Modifies shell in-place and returns it."""
+    Supports 'circle', 'ellipse', 'oval'. Modifies shell in-place and returns it.
+
+    Also auto-promotes a plain rectangular shell to footprint_points when
+    footprint_scale_overrides or footprint_offset_overrides are present — this
+    ensures the organic per-level scale/offset pipeline is used instead of the
+    static rectangular wall path, which ignores those keys entirely.
+    """
     shape = str(shell.get("shape", "")).lower().strip()
     if not shape or shell.get("footprint_points"):
-        return shell  # nothing to do
-    w = safe_num(shell.get("width"), 30000)
-    l = safe_num(shell.get("length"), w)
-    if shape == "circle":
-        r = max(w, l) / 2.0
-        shell["footprint_points"] = _make_circle_footprint(r)
-    elif shape in ("ellipse", "oval"):
-        shell["footprint_points"] = _make_ellipse_footprint(w / 2.0, l / 2.0)
+        # May still need promotion for scale/offset overrides
+        pass
+    else:
+        w = safe_num(shell.get("width"), 30000)
+        l = safe_num(shell.get("length"), w)
+        if shape == "circle":
+            r = max(w, l) / 2.0
+            shell["footprint_points"] = _make_circle_footprint(r)
+        elif shape in ("ellipse", "oval"):
+            shell["footprint_points"] = _make_ellipse_footprint(w / 2.0, l / 2.0)
+
+    # Promote rectangular shell → footprint_points when organic overrides are present.
+    # footprint_scale_overrides / footprint_offset_overrides / footprint_rotation_overrides
+    # are only processed by the organic wall/slab pipeline, which requires footprint_points.
+    # Without this promotion a rectangular building with any of these overrides would
+    # silently fall through to the static 4-wall path and produce a uniform tower.
+    if not shell.get("footprint_points") and (
+        shell.get("footprint_scale_overrides")
+        or shell.get("footprint_offset_overrides")
+        or shell.get("footprint_rotation_overrides")
+    ):
+        w = safe_num(shell.get("width"), 30000)
+        l = safe_num(shell.get("length"), w)
+        hw, hl = w / 2.0, l / 2.0
+        # CCW rectangle centred on origin
+        shell["footprint_points"] = [
+            [-hw, -hl],
+            [ hw, -hl],
+            [ hw,  hl],
+            [-hw,  hl],
+        ]
+        try:
+            from revit_mcp.gemini_client import client as _cl
+            _cl.log("[ShapePromotion] Rectangular shell promoted to footprint_points ({}x{}mm) for organic scale/offset overrides.".format(w, l))
+        except Exception:
+            pass
+
     return shell
+
+
+def _get_interpolated_rotation(rotation_overrides, level_1based):
+    """Return the rotation in degrees for a given 1-based level index,
+    linearly interpolating between sparse control-point keys.
+    Levels outside the key range clamp to the nearest endpoint.
+    Example: {"1": 0, "10": 90, "20": 180} → 45° at level 5."""
+    if not rotation_overrides:
+        return 0.0
+    pts = {}
+    for k, v in rotation_overrides.items():
+        try:
+            pts[int(k)] = float(v)
+        except (ValueError, TypeError):
+            pass
+    if not pts:
+        return 0.0
+    sorted_keys = sorted(pts.keys())
+    if level_1based <= sorted_keys[0]:
+        return pts[sorted_keys[0]]
+    if level_1based >= sorted_keys[-1]:
+        return pts[sorted_keys[-1]]
+    lo = max(k for k in sorted_keys if k <= level_1based)
+    hi = min(k for k in sorted_keys if k > level_1based)
+    t = (level_1based - lo) / float(hi - lo)
+    return pts[lo] + t * (pts[hi] - pts[lo])
 
 
 def _get_interpolated_scale(scale_overrides, level_1based):
@@ -126,20 +181,180 @@ def _get_interpolated_scale(scale_overrides, level_1based):
     return pts[lo] + t * (pts[hi] - pts[lo])
 
 
-def _scale_footprint(pts, scale):
-    """Scale footprint_points about the origin [0,0] by a uniform scale factor.
-    Arc mid-points (3rd element dicts with mid_x/mid_y) are scaled the same way."""
+def _scale_footprint(pts, scale, offset_x=0.0, offset_y=0.0, rotation_deg=0.0):
+    """Scale footprint_points about [0,0], rotate, then apply an XY offset (all in mm).
+
+    Order: scale → rotate → offset.
+    rotation_deg rotates the (already-scaled) footprint about the origin before
+    the centroid offset is applied. This produces a true per-level rotation for
+    twist/screw forms without changing the footprint size.
+    offset_x / offset_y shift the rotated footprint so the form can drift
+    asymmetrically as it rises — positive X moves east, positive Y moves north.
+    Arc mid-points are transformed identically to vertices.
+    """
+    import math as _math
+    cos_r = _math.cos(_math.radians(rotation_deg))
+    sin_r = _math.sin(_math.radians(rotation_deg))
+
+    def _transform(x, y):
+        xs = x * scale
+        ys = y * scale
+        xr = xs * cos_r - ys * sin_r
+        yr = xs * sin_r + ys * cos_r
+        return xr + offset_x, yr + offset_y
+
     result = []
     for pt in pts:
-        new_pt = [pt[0] * scale, pt[1] * scale]
+        rx, ry = _transform(pt[0], pt[1])
+        new_pt = [rx, ry]
         if len(pt) > 2 and isinstance(pt[2], dict):
             ad = pt[2]
+            mx, my = _transform(ad.get("mid_x", 0), ad.get("mid_y", 0))
+            new_pt.append({"mid_x": mx, "mid_y": my})
+        result.append(new_pt)
+    return result
+
+
+def _build_volume_map(manifest, num_levels):
+    """Return a dict {level_1based: volume_dict} from manifest["volumes"].
+
+    Each volume entry:
+      {"id": "vol_base", "levels": [1, 5], "width": 40000, "length": 40000,
+       "offset_x": 0, "offset_y": 0, "rotation_deg": 0,
+       "footprint_points": [...]}   # optional — overrides width/length box
+
+    Levels assigned to MULTIPLE volumes use the LAST one listed (higher in
+    the array wins, so Gemini can layer corrections easily).
+    """
+    volumes = manifest.get("volumes")
+    if not volumes:
+        return {}
+    vol_map = {}
+    for vol in volumes:
+        try:
+            lo, hi = int(vol["levels"][0]), int(vol["levels"][1])
+        except (KeyError, IndexError, TypeError, ValueError):
+            continue
+        for lvl in range(lo, hi + 1):
+            if 1 <= lvl <= num_levels:
+                vol_map[lvl] = vol
+    return vol_map
+
+
+def _rotate_pts(pts_2d, angle_rad, cx=0.0, cy=0.0):
+    """Rotate a list of [x, y] points about (cx, cy) by angle_rad.
+    Points may have an optional arc-mid dict as a third element — it is also rotated.
+    """
+    cos_a, sin_a = math.cos(angle_rad), math.sin(angle_rad)
+    result = []
+    for pt in pts_2d:
+        dx, dy = pt[0] - cx, pt[1] - cy
+        rx = cx + dx * cos_a - dy * sin_a
+        ry = cy + dx * sin_a + dy * cos_a
+        new_pt = [rx, ry]
+        if len(pt) > 2 and isinstance(pt[2], dict):
+            ad = pt[2]
+            mdx, mdy = ad.get("mid_x", cx) - cx, ad.get("mid_y", cy) - cy
             new_pt.append({
-                "mid_x": ad.get("mid_x", 0) * scale,
-                "mid_y": ad.get("mid_y", 0) * scale,
+                "mid_x": cx + mdx * cos_a - mdy * sin_a,
+                "mid_y": cy + mdx * sin_a + mdy * cos_a,
             })
         result.append(new_pt)
     return result
+
+
+def _volume_footprint_pts(vol):
+    """Return the footprint polygon [[x,y], ...] (mm) for a volume entry.
+    Uses explicit footprint_points if provided, otherwise builds a rectangle
+    from width/length centred on (offset_x, offset_y), then rotates by rotation_deg.
+    """
+    ox = safe_num(vol.get("offset_x", 0), 0)
+    oy = safe_num(vol.get("offset_y", 0), 0)
+    rot_rad = math.radians(safe_num(vol.get("rotation_deg", 0), 0))
+
+    if vol.get("footprint_points"):
+        pts = [list(p) for p in vol["footprint_points"]]
+    else:
+        w = safe_num(vol.get("width", 20000), 20000) / 2.0
+        l = safe_num(vol.get("length", 20000), 20000) / 2.0
+        # CCW rectangle centred on origin before offset
+        pts = [[-w, -l], [w, -l], [w, l], [-w, l]]
+
+    # Rotate about origin, then shift to offset position
+    if rot_rad != 0.0:
+        pts = _rotate_pts(pts, rot_rad)
+    # Apply offset
+    pts = [[p[0] + ox, p[1] + oy] + ([p[2]] if len(p) > 2 else []) for p in pts]
+    return pts
+
+
+def _get_interpolated_offset(offset_overrides, level_1based):
+    """Interpolate per-level XY offset from sparse control points.
+
+    offset_overrides format: {"1": [0,0], "10": [3000, -1500], "20": [0, 2000]}
+    Values are [offset_x_mm, offset_y_mm]. Linearly interpolated between keys.
+    Returns (offset_x_mm, offset_y_mm).
+    """
+    if not offset_overrides:
+        return 0.0, 0.0
+    pts = {}
+    for k, v in offset_overrides.items():
+        try:
+            if isinstance(v, (list, tuple)) and len(v) >= 2:
+                pts[int(k)] = (float(v[0]), float(v[1]))
+        except (ValueError, TypeError):
+            pass
+    if not pts:
+        return 0.0, 0.0
+    sorted_keys = sorted(pts.keys())
+    if level_1based <= sorted_keys[0]:
+        return pts[sorted_keys[0]]
+    if level_1based >= sorted_keys[-1]:
+        return pts[sorted_keys[-1]]
+    lo = max(k for k in sorted_keys if k <= level_1based)
+    hi = min(k for k in sorted_keys if k > level_1based)
+    t = (level_1based - lo) / float(hi - lo)
+    lox, loy = pts[lo]
+    hix, hiy = pts[hi]
+    return lox + t * (hix - lox), loy + t * (hiy - loy)
+
+
+def _interp_floor_override_offset(floor_overrides, level_1based):
+    """Linearly interpolate offset_x / offset_y from sparse floor_overrides keys.
+
+    floor_overrides format: {"1": {"offset_x": 0, "offset_y": 0}, "30": {"offset_x": 15000, "offset_y": 0}}
+    Levels without an explicit key are interpolated between their neighbours.
+    Levels before the first key clamp to the first key; levels after the last key
+    clamp to the last key.  Returns (offset_x_mm, offset_y_mm).
+    """
+    if not floor_overrides:
+        return 0.0, 0.0
+    pts = {}
+    for k, v in floor_overrides.items():
+        if not isinstance(v, dict):
+            continue
+        ox = safe_num(v.get("offset_x", None), None)
+        oy = safe_num(v.get("offset_y", None), None)
+        if ox is not None or oy is not None:
+            try:
+                pts[int(k)] = (float(ox or 0.0), float(oy or 0.0))
+            except (ValueError, TypeError):
+                pass
+    if not pts:
+        return 0.0, 0.0
+    sorted_keys = sorted(pts.keys())
+    if level_1based <= sorted_keys[0]:
+        return pts[sorted_keys[0]]
+    if level_1based >= sorted_keys[-1]:
+        return pts[sorted_keys[-1]]
+    lo = max(k for k in sorted_keys if k <= level_1based)
+    hi = min(k for k in sorted_keys if k > level_1based)
+    if lo == hi:
+        return pts[lo]
+    t = (level_1based - lo) / float(hi - lo)
+    lox, loy = pts[lo]
+    hix, hiy = pts[hi]
+    return lox + t * (hix - lox), loy + t * (hiy - loy)
 
 
 class RevitWorkers:
@@ -166,12 +381,32 @@ class RevitWorkers:
 
     def execute_fast_manifest(self, manifest):
         """High-speed execution using intent-based logic and state-aware updates"""
+        from revit_mcp.cancel_manager import check_cancelled
         self.log("--- execute_fast_manifest START ---")
         import Autodesk.Revit.DB as DB # type: ignore
         from revit_mcp.building_generator import get_model_registry # type: ignore
         doc = self.doc
         results = {"levels": [], "elements": [], "summary": {}}
-        
+
+        # --- SVG FOOTPRINT EXPANSION ---
+        # Convert footprint_svg → footprint_points before any phase touches the manifest.
+        # This is the real execution path; building_generator._expand_high_level_manifest
+        # is the legacy path and is not called from here.
+        _shell = manifest.get("shell", {})
+        _svg_path = _shell.get("footprint_svg")
+        if _svg_path:
+            try:
+                from revit_mcp.svg_to_footprint import svg_path_to_footprint_points
+                _pts = svg_path_to_footprint_points(_svg_path)
+                _shell = dict(_shell)
+                _shell["footprint_points"] = _pts
+                _shell.pop("footprint_svg", None)
+                manifest = dict(manifest)
+                manifest["shell"] = _shell
+                self.log("[SVG] footprint_svg converted: {} vertices".format(len(_pts)))
+            except Exception as _svg_err:
+                self.log("[SVG] footprint_svg conversion FAILED: {} — building will be rectangular".format(_svg_err))
+
         # 1. State Scan
         registry = get_model_registry(doc)
         self._registry_cache = registry  # Cache so sub-methods can access for lift count detection
@@ -180,6 +415,7 @@ class RevitWorkers:
         _typology = manifest.get("typology", "")
         self._manifest_typology = _typology  # store so sub-methods can access
         self._compliance_params = manifest.get("compliance_parameters", {})
+        self._current_manifest = manifest  # store for volume/asymmetry sub-methods
         
         # Track counts of elements handled/created/deleted
         reused = [0]
@@ -200,7 +436,7 @@ class RevitWorkers:
         
         try:
             # --- PHASE 1: LEVELS ---
-            if self.tracker: self.tracker.report("Setting up building elevations...")
+            if self.tracker: self.tracker.set_status("Setting up building elevations...")
             t = DB.Transaction(doc, "AI Build: Levels")
             t.Start()
             setup_failure_handling(t, use_nuclear=True)
@@ -223,7 +459,7 @@ class RevitWorkers:
                         height_desc = f", all at {unique_h[0]}mm"
                     else:
                         height_desc = f", heights: {min(heights_mm)}-{max(heights_mm)}mm"
-                self.tracker.report(
+                self.tracker.set_status(
                     f"{self._phase_msg('levels', lvl_new, lvl_reused)} "
                     f"({len(current_levels)} total, top elevation {elevations[-1]*304.8:.0f}mm{height_desc})"
                 )
@@ -234,6 +470,7 @@ class RevitWorkers:
             if "footprint_points" in shell and "footprint_points" not in manifest.get("shell", {}):
                 manifest.setdefault("shell", {})["footprint_points"] = shell["footprint_points"]
 
+            check_cancelled("after levels phase")
             # --- PHASE 2: VERTICAL CIRCULATION (Unified Core: Lifts + Staircases) ---
             # Pre-calculate core layout BEFORE opening a transaction — this is pure Python
             # (no Revit document writes). Keeping heavy calc inside a transaction was wasting
@@ -242,7 +479,7 @@ class RevitWorkers:
             importlib.reload(staircase_logic)
             importlib.reload(fire_safety_logic)
             self.log("Step 3a: Pre-calculating Unified Vertical Circulation layout...")
-            if self.tracker: self.tracker.report("Calculating unified core layout (Lifts + Fire Safety)...")
+            if self.tracker: self.tracker.set_status("Calculating unified core layout (Lifts + Fire Safety)...")
 
             core_bounds_ft = None
             if "core_bounds" in manifest and manifest["core_bounds"]:
@@ -285,7 +522,7 @@ class RevitWorkers:
             self._stair_fps_cache = self._cleanup_staircases(doc, getattr(self, '_stair_run_data', []), manifest)
 
             if self.tracker and (core_new or core_reused):
-                self.tracker.report(
+                self.tracker.set_status(
                     f"{self._phase_msg('core elements', core_new, core_reused)} "
                     f"(Unified Lifts, Stairs, and Fire Safety lobbies synced to core bounds)"
                 )
@@ -319,12 +556,13 @@ class RevitWorkers:
             if pre_del_count > 0:
                 self.log("Atomic Pre-Cleanup: bulk-deleted {} legacy AI elements for clean build.".format(pre_del_count))
 
+            check_cancelled("after vertical circulation phase")
             # --- PHASE 3: WALLS & FLOORS ---
             t = DB.Transaction(doc, "AI Build: Shell")
             t.Start()
             setup_failure_handling(t, use_nuclear=True)
             self.log("Step 3b: Processing Shell Walls and Floors...")
-            if self.tracker: self.tracker.report("Processing shell walls and floors...")
+            if self.tracker: self.tracker.set_status("Processing shell walls and floors...")
             # footprint_points in shell = organic mode; shell handles it natively
             # suppress_shell only needed when AI uses granular walls[] with arcs AND no footprint_points
             has_footprint = bool(shell.get("footprint_points"))
@@ -339,7 +577,7 @@ class RevitWorkers:
                 self._process_walls(current_levels, elevations, floor_dims, shell, registry, results, created, reused, affected_elements)
             walls_new, walls_reused = created[0] - c0, reused[0] - r0
             c0, r0 = created[0], reused[0]
-            res_f = self._process_floors(current_levels, floor_dims, shell, registry, results, created, reused, affected_elements)
+            res_f = self._process_floors(current_levels, floor_dims, shell, registry, results, created, reused, affected_elements, core_bounds_ft=core_bounds)
             if isinstance(res_f, dict) and res_f.get("status") == "CONFLICT":
                 try: t.RollBack(); t.Dispose()
                 except: pass
@@ -366,11 +604,11 @@ class RevitWorkers:
                     fp_desc = f"{min_w/1000:.0f}-{max_w_d/1000:.0f}m x {min_l/1000:.0f}-{max_l_d/1000:.0f}m"
                 cant = shell.get("cantilever_depth", 0)
                 cant_desc = f", cantilever {cant}mm" if cant else ""
-                self.tracker.report(
+                self.tracker.set_status(
                     f"{self._phase_msg('perimeter walls', walls_new, walls_reused)} "
                     f"(4 per level, footprint {fp_desc})"
                 )
-                self.tracker.report(
+                self.tracker.set_status(
                     f"{self._phase_msg('floor slabs', floors_new, floors_reused)} "
                     f"({len(current_levels)} levels{cant_desc})"
                 )
@@ -408,11 +646,12 @@ class RevitWorkers:
             self._synth_span_w = synth_span_w
             self._synth_span_l = synth_span_l
 
+            check_cancelled("after shell phase")
             t = DB.Transaction(doc, "AI Build: Structure")
             t.Start()
             setup_failure_handling(t, use_nuclear=True)
             self.log("Step 3c: Processing Structure with Core Alignment...")
-            if self.tracker: self.tracker.report("Processing structural columns...")
+            if self.tracker: self.tracker.set_status("Processing structural columns...")
             c0, r0 = created[0], reused[0]
             self._process_columns_and_grids(current_levels, elevations, floor_dims, expanded_slab_dims, shell, registry, results, created, reused, affected_elements, core_bounds)
             cols_new, cols_reused = created[0] - c0, reused[0] - r0
@@ -425,13 +664,14 @@ class RevitWorkers:
                     spacing_str = "x".join(f"{v/1000:.0f}" for v in col_spacing) + "m"
                 else:
                     spacing_str = f"{col_spacing/1000:.0f}m"
-                self.tracker.report(
+                self.tracker.set_status(
                     f"{self._phase_msg('structural columns', cols_new, cols_reused)} "
                     f"(grid spacing {spacing_str}, {offset_edge}mm from edge)"
                 )
             t.Commit()
             t.Dispose()
 
+            check_cancelled("after structure phase")
             # --- PHASE 5: GRANULAR ---
             t = DB.Transaction(doc, "AI Build: Granular")
             t.Start()
@@ -446,7 +686,7 @@ class RevitWorkers:
                 if gran_wall_count: parts.append(f"{gran_wall_count} walls (lift cores, staircases, dividers)")
                 if gran_floor_count: parts.append(f"{gran_floor_count} floors (landings, custom slabs)")
                 if gran_col_count: parts.append(f"{gran_col_count} columns")
-                self.tracker.report(f"Processing granular elements: {', '.join(parts)}...")
+                self.tracker.set_status(f"Processing granular elements: {', '.join(parts)}...")
             c0, r0 = created[0], reused[0]
             self._process_granular_walls(manifest, current_levels, registry, results, created, reused, affected_elements)
             gw_new, gw_reused = created[0] - c0, reused[0] - r0
@@ -468,7 +708,7 @@ class RevitWorkers:
                 if gf_new or gf_reused: parts.append(self._phase_msg("floors", gf_new, gf_reused))
                 if gc_new or gc_reused: parts.append(self._phase_msg("columns", gc_new, gc_reused))
                 if parts:
-                    self.tracker.report(f"Granular overrides: {' | '.join(parts)}")
+                    self.tracker.set_status(f"Granular overrides: {' | '.join(parts)}")
             self._enforce_disjoint(affected_elements)
             t.Commit()
             t.Dispose()
@@ -478,14 +718,14 @@ class RevitWorkers:
             ss = getattr(self, '_stair_summary', None)
             if self.tracker:
                 if ss:
-                    self.tracker.report(
+                    self.tracker.set_status(
                         f"Creating stair runs ({ss['count']} cores, "
                         f"{ss['flights_typical']} flights/floor, "
                         f"{ss['risers_per_flight']} risers/flight at {ss['riser']}mm rise, "
                         f"{ss['tread']}mm tread)..."
                     )
                 else:
-                    self.tracker.report("Processing stair runs...")
+                    self.tracker.set_status("Processing stair runs...")
             try:
                 self.log("Step 4a: Creating Stair Runs...")
                 stair_runs_before = self.tracker.elements_created["stair_runs"] if self.tracker else 0
@@ -493,12 +733,12 @@ class RevitWorkers:
                 if self.tracker:
                     stair_runs_added = self.tracker.elements_created["stair_runs"] - stair_runs_before
                     if stair_runs_added > 0:
-                        self.tracker.report(f"Created {stair_runs_added} stair runs across {len(current_levels)-1} storeys.")
+                        self.tracker.set_status(f"Created {stair_runs_added} stair runs across {len(current_levels)-1} storeys.")
             except Exception as stair_err:
                 self.log("Stair phase failed (non-fatal): {}".format(stair_err))
 
             # --- PHASE 5.6: DOORS ---
-            if self.tracker: self.tracker.report("Placing doors in staircases, lobbies and lift shafts...")
+            if self.tracker: self.tracker.set_status("Placing doors in staircases, lobbies and lift shafts...")
             try:
                 t = DB.Transaction(doc, "AI Build: Doors")
                 t.Start()
@@ -508,7 +748,7 @@ class RevitWorkers:
                 t.Commit()
                 t.Dispose()
                 if self.tracker and doors_placed:
-                    self.tracker.report(f"Placed {doors_placed} doors (staircases, fire lobbies, lift shafts).")
+                    self.tracker.set_status(f"Placed {doors_placed} doors (staircases, fire lobbies, lift shafts).")
             except Exception as door_err:
                 import traceback
                 self.log("Door phase failed (non-fatal): {}\n{}".format(door_err, traceback.format_exc()))
@@ -516,7 +756,7 @@ class RevitWorkers:
                 except: pass
 
             # --- PHASE 6: CLEANUP & DOC ---
-            if self.tracker: self.tracker.report("Finalizing and cleaning up...")
+            if self.tracker: self.tracker.set_status("Finalizing and cleaning up...")
             t = DB.Transaction(doc, "AI Build: Cleanup")
             t.Start()
             setup_failure_handling(t, use_nuclear=True)
@@ -539,10 +779,21 @@ class RevitWorkers:
                 import json as _json, os as _os
                 from revit_mcp.utils import get_log_path
                 _shell_to_save = {k: v for k, v in manifest.get("shell", {}).items()}
-                # footprint_points is auto-generated from 'shape' — skip to keep file compact
-                if _shell_to_save.get("shape") and "footprint_points" in _shell_to_save:
-                    del _shell_to_save["footprint_points"]
-                _shell_path = _os.path.join(_os.path.dirname(get_log_path()), "last_shell_state.json")
+                # footprint_points is always auto-derived (from footprint_svg, shape, or
+                # rectangular expansion) — never persist it; it is a raw coordinate dump
+                # that confuses Gemini when injected back as EXISTING SHELL PARAMETERS.
+                # footprint_svg is the compact, human-readable source of truth — keep it.
+                _shell_to_save.pop("footprint_points", None)
+                # When volumes are used, do NOT persist organic shell overrides.
+                # Carrying scale / offset / rotation / svg from a previous organic build
+                # into a volumes build causes the old curved shape to bleed back.
+                if manifest.get("volumes"):
+                    for _organic_key in ("footprint_svg", "footprint_scale_overrides",
+                                         "footprint_offset_overrides", "footprint_rotation_overrides",
+                                         "shape"):
+                        _shell_to_save.pop(_organic_key, None)
+                from revit_mcp.utils import get_appdata_path
+                _shell_path = _os.path.join(get_appdata_path("cache"), "last_shell_state.json")
                 with open(_shell_path, "w") as _f:
                     _json.dump(_shell_to_save, _f)
                 self.log("Shell state saved to last_shell_state.json")
@@ -774,7 +1025,27 @@ class RevitWorkers:
         shell["length"] = base_l
         shell["position"] = base_pos
         overrides = shell.get("floor_overrides", {})
-        
+
+        # When volumes are present, levels above the topmost volume should use the
+        # top volume's bounding-box dims as a fallback instead of the full shell dims.
+        # This prevents a full-footprint slab being placed at the roof level.
+        _manifest_v = getattr(self, '_current_manifest', None) or manifest
+        _vol_top_lvl = 0
+        _vol_top_w = None
+        _vol_top_l = None
+        for _v in _manifest_v.get("volumes", []):
+            try:
+                _hi = int(_v["levels"][1])
+                if _hi > _vol_top_lvl:
+                    _vol_top_lvl = _hi
+                    _vpts = _volume_footprint_pts(_v)
+                    _vxs = [p[0] for p in _vpts]
+                    _vys = [p[1] for p in _vpts]
+                    _vol_top_w = max(_vxs) - min(_vxs)
+                    _vol_top_l = max(_vys) - min(_vys)
+            except Exception:
+                pass
+
         dims = []
         for i in range(len(current_levels)):
             lvl_idx = i + 1
@@ -813,10 +1084,20 @@ class RevitWorkers:
                             if w is None: w = (bb.Max.X - bb.Min.X) * 304.8
                             if l is None: l = (bb.Max.Y - bb.Min.Y) * 304.8
 
-            # 3. Fall back to global shell dimensions (for NEW levels only)
+            # 3. Fall back to global shell dimensions (for NEW levels only).
+            # Exception: levels above the topmost volume use the top volume's
+            # bounding-box dims so the roof slab matches the uppermost mass, not
+            # the full ground-floor shell footprint.
             dim_source = "override" if ov.get("width") or ov.get("length") else ("model" if w is not None else "shell")
-            if w is None: w = shell.get("width")
-            if l is None: l = shell.get("length")
+            if w is None:
+                if _vol_top_lvl > 0 and lvl_idx > _vol_top_lvl and _vol_top_w is not None:
+                    w = _vol_top_w
+                    l = _vol_top_l
+                    dim_source = "top_volume"
+                else:
+                    w = shell.get("width")
+                    if l is None:
+                        l = shell.get("length")
             final_w = get_random_dim(w, base_w, variation=0.25)
             final_l = get_random_dim(l, base_l, variation=0.25)
 
@@ -828,19 +1109,126 @@ class RevitWorkers:
             dims.append((final_w, final_l))
         return dims, shell
 
+    def _draw_volume_walls_for_level(self, k, lvl, elev, vol_pts, current_levels, elevations, registry, results, created, reused, affected_elements):
+        """Draw a closed polygon of walls for a single level from a volume's footprint points."""
+        import Autodesk.Revit.DB as DB  # type: ignore
+        doc = self.doc
+        n = len(vol_pts)
+        updated = []
+        for j in range(n):
+            seg_start = vol_pts[j]
+            seg_end   = vol_pts[(j + 1) % n]
+            p1 = DB.XYZ(mm_to_ft(seg_start[0]), mm_to_ft(seg_start[1]), elev)
+            p2 = DB.XYZ(mm_to_ft(seg_end[0]),   mm_to_ft(seg_end[1]),   elev)
+            if p1.DistanceTo(p2) < mm_to_ft(2.0):
+                continue
+            arc_data = seg_start[2] if len(seg_start) > 2 else None
+            is_arc_seg = arc_data and isinstance(arc_data, dict)
+            if is_arc_seg:
+                pm = DB.XYZ(mm_to_ft(arc_data["mid_x"]), mm_to_ft(arc_data["mid_y"]), elev)
+                try:
+                    curve = DB.Arc.Create(p1, p2, pm)
+                except Exception:
+                    try:
+                        curve = DB.Line.CreateBound(p1, p2)
+                    except Exception:
+                        continue
+                    is_arc_seg = False
+            else:
+                curve = DB.Line.CreateBound(p1, p2)
+
+            tag = "AI_Wall_L{}_Vol{}".format(k + 1, j)
+            wall_id = registry.get(tag)
+            wall = doc.GetElement(wall_id) if wall_id else None
+            if is_arc_seg and wall and isinstance(wall, DB.Wall):
+                doc.Delete(wall.Id)
+                wall = None
+            if wall and isinstance(wall, DB.Wall):
+                w_curve = wall.Location.Curve
+                if not (w_curve.GetEndPoint(0).IsAlmostEqualTo(curve.GetEndPoint(0)) and
+                        w_curve.GetEndPoint(1).IsAlmostEqualTo(curve.GetEndPoint(1))):
+                    disallow_joins(wall)
+                    try:
+                        wall.Location.Curve = curve
+                        affected_elements.append(wall)
+                    except Exception:
+                        doc.Delete(wall.Id)
+                        wall = None
+                if wall:
+                    disallow_joins(wall)
+                    reused[0] += 1
+            if not wall or not isinstance(wall, DB.Wall):
+                wall = DB.Wall.Create(doc, curve, lvl.Id, False)
+                disallow_joins(wall)
+                safe_set_comment(wall, tag)
+                registry[tag] = wall.Id
+                created[0] += 1
+                affected_elements.append(wall)
+            try:
+                if k < len(current_levels) - 1:
+                    wall.get_Parameter(DB.BuiltInParameter.WALL_HEIGHT_TYPE).Set(current_levels[k + 1].Id)
+                else:
+                    wall.get_Parameter(DB.BuiltInParameter.WALL_HEIGHT_TYPE).Set(DB.ElementId.InvalidElementId)
+                    h_ft = elevations[k + 1] - elevations[k] if k < len(elevations) - 1 else mm_to_ft(1000)
+                    p_h = wall.get_Parameter(DB.BuiltInParameter.WALL_USER_HEIGHT_PARAM)
+                    if p_h: p_h.Set(h_ft)
+            except:
+                pass
+            updated.append(wall)
+            results["elements"].append(str(wall.Id.Value))
+        return updated
+
     def _process_walls(self, current_levels, elevations, floor_dims, shell, registry, results, created, reused, affected_elements):
         import Autodesk.Revit.DB as DB # type: ignore
         doc = self.doc
         updated = []
 
+        # --- STACKED VOLUMES MODE ---
+        # Levels assigned to a volume get their walls drawn here.
+        # Remaining levels fall through to organic or rectangular mode.
+        # _level_indices carries the original 1-based level number for each
+        # entry in current_levels so that wall tags stay stable even when
+        # some levels are consumed by volumes and the list is spliced.
+        manifest = getattr(self, '_current_manifest', None) or {}
+        vol_map = _build_volume_map(manifest, len(current_levels))
+        _level_indices = list(range(1, len(current_levels) + 1))  # [1, 2, ..., N]
+        if vol_map:
+            vol_levels_done = set()
+            for k, lvl in enumerate(current_levels):
+                vol = vol_map.get(k + 1)
+                if vol is None:
+                    continue
+                vol_levels_done.add(k)
+                vol_pts = _volume_footprint_pts(vol)
+                updated += self._draw_volume_walls_for_level(
+                    k, lvl, elevations[k], vol_pts,
+                    current_levels, elevations, registry, results, created, reused, affected_elements
+                )
+            if vol_levels_done:
+                remaining_k = [k for k in range(len(current_levels)) if k not in vol_levels_done]
+                if not remaining_k:
+                    return updated
+                # Splice down to non-volume levels; preserve original level indices for tags
+                _level_indices  = [_level_indices[k]  for k in remaining_k]
+                current_levels  = [current_levels[k]  for k in remaining_k]
+                elevations      = [elevations[k]       for k in remaining_k]
+                floor_dims      = [floor_dims[k]       for k in remaining_k]
+
         footprint_pts = shell.get("footprint_points")
         if footprint_pts:
             # --- ORGANIC MODE: walls from polygon/arc footprint, optionally scaled per level ---
-            scale_overrides = shell.get("footprint_scale_overrides", {})
+            scale_overrides    = shell.get("footprint_scale_overrides", {})
+            offset_overrides   = shell.get("footprint_offset_overrides", {})
+            rotation_overrides = shell.get("footprint_rotation_overrides", {})
             for k, lvl in enumerate(current_levels):
+                from revit_mcp.cancel_manager import check_cancelled
+                check_cancelled("walls level {}".format(k + 1))
                 elev = elevations[k]
-                scale = _get_interpolated_scale(scale_overrides, k + 1)
-                level_pts = _scale_footprint(footprint_pts, scale) if scale != 1.0 else footprint_pts
+                orig_lvl = _level_indices[k]
+                scale = _get_interpolated_scale(scale_overrides, orig_lvl)
+                ox, oy = _get_interpolated_offset(offset_overrides, orig_lvl)
+                rot = _get_interpolated_rotation(rotation_overrides, orig_lvl)
+                level_pts = _scale_footprint(footprint_pts, scale, ox, oy, rot) if (scale != 1.0 or ox or oy or rot) else footprint_pts
                 n = len(level_pts)
                 for j in range(n):
                     seg_start = level_pts[j]
@@ -863,7 +1251,7 @@ class RevitWorkers:
                     else:
                         curve = DB.Line.CreateBound(p1, p2)
 
-                    tag = "AI_Wall_L{}_Seg{}".format(k + 1, j)
+                    tag = "AI_Wall_L{}_Seg{}".format(orig_lvl, j)
                     wall_id = registry.get(tag)
                     wall = doc.GetElement(wall_id) if wall_id else None
                     # Arc walls must be delete-and-recreated (can't change Line->Arc in place)
@@ -911,12 +1299,20 @@ class RevitWorkers:
 
         # --- RECTANGULAR MODE (default): 4 straight walls per level ---
         tags = ["AI_Wall_L{}_N", "AI_Wall_L{}_E", "AI_Wall_L{}_S", "AI_Wall_L{}_W"]
+        _rect_overrides = shell.get("floor_overrides", {})
 
         for k, lvl in enumerate(current_levels):
+            from revit_mcp.cancel_manager import check_cancelled
+            check_cancelled("walls level {}".format(k + 1))
+            orig_lvl = _level_indices[k]
             w_k, l_k = floor_dims[k]
             w_k_ft, l_k_ft = mm_to_ft(w_k), mm_to_ft(l_k)
             m_pos = shell.get("position", [0.0, 0.0])
-            cx_ft, cy_ft = mm_to_ft(m_pos[0]), mm_to_ft(m_pos[1])
+            # Interpolate offset across sparse floor_overrides keys so lean/tilt
+            # applies smoothly to every floor, not just explicitly listed ones.
+            ox_mm, oy_mm = _interp_floor_override_offset(_rect_overrides, orig_lvl)
+            cx_ft = mm_to_ft(m_pos[0] + ox_mm)
+            cy_ft = mm_to_ft(m_pos[1] + oy_mm)
             pts = [DB.XYZ(cx_ft - w_k_ft/2, cy_ft - l_k_ft/2, 0),
                    DB.XYZ(cx_ft + w_k_ft/2, cy_ft - l_k_ft/2, 0),
                    DB.XYZ(cx_ft + w_k_ft/2, cy_ft + l_k_ft/2, 0),
@@ -930,7 +1326,7 @@ class RevitWorkers:
                 if p1.DistanceTo(p2) < mm_to_ft(2.0): continue
                 line = DB.Line.CreateBound(p1, p2)
 
-                tag = tags[j].format(k+1)
+                tag = tags[j].format(orig_lvl)
                 wall_id = registry.get(tag)
                 wall = doc.GetElement(wall_id) if wall_id else None
                 is_changed = False
@@ -1002,7 +1398,9 @@ class RevitWorkers:
         g_parapet_h = safe_num(shell.get("parapet_height"), None)
         overrides = shell.get("floor_overrides", {})
         footprint_pts = shell.get("footprint_points")
-        scale_overrides = shell.get("footprint_scale_overrides", {})
+        scale_overrides    = shell.get("footprint_scale_overrides", {})
+        offset_overrides   = shell.get("footprint_offset_overrides", {})
+        rotation_overrides = shell.get("footprint_rotation_overrides", {})
 
         for k in range(len(current_levels)):
             lvl = current_levels[k]
@@ -1021,7 +1419,13 @@ class RevitWorkers:
                 scale_above = _get_interpolated_scale(scale_overrides, k + 2) if k + 1 < len(current_levels) else 0.0
                 if slab_scale <= scale_above:
                     continue  # wall above covers this slab edge -- no exposed parapet needed
-                level_pts = _scale_footprint(footprint_pts, slab_scale) if slab_scale != 1.0 else footprint_pts
+                if scale_here >= scale_below:
+                    ox, oy = _get_interpolated_offset(offset_overrides, k + 1)
+                    rot    = _get_interpolated_rotation(rotation_overrides, k + 1)
+                else:
+                    ox, oy = _get_interpolated_offset(offset_overrides, k)
+                    rot    = _get_interpolated_rotation(rotation_overrides, k)
+                level_pts = _scale_footprint(footprint_pts, slab_scale, ox, oy, rot) if (slab_scale != 1.0 or ox or oy or rot) else footprint_pts
                 n = len(level_pts)
                 wall_type = DB.FilteredElementCollector(doc).OfClass(DB.WallType).FirstElement()
                 for j in range(n):
@@ -1077,7 +1481,7 @@ class RevitWorkers:
                             tag = "AI_Parapet_L{}_{}".format(k+1, i)
                             self._draw_wall(doc, p1, p2, lvl, wall_type, mm_to_ft(p_h_mm), tag, registry, results, created, reused, affected_elements)
 
-    def _process_floors(self, current_levels, floor_dims, shell, registry, results, created, reused, affected_elements):
+    def _process_floors(self, current_levels, floor_dims, shell, registry, results, created, reused, affected_elements, core_bounds_ft=None):
         import Autodesk.Revit.DB as DB # type: ignore
         doc = self.doc
         ftype = DB.FilteredElementCollector(doc).OfClass(DB.FloorType).FirstElement()
@@ -1119,11 +1523,85 @@ class RevitWorkers:
                 _flog("[FloorDims] L{}: floor_dims=({:.0f},{:.0f}) expanded_slab=({:.0f},{:.0f})".format(
                     k+1, fd_w, fd_l, es_w, es_l))
 
+        # Convert core bounds to mm for slab expansion check (core_bounds_ft is in feet).
+        _core_mm = None
+        if core_bounds_ft and not isinstance(core_bounds_ft, dict):
+            _core_mm = (ft_to_mm(core_bounds_ft[0]), ft_to_mm(core_bounds_ft[1]),
+                        ft_to_mm(core_bounds_ft[2]), ft_to_mm(core_bounds_ft[3]))
+
+        # Build volume map once for floor loop (same manifest as _process_walls)
+        _manifest_f = getattr(self, '_current_manifest', None) or {}
+        vol_map_f = _build_volume_map(_manifest_f, len(current_levels))
+
         for k, lvl in enumerate(current_levels):
+            from revit_mcp.cancel_manager import check_cancelled
+            check_cancelled("floors level {}".format(k + 1))
+            orig_lvl = k + 1  # 1-based; used for tags and override lookups
             slab_w, slab_l = expanded_slab_dims[k]
+
+            # --- VOLUME SLAB ---
+            vol_f = vol_map_f.get(orig_lvl)
+            if vol_f is not None:
+                vol_pts_f = _volume_footprint_pts(vol_f)
+                # Ensure slab encompasses the central core footprint.
+                # If the core extends beyond the volume polygon's bounding box,
+                # expand the slab to a rectangle that contains both.
+                if _core_mm:
+                    _vxs = [p[0] for p in vol_pts_f]
+                    _vys = [p[1] for p in vol_pts_f]
+                    _vxmin, _vxmax = min(_vxs), max(_vxs)
+                    _vymin, _vymax = min(_vys), max(_vys)
+                    _cxmin, _cymin, _cxmax, _cymax = _core_mm
+                    if (_cxmin < _vxmin - 1 or _cxmax > _vxmax + 1 or
+                            _cymin < _vymin - 1 or _cymax > _vymax + 1):
+                        _nxmin = min(_vxmin, _cxmin)
+                        _nxmax = max(_vxmax, _cxmax)
+                        _nymin = min(_vymin, _cymin)
+                        _nymax = max(_vymax, _cymax)
+                        vol_pts_f = [[_nxmin, _nymin], [_nxmax, _nymin],
+                                     [_nxmax, _nymax], [_nxmin, _nymax]]
+                        self.log("[FloorExpand] L{}: slab expanded to contain core "
+                                 "({:.0f}x{:.0f} → {:.0f}x{:.0f}mm)".format(
+                                     orig_lvl,
+                                     _vxmax - _vxmin, _vymax - _vymin,
+                                     _nxmax - _nxmin, _nymax - _nymin))
+                tag = "AI_Floor_L{}".format(orig_lvl)
+                loop = DB.CurveLoop()
+                n_vf = len(vol_pts_f)
+                for j in range(n_vf):
+                    vs = vol_pts_f[j]; ve = vol_pts_f[(j + 1) % n_vf]
+                    fp1 = DB.XYZ(mm_to_ft(vs[0]), mm_to_ft(vs[1]), 0)
+                    fp2 = DB.XYZ(mm_to_ft(ve[0]), mm_to_ft(ve[1]), 0)
+                    if fp1.DistanceTo(fp2) < mm_to_ft(2.0): continue
+                    ad_v = vs[2] if len(vs) > 2 else None
+                    if ad_v and isinstance(ad_v, dict):
+                        fpm = DB.XYZ(mm_to_ft(ad_v["mid_x"]), mm_to_ft(ad_v["mid_y"]), 0)
+                        try:
+                            loop.Append(DB.Arc.Create(fp1, fp2, fpm))
+                        except Exception:
+                            try: loop.Append(DB.Line.CreateBound(fp1, fp2))
+                            except Exception: pass
+                    else:
+                        try: loop.Append(DB.Line.CreateBound(fp1, fp2))
+                        except Exception: pass
+                if loop.NumberOfCurves() >= 3:
+                    import System.Collections.Generic as Generic  # type: ignore
+                    _vol_loops = Generic.List[DB.CurveLoop]()
+                    _vol_loops.Add(loop)
+                    try:
+                        floor = DB.Floor.Create(doc, _vol_loops, ftype.Id, lvl.Id)
+                        safe_set_comment(floor, tag)
+                        affected_elements.append(floor)
+                        registry[tag] = floor.Id
+                        created[0] += 1
+                        results["elements"].append(str(floor.Id.Value))
+                    except Exception as _ve:
+                        self.log("[Volumes] L{}: slab failed ({})".format(orig_lvl, _ve))
+                continue  # volume slab done — skip shell logic below
+
             if slab_w < 1000 or slab_l < 1000:
                 continue  # shell suppressed (organic mode uses granular floors[])
-            tag = "AI_Floor_L{}".format(k+1)
+            tag = "AI_Floor_L{}".format(orig_lvl)
 
             footprint_pts = shell.get("footprint_points")
             m_pos = shell.get("position", [0.0, 0.0])
@@ -1131,14 +1609,39 @@ class RevitWorkers:
             loop = DB.CurveLoop()
             if footprint_pts:
                 # Organic footprint: build loop from polygon/arc points, scaled per level.
-                # SHELTER RULE: slab scale = max(this level's scale, level below's scale)
-                # so the slab always covers the larger of the two adjacent floor plates,
-                # matching the rectangular mode's expanded_slab_dims max(below, here) logic.
-                scale_overrides = shell.get("footprint_scale_overrides", {})
-                scale_here  = _get_interpolated_scale(scale_overrides, k + 1)
-                scale_below = _get_interpolated_scale(scale_overrides, k) if k > 0 else 0.0
-                scale = max(scale_here, scale_below)
-                level_pts = _scale_footprint(footprint_pts, scale) if scale != 1.0 else footprint_pts
+                scale_overrides    = shell.get("footprint_scale_overrides", {})
+                offset_overrides   = shell.get("footprint_offset_overrides", {})
+                rotation_overrides = shell.get("footprint_rotation_overrides", {})
+                scale_here = _get_interpolated_scale(scale_overrides, orig_lvl)
+                ox, oy = _get_interpolated_offset(offset_overrides, orig_lvl)
+                rot    = _get_interpolated_rotation(rotation_overrides, orig_lvl)
+                scale  = scale_here
+                level_pts = _scale_footprint(footprint_pts, scale, ox, oy, rot) if (scale != 1.0 or ox or oy or rot) else footprint_pts
+
+                # SHELTER RULE: when the floor directly below is offset or scaled differently
+                # from the current floor, this slab must extend to cover it so no exposed
+                # gap appears at the top of the walls below.
+                # Method: for each vertex index i, pick whichever of level_pts[i] or
+                # pts_below[i] is farther from the average centroid of the two polygons.
+                # For convex shapes with the same vertex angular distribution (same base
+                # footprint_pts template), this gives the exact outer union boundary.
+                if k > 0 and (offset_overrides or scale_overrides):
+                    _lvl_below = orig_lvl - 1
+                    _sc_below  = _get_interpolated_scale(scale_overrides, _lvl_below)
+                    _ox_b, _oy_b = _get_interpolated_offset(offset_overrides, _lvl_below)
+                    _rot_b = _get_interpolated_rotation(rotation_overrides, _lvl_below)
+                    _pts_below = _scale_footprint(footprint_pts, _sc_below, _ox_b, _oy_b, _rot_b) \
+                        if (_sc_below != 1.0 or _ox_b or _oy_b or _rot_b) else footprint_pts
+                    if len(_pts_below) == len(level_pts):
+                        _cx_avg = (ox + _ox_b) / 2.0
+                        _cy_avg = (oy + _oy_b) / 2.0
+                        _shelter = []
+                        for _ph, _pb in zip(level_pts, _pts_below):
+                            _dxh = _ph[0] - _cx_avg;  _dyh = _ph[1] - _cy_avg
+                            _dxb = _pb[0] - _cx_avg;  _dyb = _pb[1] - _cy_avg
+                            _shelter.append(_ph if (_dxh*_dxh + _dyh*_dyh) >= (_dxb*_dxb + _dyb*_dyb) else _pb)
+                        level_pts = _shelter
+
                 n = len(level_pts)
                 for j in range(n):
                     seg_start = level_pts[j]
@@ -1146,21 +1649,16 @@ class RevitWorkers:
                     fp1 = DB.XYZ(mm_to_ft(seg_start[0]), mm_to_ft(seg_start[1]), 0)
                     fp2 = DB.XYZ(mm_to_ft(seg_end[0]),   mm_to_ft(seg_end[1]),   0)
                     if fp1.DistanceTo(fp2) < mm_to_ft(2.0): continue
-                    arc_data = seg_start[2] if len(seg_start) > 2 else None
-                    if arc_data and isinstance(arc_data, dict):
-                        fpm = DB.XYZ(mm_to_ft(arc_data["mid_x"]), mm_to_ft(arc_data["mid_y"]), 0)
-                        try:
-                            loop.Append(DB.Arc.Create(fp1, fp2, fpm))
-                        except Exception:
-                            try:
-                                loop.Append(DB.Line.CreateBound(fp1, fp2))
-                            except Exception:
-                                pass
-                    else:
-                        try:
-                            loop.Append(DB.Line.CreateBound(fp1, fp2))
-                        except Exception:
-                            pass
+                    # FLOORS ALWAYS USE STRAIGHT LINES — Revit's Floor.Create is far
+                    # stricter than Wall.Create about arc-segment CurveLoops.  Any arc
+                    # in the loop can trigger a "cannot compose valid boundary" rejection.
+                    # With enough vertices from the bezier approximation (typically 30-100)
+                    # the floor boundary looks smooth despite being a straight-line polygon.
+                    # Arcs are preserved for WALLS where Revit is more permissive.
+                    try:
+                        loop.Append(DB.Line.CreateBound(fp1, fp2))
+                    except Exception:
+                        pass
                 # Bounding box for void-clipping: derive from scaled footprint points
                 fp_xs = [p[0] for p in level_pts]
                 fp_ys = [p[1] for p in level_pts]
@@ -1170,91 +1668,183 @@ class RevitWorkers:
                 # fall back to a bounding-box rectangle so the slab can still be created.
                 if loop.NumberOfCurves() < 3:
                     from .runner import log as _flog3
-                    _flog3("[FloorDims] L{}: organic loop degenerate ({} curves), using bbox fallback".format(k+1, loop.NumberOfCurves()))
+                    _flog3("[FloorDims] L{}: organic loop degenerate ({} curves), using bbox fallback".format(orig_lvl, loop.NumberOfCurves()))
                     loop = DB.CurveLoop()
                     fb_hw = w_ft / 2.0
                     fb_hl = l_ft / 2.0
-                    fb1 = DB.XYZ(cx_ft - fb_hw, cy_ft - fb_hl, 0)
-                    fb2 = DB.XYZ(cx_ft + fb_hw, cy_ft - fb_hl, 0)
-                    fb3 = DB.XYZ(cx_ft + fb_hw, cy_ft + fb_hl, 0)
-                    fb4 = DB.XYZ(cx_ft - fb_hw, cy_ft + fb_hl, 0)
+                    # Use the already-computed per-level offset (ox, oy) so the fallback
+                    # rectangle is centred on the actual shifted floor, not the shell origin.
+                    fb_cx = cx_ft + mm_to_ft(ox)
+                    fb_cy = cy_ft + mm_to_ft(oy)
+                    fb1 = DB.XYZ(fb_cx - fb_hw, fb_cy - fb_hl, 0)
+                    fb2 = DB.XYZ(fb_cx + fb_hw, fb_cy - fb_hl, 0)
+                    fb3 = DB.XYZ(fb_cx + fb_hw, fb_cy + fb_hl, 0)
+                    fb4 = DB.XYZ(fb_cx - fb_hw, fb_cy + fb_hl, 0)
                     loop.Append(DB.Line.CreateBound(fb1, fb2))
                     loop.Append(DB.Line.CreateBound(fb2, fb3))
                     loop.Append(DB.Line.CreateBound(fb3, fb4))
                     loop.Append(DB.Line.CreateBound(fb4, fb1))
             else:
+                # Rectangular slab — interpolate per-level offset across sparse floor_overrides
+                _sox_mm, _soy_mm = _interp_floor_override_offset(
+                    shell.get("floor_overrides", {}), orig_lvl)
+                _scx_ft = mm_to_ft(m_pos[0] + _sox_mm)
+                _scy_ft = mm_to_ft(m_pos[1] + _soy_mm)
                 w_ft, l_ft = mm_to_ft(slab_w), mm_to_ft(slab_l)
-                p1 = DB.XYZ(cx_ft - w_ft/2.0, cy_ft - l_ft/2.0, 0)
-                p2 = DB.XYZ(cx_ft + w_ft/2.0, cy_ft - l_ft/2.0, 0)
-                p3 = DB.XYZ(cx_ft + w_ft/2.0, cy_ft + l_ft/2.0, 0)
-                p4 = DB.XYZ(cx_ft - w_ft/2.0, cy_ft + l_ft/2.0, 0)
+                p1 = DB.XYZ(_scx_ft - w_ft/2.0, _scy_ft - l_ft/2.0, 0)
+                p2 = DB.XYZ(_scx_ft + w_ft/2.0, _scy_ft - l_ft/2.0, 0)
+                p3 = DB.XYZ(_scx_ft + w_ft/2.0, _scy_ft + l_ft/2.0, 0)
+                p4 = DB.XYZ(_scx_ft - w_ft/2.0, _scy_ft + l_ft/2.0, 0)
                 loop.Append(DB.Line.CreateBound(p1, p2))
                 loop.Append(DB.Line.CreateBound(p2, p3))
                 loop.Append(DB.Line.CreateBound(p3, p4))
                 loop.Append(DB.Line.CreateBound(p4, p1))
 
-            # Build the curve loop list: outer boundary + per-shaft void loops
+            # Build the curve loop list: outer boundary + courtyard holes + shaft voids.
+            # ORGANIC FOOTPRINT NOTE: Revit's Floor.Create rejects shaft void loops
+            # when the outer boundary contains arc segments.  Shaft/stair voids are
+            # therefore skipped for organic shapes; the core walls enclose the shafts.
+            # User-defined courtyard holes (footprint_holes) are always added — they
+            # are part of the floor plate definition and use straight-line segments.
             import System.Collections.Generic as Generic # type: ignore
             floor_loops = Generic.List[DB.CurveLoop]()
             floor_loops.Add(loop)
-            # Combine lift voids + stair voids -- skip on ground floor (k == 0)
-            shaft_voids = getattr(self, '_shaft_voids', None) or []
-            stair_voids = getattr(self, '_stair_voids', None) or []
-            all_voids = (list(shaft_voids) + list(stair_voids)) if k > 0 else []
-            margin_ft = mm_to_ft(2.0)  # Make margin as small as possible so shaft boundaries align with edge
-            slab_hx = w_ft / 2.0 - margin_ft
-            slab_hy = l_ft / 2.0 - margin_ft
-            if all_voids and slab_hx > 0 and slab_hy > 0:
-                slab_min_x = cx_ft - slab_hx
-                slab_max_x = cx_ft + slab_hx
-                slab_min_y = cy_ft - slab_hy
-                slab_max_y = cy_ft + slab_hy
-                min_void_ft = mm_to_ft(200)
-                clipped = []
-                for (vx1, vy1, vx2, vy2) in all_voids:
-                    cx1 = max(vx1, slab_min_x)
-                    cy1 = max(vy1, slab_min_y)
-                    cx2 = min(vx2, slab_max_x)
-                    cy2 = min(vy2, slab_max_y)
-                    if (cx2 - cx1) < min_void_ft or (cy2 - cy1) < min_void_ft:
-                        continue
-                    clipped.append((cx1, cy1, cx2, cy2))
-                merged = _merge_void_rects(clipped)
-                for (vx1, vy1, vx2, vy2) in merged:
-                    vp1 = DB.XYZ(vx1, vy1, 0)
-                    vp2 = DB.XYZ(vx1, vy2, 0)
-                    vp3 = DB.XYZ(vx2, vy2, 0)
-                    vp4 = DB.XYZ(vx2, vy1, 0)
-                    void_loop = DB.CurveLoop()
-                    void_loop.Append(DB.Line.CreateBound(vp1, vp2))
-                    void_loop.Append(DB.Line.CreateBound(vp2, vp3))
-                    void_loop.Append(DB.Line.CreateBound(vp3, vp4))
-                    void_loop.Append(DB.Line.CreateBound(vp4, vp1))
-                    floor_loops.Add(void_loop)
+
+            # Courtyard / inner-void holes from multi-subpath footprint_svg
+            _courtyard_holes = shell.get("footprint_holes", [])
+            if _courtyard_holes:
+                _h_scale = _get_interpolated_scale(shell.get("footprint_scale_overrides", {}), orig_lvl)
+                _h_ox, _h_oy = _get_interpolated_offset(shell.get("footprint_offset_overrides", {}), orig_lvl)
+                _h_rot = _get_interpolated_rotation(shell.get("footprint_rotation_overrides", {}), orig_lvl)
+                for _hole_raw in _courtyard_holes:
+                    _hole_pts = _scale_footprint(_hole_raw, _h_scale, _h_ox, _h_oy, _h_rot) \
+                        if (_h_scale != 1.0 or _h_ox or _h_oy or _h_rot) else _hole_raw
+                    _hole_loop = DB.CurveLoop()
+                    _nh = len(_hole_pts)
+                    for _j in range(_nh):
+                        _hs = _hole_pts[_j]; _he = _hole_pts[(_j + 1) % _nh]
+                        _hp1 = DB.XYZ(mm_to_ft(_hs[0]), mm_to_ft(_hs[1]), 0)
+                        _hp2 = DB.XYZ(mm_to_ft(_he[0]), mm_to_ft(_he[1]), 0)
+                        if _hp1.DistanceTo(_hp2) < mm_to_ft(2.0):
+                            continue
+                        try:
+                            _hole_loop.Append(DB.Line.CreateBound(_hp1, _hp2))
+                        except Exception:
+                            pass
+                    if _hole_loop.NumberOfCurves() >= 3:
+                        floor_loops.Add(_hole_loop)
+
+            # Skip shaft/stair voids for any organic footprint (ellipse, polygon, etc.).
+            # The void-clipping math uses cx_ft/w_ft/l_ft centred at the shell origin,
+            # which is wrong for offset floors — the void rect may lie outside the slab
+            # boundary, causing Floor.Create to reject the loop with an invalid geometry
+            # error (which then falls through to the un-offset bbox fallback, Bug 2).
+            # Organic slabs are solid plates; the core walls already enclose the shafts.
+            _loop_has_arcs = bool(footprint_pts)
+
+            if not _loop_has_arcs:
+                # Rectangular / rotation-only footprint: voids are safe to add.
+                shaft_voids = getattr(self, '_shaft_voids', None) or []
+                stair_voids = getattr(self, '_stair_voids', None) or []
+                all_voids = (list(shaft_voids) + list(stair_voids)) if k > 0 else []
+                margin_ft = mm_to_ft(2.0)
+                slab_hx = w_ft / 2.0 - margin_ft
+                slab_hy = l_ft / 2.0 - margin_ft
+                if all_voids and slab_hx > 0 and slab_hy > 0:
+                    slab_min_x = cx_ft - slab_hx
+                    slab_max_x = cx_ft + slab_hx
+                    slab_min_y = cy_ft - slab_hy
+                    slab_max_y = cy_ft + slab_hy
+                    min_void_ft = mm_to_ft(200)
+                    clipped = []
+                    for (vx1, vy1, vx2, vy2) in all_voids:
+                        cx1 = max(vx1, slab_min_x)
+                        cy1 = max(vy1, slab_min_y)
+                        cx2 = min(vx2, slab_max_x)
+                        cy2 = min(vy2, slab_max_y)
+                        if (cx2 - cx1) < min_void_ft or (cy2 - cy1) < min_void_ft:
+                            continue
+                        clipped.append((cx1, cy1, cx2, cy2))
+                    merged = _merge_void_rects(clipped)
+                    for (vx1, vy1, vx2, vy2) in merged:
+                        vp1 = DB.XYZ(vx1, vy1, 0)
+                        vp2 = DB.XYZ(vx1, vy2, 0)
+                        vp3 = DB.XYZ(vx2, vy2, 0)
+                        vp4 = DB.XYZ(vx2, vy1, 0)
+                        void_loop = DB.CurveLoop()
+                        void_loop.Append(DB.Line.CreateBound(vp1, vp2))
+                        void_loop.Append(DB.Line.CreateBound(vp2, vp3))
+                        void_loop.Append(DB.Line.CreateBound(vp3, vp4))
+                        void_loop.Append(DB.Line.CreateBound(vp4, vp1))
+                        floor_loops.Add(void_loop)
+
+                # Rotated shaft voids — stored as polygon point lists (in ft) when
+                # core rotation is active.  Added after AABB voids; non-fatal if Revit
+                # rejects any individual loop (the enclosure walls still seal the shaft).
+                _void_polys = getattr(self, '_stair_void_polygons', None) or []
+                for _poly_ft in _void_polys:
+                    try:
+                        _pvloop = DB.CurveLoop()
+                        _pn = len(_poly_ft)
+                        for _j in range(_pn):
+                            _pp1 = DB.XYZ(_poly_ft[_j][0],         _poly_ft[_j][1],         0)
+                            _pp2 = DB.XYZ(_poly_ft[(_j+1)%_pn][0], _poly_ft[(_j+1)%_pn][1], 0)
+                            if _pp1.DistanceTo(_pp2) > mm_to_ft(2.0):
+                                _pvloop.Append(DB.Line.CreateBound(_pp1, _pp2))
+                        if _pvloop.NumberOfCurves() >= 3:
+                            floor_loops.Add(_pvloop)
+                    except Exception:
+                        pass
 
             # Old floors were pre-deleted in PHASE 2.9 -- always create fresh.
             # Force Regenerate at dimension transitions so Revit finalises
             # the previous floor's geometry before creating the next one.
-            # Without this, Revit 2026 can carry forward the previous floor's
-            # boundary to the new floor on transition levels.
             try:
                 prev_slab = expanded_slab_dims[k-1] if k > 0 else (0, 0)
                 if k > 0 and (abs(slab_w - prev_slab[0]) > 1 or abs(slab_l - prev_slab[1]) > 1):
                     doc.Regenerate()
-                
-                # Try create with voids
+
+                # Try create with voids (or solid if organic)
                 try:
                     floor = DB.Floor.Create(doc, floor_loops, ftype.Id, lvl.Id)
                 except Exception as e_void:
-                    # Void loops invalid -- log actual error, retry without voids
+                    # Void loops rejected — fall back to solid floor (no voids)
                     from .runner import log as _flog2
-                    _flog2("[FloorDims] L{}: void loops invalid ({}), creating floor without voids".format(k+1, e_void))
+                    _flog2("[FloorDims] L{}: void loops invalid, retrying solid floor".format(k+1))
                     fallback_loops = Generic.List[DB.CurveLoop]()
                     fallback_loops.Add(loop)
                     floor = DB.Floor.Create(doc, fallback_loops, ftype.Id, lvl.Id)
             except Exception as e_final:
-                self.log("[FloorDims] L{}: SKIPPED (loop invalid after bbox fallback: {})".format(k+1, str(e_final)[:200]))
-                continue
+                self.log("[FloorDims] L{}: SKIPPED ({}), trying plain bbox".format(k+1, str(e_final)[:120]))
+                # Last resort: axis-aligned bounding box slab — never skip a floor entirely.
+                # Use the offset-adjusted centroid so organic floors at high-offset
+                # transition levels (e.g. floor 7/15/23 of an S-shape) don't drop a
+                # centred rectangle that protrudes beyond the offset wall footprint.
+                try:
+                    _bb_ox_mm, _bb_oy_mm = (0.0, 0.0)
+                    if footprint_pts:
+                        _bb_ox_mm, _bb_oy_mm = _get_interpolated_offset(
+                            shell.get("footprint_offset_overrides", {}), orig_lvl)
+                    bb_cx_ft = cx_ft + mm_to_ft(_bb_ox_mm)
+                    bb_cy_ft = cy_ft + mm_to_ft(_bb_oy_mm)
+                    bb_loop = DB.CurveLoop()
+                    bb_hw = w_ft / 2.0
+                    bb_hl = l_ft / 2.0
+                    bb1 = DB.XYZ(bb_cx_ft - bb_hw, bb_cy_ft - bb_hl, 0)
+                    bb2 = DB.XYZ(bb_cx_ft + bb_hw, bb_cy_ft - bb_hl, 0)
+                    bb3 = DB.XYZ(bb_cx_ft + bb_hw, bb_cy_ft + bb_hl, 0)
+                    bb4 = DB.XYZ(bb_cx_ft - bb_hw, bb_cy_ft + bb_hl, 0)
+                    bb_loop.Append(DB.Line.CreateBound(bb1, bb2))
+                    bb_loop.Append(DB.Line.CreateBound(bb2, bb3))
+                    bb_loop.Append(DB.Line.CreateBound(bb3, bb4))
+                    bb_loop.Append(DB.Line.CreateBound(bb4, bb1))
+                    bb_loops = Generic.List[DB.CurveLoop]()
+                    bb_loops.Add(bb_loop)
+                    floor = DB.Floor.Create(doc, bb_loops, ftype.Id, lvl.Id)
+                    self.log("[FloorDims] L{}: bbox fallback succeeded".format(k+1))
+                except Exception as e_bb:
+                    self.log("[FloorDims] L{}: all floor attempts failed, skipping".format(k+1))
+                    continue
 
             safe_set_comment(floor, tag)
             affected_elements.append(floor)
@@ -1307,7 +1897,6 @@ class RevitWorkers:
         # Read offset_from_edge from shell or preset
         offset_from_edge_mm = safe_num(
             shell.get("column_offset", p_col_logic.get("offset_from_edge", 500)), 500)
-        offset_from_edge_ft = mm_to_ft(offset_from_edge_mm)
 
         max_w = max(d[0] for d in floor_dims)
         max_l = max(d[1] for d in floor_dims)
@@ -1336,41 +1925,77 @@ class RevitWorkers:
         m_pos = shell.get("position", [0.0, 0.0])
         cx_ft, cy_ft = mm_to_ft(m_pos[0]), mm_to_ft(m_pos[1])
 
+        # Option B — polygon-aware grid anchor.
+        # Use the footprint polygon's own bounding-box centre and span for grid synthesis
+        # instead of shell.position + manifest width/length.  For symmetric polygons
+        # (SVG-centred at origin, or plain rectangles) this is identical to the old
+        # behaviour.  For asymmetric polygons (e.g. an L whose vertices are all in the
+        # positive quadrant) this correctly recentres the grid so every arm is covered.
+        _fp_for_grid = shell.get("footprint_points")
+        if _fp_for_grid:
+            try:
+                _fpg_xs = [float(p[0]) for p in _fp_for_grid]
+                _fpg_ys = [float(p[1]) for p in _fp_for_grid]
+                _grid_dim_w  = max(_fpg_xs) - min(_fpg_xs)
+                _grid_dim_l  = max(_fpg_ys) - min(_fpg_ys)
+                _grid_cx_ft  = mm_to_ft((min(_fpg_xs) + max(_fpg_xs)) / 2.0)
+                _grid_cy_ft  = mm_to_ft((min(_fpg_ys) + max(_fpg_ys)) / 2.0)
+            except Exception:
+                _grid_dim_w, _grid_dim_l = max_w, max_l
+                _grid_cx_ft, _grid_cy_ft = cx_ft, cy_ft
+        else:
+            _grid_dim_w, _grid_dim_l = max_w, max_l
+            _grid_cx_ft, _grid_cy_ft = cx_ft, cy_ft
+
         def compute_axis_grid(dim_mm, center_ft, core_min_ft, core_max_ft, span_ft):
-            """Compute column grid positions along one axis."""
-            half_dim_ft = mm_to_ft(dim_mm) / 2.0
-            edge_pos = center_ft + (half_dim_ft - offset_from_edge_ft)
-            edge_neg = center_ft - (half_dim_ft - offset_from_edge_ft)
+            """Compute column grid positions along one axis with round-number spacing.
+
+            All arithmetic is done in mm so that spacing is snapped to the nearest
+            100 mm, then grid lines are placed symmetrically about the center.
+            This guarantees positions like 12500 mm rather than 12523 mm.
+            """
+            # Work in mm for round-number arithmetic
+            center_mm = round(center_ft * 304.8)
+            span_mm = span_ft * 304.8
+            reach_mm = dim_mm / 2.0 - offset_from_edge_mm  # center → outermost column
+
+            if reach_mm <= 100:
+                return [mm_to_ft(center_mm)]
+
+            full_dist_mm = reach_mm * 2.0
+            n_spans = max(1, int(_math.ceil(full_dist_mm / span_mm - 0.001)))
+
+            # Snap spacing to nearest 50 mm so every position is a clean round number
+            raw_spacing_mm = full_dist_mm / n_spans
+            spacing_mm = round(raw_spacing_mm / 50.0) * 50.0
+            if spacing_mm < 50:
+                spacing_mm = 50.0
+
+            # Place lines symmetrically outward from center
             positions = set()
+            max_steps = int(_math.ceil(reach_mm / spacing_mm)) + 1
+            for i in range(-max_steps, max_steps + 1):
+                pos_mm = center_mm + i * spacing_mm
+                if abs(pos_mm - center_mm) <= reach_mm + 1.0:
+                    positions.add(pos_mm)
 
-            full_dist = edge_pos - edge_neg
-            if full_dist <= 0.1:
-                positions.add(center_ft)
-                return sorted(positions)
-
-            # Single uniform grid: divide the full span into equal parts
-            n_spans = max(1, int(_math.ceil(full_dist / span_ft - 0.001)))
-            s = full_dist / n_spans
-            for i in range(n_spans + 1):
-                positions.add(round(edge_neg + i * s, 4))
-
-            return sorted(positions)
+            return sorted(mm_to_ft(p) for p in positions)
 
         x_core_min = lift_core_ft[0] if lift_core_ft else None
         x_core_max = lift_core_ft[2] if lift_core_ft else None
         y_core_min = lift_core_ft[1] if lift_core_ft else None
         y_core_max = lift_core_ft[3] if lift_core_ft else None
 
-        x_offsets = compute_axis_grid(max_w, cx_ft, x_core_min, x_core_max, span_w_ft)
-        y_offsets = compute_axis_grid(max_l, cy_ft, y_core_min, y_core_max, span_l_ft)
+        x_offsets = compute_axis_grid(_grid_dim_w, _grid_cx_ft, x_core_min, x_core_max, span_w_ft)
+        y_offsets = compute_axis_grid(_grid_dim_l, _grid_cy_ft, y_core_min, y_core_max, span_l_ft)
 
         # Store grid positions for documentation (grid line creation)
         self._grid_x_offsets_ft = list(x_offsets)
         self._grid_y_offsets_ft = list(y_offsets)
-        self._grid_cx_ft = cx_ft
-        self._grid_cy_ft = cy_ft
-        self._grid_max_w_ft = mm_to_ft(max_w) / 2.0
-        self._grid_max_l_ft = mm_to_ft(max_l) / 2.0
+        self._grid_cx_ft = _grid_cx_ft
+        self._grid_cy_ft = _grid_cy_ft
+        self._grid_max_w_ft = mm_to_ft(_grid_dim_w) / 2.0
+        self._grid_max_l_ft = mm_to_ft(_grid_dim_l) / 2.0
 
         # Anchor for column tagging -- use lift core center (not merged core+stairs)
         if lift_core_ft:
@@ -1380,83 +2005,158 @@ class RevitWorkers:
             anchor_ft_x = (core_bounds[0] + core_bounds[2]) / 2.0
             anchor_ft_y = (core_bounds[1] + core_bounds[3]) / 2.0
         else:
-            anchor_ft_x = cx_ft
-            anchor_ft_y = cy_ft
+            anchor_ft_x = _grid_cx_ft
+            anchor_ft_y = _grid_cy_ft
 
         if center_only:
-            half_w_ft = mm_to_ft(max_w) / 2.0
-            half_l_ft = mm_to_ft(max_l) / 2.0
-            x_offsets = [o for o in x_offsets if abs(o - cx_ft) < half_w_ft - 0.1]
-            y_offsets = [o for o in y_offsets if abs(o - cy_ft) < half_l_ft - 0.1]
+            half_w_ft = mm_to_ft(_grid_dim_w) / 2.0
+            half_l_ft = mm_to_ft(_grid_dim_l) / 2.0
+            x_offsets = [o for o in x_offsets if abs(o - _grid_cx_ft) < half_w_ft - 0.1]
+            y_offsets = [o for o in y_offsets if abs(o - _grid_cy_ft) < half_l_ft - 0.1]
 
         # 3. PILLAR RULE with Stable Mapping
-        col_margin_ft = mm_to_ft(400)
-
-        max_level_for_grid = {}
-        # Pre-build footprint polygon for point-in-polygon column culling
-        _footprint_poly_mm = None
         _footprint_pts = shell.get("footprint_points")
-        if _footprint_pts:
-            import math as _math2
-            poly_mm = []
-            n_fp = len(_footprint_pts)
-            for _j in range(n_fp):
-                _s  = _footprint_pts[_j]
-                _e  = _footprint_pts[(_j + 1) % n_fp]
+        # Option A: for plain rectangular buildings (no SVG / organic overrides) synthesise
+        # a 4-point rectangle so the unified polygon containment path always fires.
+        # This is local to column logic — it does NOT affect wall or floor creation.
+        if not _footprint_pts:
+            _w_fp = safe_num(shell.get("width"), 30000)
+            _l_fp = safe_num(shell.get("length"), _w_fp)
+            _hw_fp, _hl_fp = _w_fp / 2.0, _l_fp / 2.0
+            _footprint_pts = [
+                [-_hw_fp, -_hl_fp], [_hw_fp, -_hl_fp],
+                [_hw_fp,  _hl_fp], [-_hw_fp,  _hl_fp],
+            ]
+        _scale_ovr     = shell.get("footprint_scale_overrides", {})
+        _offset_ovr    = shell.get("footprint_offset_overrides", {})
+        _rot_ovr       = shell.get("footprint_rotation_overrides", {})
+
+        def _tessellate_pts(pts):
+            """Convert footprint_points (with optional arc mid-points) to a flat polygon."""
+            import math as _mth
+            poly = []
+            n = len(pts)
+            for _j in range(n):
+                _s = pts[_j]
+                _e = pts[(_j + 1) % n]
                 _x1, _y1 = float(_s[0]), float(_s[1])
                 _x2, _y2 = float(_e[0]), float(_e[1])
                 _arc = _s[2] if len(_s) > 2 else None
                 if _arc and isinstance(_arc, dict):
                     _mx, _my = float(_arc["mid_x"]), float(_arc["mid_y"])
-                    # Circumscribed circle from 3 points
                     _ax, _ay = _x2 - _x1, _y2 - _y1
                     _bx, _by = _mx - _x1, _my - _y1
                     _D = 2.0 * (_ax * _by - _ay * _bx)
                     if abs(_D) < 1e-6:
-                        poly_mm.append((_x1, _y1))
+                        poly.append((_x1, _y1))
                         continue
                     _ux = (_by * (_ax*_ax + _ay*_ay) - _ay * (_bx*_bx + _by*_by)) / _D
                     _uy = (_ax * (_bx*_bx + _by*_by) - _bx * (_ax*_ax + _ay*_ay)) / _D
                     _ccx, _ccy = _x1 + _ux, _y1 + _uy
-                    _r = _math2.sqrt(_ux*_ux + _uy*_uy)
-                    _a1 = _math2.atan2(_y1 - _ccy, _x1 - _ccx)
-                    _a2 = _math2.atan2(_y2 - _ccy, _x2 - _ccx)
-                    _am = _math2.atan2(_my - _ccy, _mx - _ccx)
-                    # Determine winding direction through mid point
-                    _PI2 = 2.0 * _math2.pi
+                    _r = _mth.sqrt(_ux*_ux + _uy*_uy)
+                    _a1 = _mth.atan2(_y1 - _ccy, _x1 - _ccx)
+                    _a2 = _mth.atan2(_y2 - _ccy, _x2 - _ccx)
+                    _am = _mth.atan2(_my - _ccy, _mx - _ccx)
+                    _PI2 = 2.0 * _mth.pi
                     _ccw = ((_am - _a1) % _PI2) < ((_a2 - _a1) % _PI2)
                     _span = (_a2 - _a1) % _PI2 if _ccw else (_a1 - _a2) % _PI2
                     _dir = 1 if _ccw else -1
                     for _si in range(24):
-                        _t = _si / 24.0
-                        _ang = _a1 + _dir * _span * _t
-                        poly_mm.append((_ccx + _r * _math2.cos(_ang), _ccy + _r * _math2.sin(_ang)))
+                        _ang = _a1 + _dir * _span * (_si / 24.0)
+                        poly.append((_ccx + _r * _mth.cos(_ang), _ccy + _r * _mth.sin(_ang)))
                 else:
-                    poly_mm.append((_x1, _y1))
-            _footprint_poly_mm = poly_mm
+                    poly.append((_x1, _y1))
+            return poly
 
-        def _in_footprint(ox_ft, oy_ft):
-            if _footprint_poly_mm is None:
-                return True
-            px, py = ft_to_mm(ox_ft), ft_to_mm(oy_ft)
+        def _point_in_poly(px, py, poly):
             inside = False
-            n_p = len(_footprint_poly_mm)
+            n_p = len(poly)
             for _i in range(n_p):
-                _fx1, _fy1 = _footprint_poly_mm[_i]
-                _fx2, _fy2 = _footprint_poly_mm[(_i + 1) % n_p]
+                _fx1, _fy1 = poly[_i]
+                _fx2, _fy2 = poly[(_i + 1) % n_p]
                 if ((_fy1 > py) != (_fy2 > py)) and (px < (_fx2 - _fx1) * (py - _fy1) / (_fy2 - _fy1) + _fx1):
                     inside = not inside
             return inside
 
+        # For organic builds, pre-tessellate the BASE footprint (scale=1, no offset/rotation)
+        # to quickly reject positions that can never be inside any level's slab.
+        _base_poly_mm = _tessellate_pts(_footprint_pts) if _footprint_pts else None
+
+        # Cache per-level tessellated polygons (keyed by 1-based level index)
+        _level_poly_cache = {}
+
+        def _get_level_poly(level_1based):
+            if level_1based in _level_poly_cache:
+                return _level_poly_cache[level_1based]
+            scale = _get_interpolated_scale(_scale_ovr, level_1based)
+            ox_mm, oy_mm = _get_interpolated_offset(_offset_ovr, level_1based)
+            rot = _get_interpolated_rotation(_rot_ovr, level_1based)
+            transformed = _scale_footprint(_footprint_pts, scale, ox_mm, oy_mm, rot) if (scale != 1.0 or ox_mm or oy_mm or rot) else _footprint_pts
+            poly = _tessellate_pts(transformed)
+            _level_poly_cache[level_1based] = poly
+            return poly
+
+        # Option B — gap infill: for any axis gap wider than 1.1× the column span,
+        # insert a midpoint grid line if the polygon actually crosses that axis position.
+        # This ensures narrow arms and concave regions of irregular plans always receive
+        # column coverage even when the initial rectangular grid misses them.
+        # Skipped for center_only buildings (twisted towers) to avoid re-adding perimeter lines.
+        if _base_poly_mm and not center_only:
+            _span_w_mm = span_w_ft * 304.8
+            _span_l_mm = span_l_ft * 304.8
+
+            def _poly_crossed_by(coord_mm, is_x, poly):
+                """True if the axis-aligned line at coord_mm has ≥2 edge crossings,
+                meaning it passes through the polygon interior (not merely touches it)."""
+                crossings = 0
+                _n = len(poly)
+                for _j in range(_n):
+                    _x1, _y1 = poly[_j]
+                    _x2, _y2 = poly[(_j + 1) % _n]
+                    if is_x:
+                        lo, hi = (min(_x1, _x2), max(_x1, _x2))
+                        if lo < coord_mm < hi:
+                            crossings += 1
+                    else:
+                        lo, hi = (min(_y1, _y2), max(_y1, _y2))
+                        if lo < coord_mm < hi:
+                            crossings += 1
+                return crossings >= 2
+
+            def _infill_axis(offsets, span_mm, is_x, poly, max_passes=6):
+                out = list(offsets)
+                for _ in range(max_passes):
+                    inserted = False
+                    for _i in range(len(out) - 1):
+                        if (out[_i + 1] - out[_i]) * 304.8 > span_mm * 1.1:
+                            mid_ft = (out[_i] + out[_i + 1]) / 2.0
+                            if _poly_crossed_by(mid_ft * 304.8, is_x, poly):
+                                out.insert(_i + 1, mid_ft)
+                                inserted = True
+                                break  # restart scan with updated list
+                    if not inserted:
+                        break
+                return out
+
+            x_offsets = _infill_axis(x_offsets, _span_w_mm, True,  _base_poly_mm)
+            y_offsets = _infill_axis(y_offsets, _span_l_mm, False, _base_poly_mm)
+
+        max_level_for_grid = {}
+
         for ox in x_offsets:
             for oy in y_offsets:
-                # Cull columns outside the organic footprint polygon
-                if not _in_footprint(ox, oy):
-                    continue
+                # Fast-reject: if base polygon exists and point is outside even the untransformed
+                # footprint bounding envelope, skip — no level could ever contain it.
+                if _base_poly_mm is not None:
+                    px_mm, py_mm = ft_to_mm(ox), ft_to_mm(oy)
+                    if not _point_in_poly(px_mm, py_mm, _base_poly_mm):
+                        # Check max-scale envelope — for flared/cantilever buildings the base
+                        # poly is the smallest. Only skip if outside a generous bounding box.
+                        max_scale = max((float(v) for v in _scale_ovr.values()), default=1.0) if _scale_ovr else 1.0
+                        if max_scale <= 1.05:
+                            continue  # No level will be larger than the base — safe to reject
 
                 # Cull columns inside ANY core/staircase footprint (inclusive with 1mm tolerance).
-                # Tolerance ensures boundary-flush columns (offset_from_edge == wall thickness)
-                # are correctly excluded even with floating-point rounding.
                 _TOL_FT = mm_to_ft(1.0)
                 inside_zone = False
                 for zone in exclusion_zones:
@@ -1471,13 +2171,12 @@ class RevitWorkers:
                 iy = int(round((oy - anchor_ft_y) / span_l_ft))
 
                 k_highest = -1
+                px_mm, py_mm = ft_to_mm(ox), ft_to_mm(oy)
                 for k in range(len(current_levels)):
-                    sw, sl = expanded_slab_dims[k]
-                    # Organic footprint: containment already checked above; treat all levels as in-bounds
-                    if _footprint_poly_mm is not None:
-                        k_highest = k
-                        continue
-                    if abs(ox) <= (mm_to_ft(sw)/2.0 - col_margin_ft/2.0) and abs(oy) <= (mm_to_ft(sl)/2.0 - col_margin_ft/2.0):
+                    level_1based = k + 1
+                    # Per-level containment using the actual polygon for this floor.
+                    # _footprint_pts is always set (Option A synthesises a rectangle when absent).
+                    if _point_in_poly(px_mm, py_mm, _get_level_poly(level_1based)):
                         k_highest = k
                 if k_highest >= 0:
                     max_level_for_grid[(ix, iy, ox, oy)] = k_highest
@@ -2094,9 +2793,19 @@ class RevitWorkers:
                 
                 try:
                     if hasattr(el, "Pinned") and el.Pinned: el.Pinned = False
+                    # Grids with auto-dimensions cannot be deleted directly; cascade first
+                    if isinstance(el, DB.Grid):
+                        try:
+                            for dep_id in el.GetDependentElements(None):
+                                try:
+                                    dep = doc.GetElement(dep_id)
+                                    if dep and isinstance(dep, DB.Dimension):
+                                        doc.Delete(dep_id)
+                                except: pass
+                        except: pass
                     doc.Delete(el.Id)
                     deleted[0] += 1
-                except Exception as ex: 
+                except Exception as ex:
                     # Silent skip, but we've tried our best
                     pass
 
@@ -2119,18 +2828,55 @@ class RevitWorkers:
         # Grid lines extend slightly beyond the building for clarity
         overshoot_ft = mm_to_ft(3000)
 
-        # Delete existing AI grids to prevent duplicates
-        existing_grids = DB.FilteredElementCollector(doc).OfClass(DB.Grid).ToElements()
-        for g in list(existing_grids):
+        def _delete_grid_cascade(g):
+            """Delete a grid and its dependent dimensions so the delete cannot be blocked."""
+            try:
+                for dep_id in g.GetDependentElements(None):
+                    try:
+                        dep = doc.GetElement(dep_id)
+                        if dep and isinstance(dep, DB.Dimension):
+                            doc.Delete(dep_id)
+                    except: pass
+            except: pass
+            try:
+                doc.Delete(g.Id)
+                return True
+            except: return False
+
+        # Delete existing AI grids to prevent duplicates.
+        # Use LookupParameter fallback because ALL_MODEL_INSTANCE_COMMENTS may be
+        # unavailable for Grid objects in some Revit versions.
+        for g in list(DB.FilteredElementCollector(doc).OfClass(DB.Grid).ToElements()):
             try:
                 p = g.get_Parameter(DB.BuiltInParameter.ALL_MODEL_INSTANCE_COMMENTS)
+                if not p: p = g.LookupParameter("Comments")
                 if p and p.HasValue and "AI_Grid" in p.AsString():
-                    doc.Delete(g.Id)
-            except:
-                pass
+                    _delete_grid_cascade(g)
+            except: pass
+
+        # Collect all floor plan views once.
+        all_plan_views = list(DB.FilteredElementCollector(doc).OfClass(DB.ViewPlan).ToElements())
+
+        # --- PASS 1: create all grid objects, record (grid, line) pairs ---
+        created_grids = []  # [(grid_element, creation_line), ...]
+
+        def _create_grid(line, label, comment):
+            for existing in list(DB.FilteredElementCollector(doc).OfClass(DB.Grid).ToElements()):
+                try:
+                    if existing.Name == label:
+                        _delete_grid_cascade(existing)
+                except: pass
+            try:
+                grid = DB.Grid.Create(doc, line)
+                grid.Name = label
+                safe_set_comment(grid, comment)
+                created_grids.append((grid, line))
+            except Exception: pass
 
         # X-axis grids: vertical lines (constant X, varying Y) -- labelled A, B, C, ...
-        for idx, ox in enumerate(x_offsets):
+        # x_offsets is sorted ascending (left → right), so A is always on the left.
+        sorted_x = sorted(x_offsets)
+        for idx, ox in enumerate(sorted_x):
             label = ""
             n = idx
             while True:
@@ -2140,26 +2886,85 @@ class RevitWorkers:
                     break
             p1 = DB.XYZ(ox, -half_l_ft - overshoot_ft, 0)
             p2 = DB.XYZ(ox,  half_l_ft + overshoot_ft, 0)
-            try:
-                line = DB.Line.CreateBound(p1, p2)
-                grid = DB.Grid.Create(doc, line)
-                grid.Name = label
-                safe_set_comment(grid, "AI_Grid_X_{}".format(idx))
-            except Exception:
-                pass
+            _create_grid(DB.Line.CreateBound(p1, p2), label, "AI_Grid_X_{}".format(idx))
 
         # Y-axis grids: horizontal lines (constant Y, varying X) -- labelled 1, 2, 3, ...
-        for idx, oy in enumerate(y_offsets):
+        # y_offsets is sorted ascending (bottom → top in plan). Enumerate in reverse so
+        # "1" lands on the topmost grid line (largest Y / North side), matching convention.
+        sorted_y_top_first = sorted(y_offsets, reverse=True)
+        for idx, oy in enumerate(sorted_y_top_first):
             label = str(idx + 1)
             p1 = DB.XYZ(-half_w_ft - overshoot_ft, oy, 0)
             p2 = DB.XYZ( half_w_ft + overshoot_ft, oy, 0)
+            _create_grid(DB.Line.CreateBound(p1, p2), label, "AI_Grid_Y_{}".format(idx))
+
+        # --- PASS 2: extend grid 3D height and propagate to all floor plan views ---
+        # Root cause: Grid.Create() only registers the datum in the currently active
+        # view (Level 1 plan). Two fixes applied together:
+        #   1. SetVerticalExtents(0, top) — extends the grid's 3D model height so it
+        #      spans all floors (also fixes section/elevation appearance).
+        #   2. PropagateToViews(source, target_ids) — registers the datum in every
+        #      other floor plan view so it becomes visible there.
+        try: doc.Regenerate()
+        except: pass
+
+        total_height_ft = max(elevations) if elevations else mm_to_ft(50000)
+        self.log("[Grid] Total building height for vertical extents: {:.2f} ft".format(total_height_ft))
+
+        # Find the source view: lowest-elevation non-template floor plan (Level 1).
+        # That is the view where Grid.Create() registered the datum.
+        source_view = None
+        for v in all_plan_views:
             try:
-                line = DB.Line.CreateBound(p1, p2)
-                grid = DB.Grid.Create(doc, line)
-                grid.Name = label
-                safe_set_comment(grid, "AI_Grid_Y_{}".format(idx))
-            except Exception:
+                if v.ViewType != DB.ViewType.FloorPlan or v.IsTemplate:
+                    continue
+                if source_view is None:
+                    source_view = v
+                elif v.GenLevel and source_view.GenLevel and v.GenLevel.Elevation < source_view.GenLevel.Elevation:
+                    source_view = v
+            except:
                 pass
+        if source_view is None and all_plan_views:
+            source_view = all_plan_views[0]
+        self.log("[Grid] Source view for PropagateToViews: {}".format(source_view.Name if source_view else "None"))
+
+        # Build a .NET HashSet of target view IDs (all floor plan views except source).
+        target_ids = None
+        try:
+            from System.Collections.Generic import HashSet as CSHashSet
+            target_ids = CSHashSet[DB.ElementId]()
+            for v in all_plan_views:
+                try:
+                    if v.ViewType == DB.ViewType.FloorPlan and not v.IsTemplate:
+                        if source_view is None or v.Id != source_view.Id:
+                            target_ids.Add(v.Id)
+                except:
+                    pass
+            self.log("[Grid] Propagating to {} target floor plan views".format(target_ids.Count))
+        except Exception as hse:
+            self.log("[Grid] ERROR building HashSet for PropagateToViews: {}".format(hse))
+
+        for grid, _line in created_grids:
+            # Step A: extend 3D vertical height so the grid spans all levels
+            try:
+                grid.SetVerticalExtents(0.0, total_height_ft)
+            except Exception as sve:
+                self.log("[Grid] SetVerticalExtents FAILED for '{}': {}".format(grid.Name, sve))
+            # Step B: register the datum in all other floor plan views
+            if source_view and target_ids is not None and target_ids.Count > 0:
+                try:
+                    grid.PropagateToViews(source_view, target_ids)
+                except Exception as pve:
+                    self.log("[Grid] PropagateToViews FAILED for '{}': {}".format(grid.Name, pve))
+
+        # --- PASS 3: dimensions on every floor plan view ---
+        try: doc.Regenerate()
+        except: pass
+
+        for view in all_plan_views:
+            try:
+                self._dimension_grids_in_view(view)
+            except: pass
 
     def _expand_unified_vertical_circulation(self, manifest, current_levels, elevations, floor_dims, affected_elements=[], results=None):
         """
@@ -2196,12 +3001,32 @@ class RevitWorkers:
         
         # 2. Lift Requirements
         lifts_config = manifest.get("lifts", {})
+
+        # Read core centre + orientation up-front (used in both pre-computation and main layout)
+        _raw_pos = lifts_config.get("position")
+        if _raw_pos and isinstance(_raw_pos, (list, tuple)) and len(_raw_pos) >= 2:
+            try:
+                f_center_mm = [float(_raw_pos[0]), float(_raw_pos[1])]
+            except (TypeError, ValueError):
+                f_center_mm = [0.0, 0.0]
+        else:
+            f_center_mm = [0.0, 0.0]
+        _core_orientation = str(lifts_config.get("orientation", "auto")).upper()
+        if _core_orientation not in ("NS", "EW", "AUTO"):
+            _core_orientation = "AUTO"
+        try:
+            _core_rotation_deg = float(lifts_config.get("rotation_deg", 0.0))
+        except (TypeError, ValueError):
+            _core_rotation_deg = 0.0
+
         num_lifts = lifts_config.get("count")
         shell = manifest.get("shell", {})
         _fw = safe_num(shell.get("width", 30000), 30000)
         _fl_dim = safe_num(shell.get("length", 50000), 50000)
-        _occ_density = safe_num(lifts_config.get("occupancy_density", 0.1), 0.1)
-        _total_occ = max(100, (_fw * _fl_dim / 1e6) * _occ_density * num_storeys)
+        _occ_density = safe_num(lifts_config.get("occupancy_density", 0.067), 0.067)
+        # Apply 60% NFA efficiency (core, corridors, toilets occupy ~40% of GFA)
+        _NFA_RATIO = 0.60
+        _total_occ = max(100, (_fw * _fl_dim / 1e6) * _NFA_RATIO * _occ_density * num_storeys)
         _auto_lifts = lift_logic.calculate_lift_requirements(num_storeys, typical_h_mm, _total_occ)
         # AI may return count as a dict e.g. {"passenger": 4, "fire_fighting": 2}
         if isinstance(num_lifts, dict):
@@ -2226,38 +3051,240 @@ class RevitWorkers:
         m_spec = m_stair_config.get("spec", {})
         for k in ["riser", "tread", "width_of_flight", "landing_width"]:
             if k in m_spec: stair_spec[k] = safe_num(m_spec[k], stair_spec.get(k))
-        # Only widen the entry (door-side) landing: 1000mm door + 1800mm clear = 2800mm.
-        # The opposite landing stays at the preset width.
-        stair_spec["entry_landing_width"] = max(stair_spec.get("landing_width", 1500), 2800)
+
+        # 3a. Apply RAG-derived compliance_parameters as overrides.
+        # compliance_parameters is populated by Gemini from live RAG values.
+        # These take priority over both the preset and the static JSON fallbacks.
+        # Only fall back to preset/JSON if a key is absent or zero.
+        cp = self._compliance_params  # extracted from manifest at top of execute()
+        _cp_overrides = {}
+
+        # Staircase geometry — riser/tread/headroom/overrun from compliance_parameters
+        if cp.get("stair_riser_mm"):
+            stair_spec["riser"] = int(cp["stair_riser_mm"])
+            _cp_overrides["max_riser_mm"] = int(cp["stair_riser_mm"])
+        if cp.get("stair_tread_mm"):
+            stair_spec["tread"] = int(cp["stair_tread_mm"])
+            _cp_overrides["min_tread_mm"] = int(cp["stair_tread_mm"])
+        if cp.get("stair_headroom_mm"):
+            _cp_overrides["min_headroom_mm"] = int(cp["stair_headroom_mm"])
+        if cp.get("stair_overrun_mm"):
+            _cp_overrides["overrun_height_mm"] = int(cp["stair_overrun_mm"])
+        if cp.get("max_travel_distance_mm"):
+            _cp_overrides["max_travel_distance_mm"] = int(cp["max_travel_distance_mm"])
+
+        # --- Pre-determine actual staircase count from travel distance compliance ---
+        # Must happen before the width calculation so the occupancy load is divided
+        # by the real number of stairs (central + any perimeter added for 60m rule).
+        _fp_pts_pre = shell.get("footprint_points")
+        _pre_floor_dims = floor_dims
+        if _fp_pts_pre and len(_fp_pts_pre) >= 3:
+            try:
+                _fp_xs_pre = [p[0] for p in _fp_pts_pre]
+                _fp_ys_pre = [p[1] for p in _fp_pts_pre]
+                _fp_w_pre = max(_fp_xs_pre) - min(_fp_xs_pre)
+                _fp_l_pre = max(_fp_ys_pre) - min(_fp_ys_pre)
+                _pre_floor_dims = [(_fp_w_pre, _fp_l_pre)] * len(floor_dims)
+            except Exception:
+                pass
+        _f_center_pre = list(f_center_mm)  # use manifest-specified position
+        _layout_pre = lift_logic.get_total_core_layout(num_lifts, lobby_width=lobby_w)
+        _lift_bounds_pre = (
+            _f_center_pre[0] - _layout_pre["total_w"] / 2.0,
+            _f_center_pre[1] - _layout_pre["total_d"] / 2.0,
+            _f_center_pre[0] + _layout_pre["total_w"] / 2.0,
+            _f_center_pre[1] + _layout_pre["total_d"] / 2.0,
+        )
+        _safety_sets_pre = fire_safety_logic.calculate_fire_safety_requirements(
+            _pre_floor_dims, _f_center_pre, _lift_bounds_pre,
+            typical_h_mm, preset_fs, num_lifts, lobby_w,
+            compliance_overrides=_cp_overrides,
+            footprint_pts=_fp_pts_pre,
+            orientation=_core_orientation
+        )
+        _num_stairs_from_travel = max(len(_safety_sets_pre), 2)
+        self.log("[StairCount] Travel-distance compliance requires {} staircases".format(_num_stairs_from_travel))
+
+        # --- Staircase width calculation (SCDF Table 2.2A method) ---
+        # Uses the largest floor plate so the worst-case occupant load governs.
+        # Step a: functional space = largest floor plate - central core
+        # Step b: total occupancy = functional_area_m2 / occupant_load_factor_m2
+        # Step c: total unit widths needed = ceil(total_occupancy / persons_per_unit_width)
+        # Step d: unit widths per stair = ceil(total_unit_widths / num_stairs)
+        # Step e: required width = unit_widths_per_stair * exit_width_per_unit_mm
+        #         then clamp to >= min_flight_width_mm from RAG
+        import math as _math
+        _occupant_load_factor  = safe_num(cp.get("occupant_load_factor_m2"),  0)
+        _exit_width_per_unit   = safe_num(cp.get("exit_width_per_unit_mm"),    0)
+        _min_flight_width      = safe_num(cp.get("stair_min_flight_width_mm"), 0)
+        _num_stairs            = _num_stairs_from_travel
+        # persons_per_unit_width: RAG extracts from Table 2.2A staircase column.
+        # If RAG didn't return it the calculation is skipped and the code-minimum width is used.
+        _persons_per_unit      = safe_num(cp.get("persons_per_unit_width"), 0)
+
+        _calc_flight_width = None
+        if _occupant_load_factor > 0 and _persons_per_unit > 0 and _exit_width_per_unit > 0 and floor_dims:
+            # Largest floor plate (mm -> m2)
+            _largest_area_mm2  = max(w * l for w, l in floor_dims)
+            _largest_area_m2   = _largest_area_mm2 / 1e6
+            # Core area using preset ratio midpoint
+            _core_ratio        = sum(preset.get("program_requirements", {}).get("core_area_ratio", [0.20, 0.25])) / 2.0
+            _functional_area   = _largest_area_m2 * (1.0 - _core_ratio)
+            # Occupancy
+            _total_occupancy   = _functional_area / _occupant_load_factor
+            # Required unit widths across all stairs
+            _total_unit_widths = _math.ceil(_total_occupancy / _persons_per_unit)
+            # Split across stairs
+            _units_per_stair   = _math.ceil(_total_unit_widths / max(int(_num_stairs), 1))
+            _calc_flight_width = int(_units_per_stair * _exit_width_per_unit)
+            self.log(
+                "[StairWidth] largest_floor={:.0f}m2 core_ratio={:.0%} functional={:.0f}m2 "
+                "occupants={:.0f} unit_widths={} stairs={} units/stair={} calc_width={}mm".format(
+                    _largest_area_m2, _core_ratio, _functional_area, _total_occupancy,
+                    _total_unit_widths, int(_num_stairs), _units_per_stair, _calc_flight_width
+                )
+            )
+        else:
+            self.log("[StairWidth] Skipping calculation — RAG missing occupant_load_factor={} "
+                     "persons_per_unit={} exit_width_per_unit={}".format(
+                         _occupant_load_factor, _persons_per_unit, _exit_width_per_unit))
+
+        # Final flight width: max(calculated, RAG minimum, absolute code floor 1000mm)
+        _abs_min = 1000
+        _final_flight_width = _abs_min
+        if _calc_flight_width:
+            _final_flight_width = max(_calc_flight_width, int(_min_flight_width) if _min_flight_width else _abs_min, _abs_min)
+        elif _min_flight_width:
+            _final_flight_width = max(int(_min_flight_width), _abs_min)
+        elif cp.get("stair_flight_width_mm"):
+            _final_flight_width = max(int(cp["stair_flight_width_mm"]), _abs_min)
+
+        stair_spec["width_of_flight"] = _final_flight_width
+        _cp_overrides["min_flight_width_mm"] = _final_flight_width
+        self.log("[StairWidth] Final flight width: {}mm (calc={}, rag_min={}, preset={})".format(
+            _final_flight_width, _calc_flight_width, _min_flight_width,
+            preset.get("core_logic", {}).get("fire_safety", {}).get("staircase_spec", {}).get("width_of_flight")))
+
+        # Landing width = flight width + 300mm; door-side landing widens further for door swing
+        _landing_width = _final_flight_width + 300
+        stair_spec["landing_width"] = _landing_width
+        _cp_overrides["min_landing_width_mm"] = _landing_width
+
+        # Fire lift and lobby
+        if cp.get("fire_lift_car_size_mm"):
+            _cp_overrides["fire_lift_car_size_mm"] = int(cp["fire_lift_car_size_mm"])
+        if cp.get("fire_lobby_min_area_mm2"):
+            _cp_overrides["fire_lobby_min_area_mm2"] = int(cp["fire_lobby_min_area_mm2"])
+        if cp.get("fire_lobby_min_depth_mm"):
+            _cp_overrides["fire_lobby_min_depth_mm"] = int(cp["fire_lobby_min_depth_mm"])
+        if cp.get("smoke_lobby_min_area_mm2"):
+            _cp_overrides["smoke_lobby_min_area_mm2"] = int(cp["smoke_lobby_min_area_mm2"])
+        if cp.get("smoke_lobby_min_depth_mm"):
+            _cp_overrides["smoke_lobby_min_depth_mm"] = int(cp["smoke_lobby_min_depth_mm"])
+        if cp.get("min_corridor_width_mm"):
+            _cp_overrides["min_corridor_width_mm"] = int(cp["min_corridor_width_mm"])
+
+        if _cp_overrides:
+            self.log("[ComplianceOverride] Applying {} RAG-derived value(s) to engine: {}".format(
+                len(_cp_overrides), list(_cp_overrides.keys())))
+
+        # Door-side (entry) landing must clear the door swing: flight_width + 300 is the base,
+        # but the door-side needs at minimum 1000mm door + 1800mm clear = 2800mm.
+        stair_spec["entry_landing_width"] = max(_landing_width, 2800)
         self._stair_spec = stair_spec
 
         # 4. Calculate Unified Layout
-        f_center_mm = [0.0, 0.0] # Assume centered for building generator
-        
+        # f_center_mm and _core_orientation were read from lifts_config above (step 2)
+
+        # When the shell uses footprint_offset_overrides (e.g. S-shape), the building
+        # centroid shifts per floor.  Staircase positions must lie within the building
+        # at the MOST-OFFSET floor, not just the nominal centre position.
+        # Shrink the effective floor dims by 2× the maximum offset so that perimeter
+        # stair candidates never land outside the building on any floor.
+        _stair_floor_dims = floor_dims
+        _fp_pts = shell.get("footprint_points")
+        # For organic shapes (L/H/U/T etc.) the model walls reflect the OLD building
+        # so floor_dims may contain stale rectangular bounding-box values.  Derive
+        # the bounding box directly from footprint_points instead so that the travel
+        # distance check uses the correct building dimensions.
+        if _fp_pts and len(_fp_pts) >= 3:
+            try:
+                _fp_xs = [p[0] for p in _fp_pts]
+                _fp_ys = [p[1] for p in _fp_pts]
+                _fp_w = max(_fp_xs) - min(_fp_xs)
+                _fp_l = max(_fp_ys) - min(_fp_ys)
+                _stair_floor_dims = [(_fp_w, _fp_l)] * len(floor_dims)
+            except Exception:
+                pass
+        _offset_ovr = shell.get("footprint_offset_overrides", {})
+        if _offset_ovr:
+            try:
+                _ox_vals = [abs(float(v[0])) for v in _offset_ovr.values() if isinstance(v, (list, tuple)) and len(v) >= 2]
+                _oy_vals = [abs(float(v[1])) for v in _offset_ovr.values() if isinstance(v, (list, tuple)) and len(v) >= 2]
+                _max_ox = max(_ox_vals) if _ox_vals else 0
+                _max_oy = max(_oy_vals) if _oy_vals else 0
+                if _max_ox > 0 or _max_oy > 0:
+                    _stair_floor_dims = [
+                        (max(w - 2.0 * _max_ox, w * 0.4), max(l - 2.0 * _max_oy, l * 0.4))
+                        for w, l in floor_dims
+                    ]
+                    self.log("[Core] Offset override detected (max ±{:.0f},{:.0f}mm) — shrinking stair zone to {}×{}mm".format(
+                        _max_ox, _max_oy,
+                        int(_stair_floor_dims[0][0]) if _stair_floor_dims else 0,
+                        int(_stair_floor_dims[0][1]) if _stair_floor_dims else 0,
+                    ))
+            except Exception:
+                pass
+
         # Determine passenger lift bounds first for anchor
         layout_lifts = lift_logic.get_total_core_layout(num_lifts, lobby_width=lobby_w)
         lift_core_bounds_mm = (
-            f_center_mm[0] - layout_lifts["total_w"]/2, 
+            f_center_mm[0] - layout_lifts["total_w"]/2,
             f_center_mm[1] - layout_lifts["total_d"]/2,
             f_center_mm[0] + layout_lifts["total_w"]/2,
             f_center_mm[1] + layout_lifts["total_d"]/2
         )
-        
+
         safety_sets = fire_safety_logic.calculate_fire_safety_requirements(
-            floor_dims, f_center_mm, lift_core_bounds_mm, 
-            typical_h_mm, preset_fs, num_lifts, lobby_w
+            _stair_floor_dims, f_center_mm, lift_core_bounds_mm,
+            typical_h_mm, preset_fs, num_lifts, lobby_w,
+            compliance_overrides=_cp_overrides,
+            footprint_pts=_fp_pts,
+            orientation=_core_orientation
         )
-        
+
+        # For organic offset buildings (S-shape etc), drop any perimeter SMOKE_STOP
+        # sets that fire_safety_logic may have added to satisfy the 60m travel rule.
+        # Those sets are placed relative to the nominal floor boundary — at heavily
+        # offset floors they land outside the building envelope, causing both spatial
+        # conflicts and exposed cores.  The 2 core-adjacent fire sets always satisfy
+        # travel distance for buildings ≤ ~80m in plan (max half-diagonal < 60m).
+        if _offset_ovr:
+            _before = len(safety_sets)
+            safety_sets = [s for s in safety_sets if not s.get("is_perimeter", False)]
+            if len(safety_sets) < _before:
+                self.log("[Core] Organic offset: dropped {} perimeter stair set(s) — using {} core-adjacent set(s)".format(
+                    _before - len(safety_sets), len(safety_sets)))
+
         # 5. Build Manifest Data
         levels_manifest = []
         for i, elev_ft in enumerate(elevations):
             levels_manifest.append({"id": "AI Level {}".format(i+1), "elevation": elev_ft * 304.8})
-            
+
         unified_man = fire_safety_logic.generate_fire_safety_manifest(
-            safety_sets, levels_manifest, stair_spec, typical_h_mm, preset_fs, lift_core_bounds_mm, num_lifts, lobby_w
+            safety_sets, levels_manifest, stair_spec, typical_h_mm, preset_fs,
+            lift_core_bounds_mm, num_lifts, lobby_w,
+            compliance_overrides=_cp_overrides
         )
         
         if isinstance(unified_man, dict) and unified_man.get("status") == "CONFLICT":
+            # Attach manifest inputs so dispatcher can build a rich retry prompt
+            unified_man.setdefault("manifest_inputs", {
+                "lift_count": num_lifts,
+                "shell_width_mm": round(safe_num(manifest.get("shell", {}).get("width", 0), 0)),
+                "shell_length_mm": round(safe_num(manifest.get("shell", {}).get("length", 0), 0)),
+                "level_height_mm": round(typical_h_mm),
+            })
             return unified_man
 
         # Collect door specs from fire-safety manifest + passenger lift doors
@@ -2294,10 +3321,75 @@ class RevitWorkers:
                                mm_to_ft(rect[2]), mm_to_ft(rect[3])))
                 res, conflict = self.spatial_registry.reserve(res_id, (rect[0], rect[1], 0, rect[2], rect[3], typical_h_mm))
                 if not res:
+                    # Compute total core footprint vs building shell to give Gemini a geometric hint
+                    _all_rects = [sb2["rect"] for sb2 in sub_bounds]
+                    _all_rects.append(list(lift_core_bounds_mm))
+                    _core_x1 = min(r[0] for r in _all_rects)
+                    _core_y1 = min(r[1] for r in _all_rects)
+                    _core_x2 = max(r[2] for r in _all_rects)
+                    _core_y2 = max(r[3] for r in _all_rects)
+                    _core_w = _core_x2 - _core_x1
+                    _core_d = _core_y2 - _core_y1
+                    _shell_w = safe_num(manifest.get("shell", {}).get("width", 0), 0)
+                    _shell_l = safe_num(manifest.get("shell", {}).get("length", 0), 0)
+
+                    # Describe each sub-boundary so the AI can see what zones exist
+                    _zone_lines = []
+                    for _sb in sub_bounds:
+                        _r = _sb["rect"]
+                        _zw = _r[2] - _r[0]
+                        _zd = _r[3] - _r[1]
+                        _zone_lines.append("  {:<30s}  {:>6.0f} x {:>5.0f} mm".format(_sb["id"], _zw, _zd))
+                    _lift_w = lift_core_bounds_mm[2] - lift_core_bounds_mm[0]
+                    _lift_d = lift_core_bounds_mm[3] - lift_core_bounds_mm[1]
+                    _zone_lines.insert(0, "  {:<30s}  {:>6.0f} x {:>5.0f} mm".format("PassengerLifts (core)", _lift_w, _lift_d))
+                    _zones_text = "\n".join(_zone_lines)
+
+                    # Compute a resolution hint
+                    _hints = []
+                    if _shell_w and _core_w > _shell_w * 0.45:
+                        _needed_w = int(_core_w / 0.40)
+                        _hints.append(
+                            "Core is {:.0f}mm wide but shell.width is only {:.0f}mm "
+                            "(core occupies {:.0%} of width — max comfortable is ~40%). "
+                            "Suggest: increase shell.width to at least {:,}mm, "
+                            "OR reduce lifts.count from {} to {}.".format(
+                                _core_w, _shell_w, _core_w / _shell_w,
+                                _needed_w, num_lifts, max(2, num_lifts - 2)
+                            )
+                        )
+                    if _shell_l and _core_d > _shell_l * 0.55:
+                        _needed_l = int(_core_d / 0.45)
+                        _hints.append(
+                            "Core is {:.0f}mm deep but shell.length is only {:.0f}mm "
+                            "(core occupies {:.0%} of length — max comfortable is ~45%). "
+                            "Suggest: increase shell.length to at least {:,}mm.".format(
+                                _core_d, _shell_l, _core_d / _shell_l, _needed_l
+                            )
+                        )
+                    if not _hints:
+                        _hints.append(
+                            "Core total footprint is {:.0f} x {:.0f}mm vs shell {:.0f} x {:.0f}mm. "
+                            "Consider adjusting shell.width, shell.length, or lifts.count.".format(
+                                _core_w, _core_d, _shell_w, _shell_l
+                            )
+                        )
+
                     return {
                         "status": "CONFLICT",
                         "type": "GEOMETRIC_INTERFERENCE",
-                        "description": "Spatial Conflict detected in Central Core: '{}' overlaps with '{}'".format(res_id, conflict)
+                        "description": "Spatial Conflict detected in Central Core: '{}' overlaps with '{}'".format(res_id, conflict),
+                        "conflicting_zones": (res_id, conflict),
+                        "core_layout_summary": _zones_text,
+                        "core_total_mm": {"width": round(_core_w), "depth": round(_core_d)},
+                        "shell_mm": {"width": round(_shell_w), "length": round(_shell_l)},
+                        "manifest_inputs": {
+                            "lift_count": num_lifts,
+                            "shell_width_mm": round(_shell_w),
+                            "shell_length_mm": round(_shell_l),
+                            "level_height_mm": round(typical_h_mm),
+                        },
+                        "resolution_hints": _hints,
                     }
         else:
             for i, cb in enumerate(unified_man.get("core_bounds", [])):
@@ -2319,6 +3411,8 @@ class RevitWorkers:
         self._lift_core_bounds_ft = _excl[0]
 
         # 6. Inject into Build Pipeline
+        _walls_base_idx  = len(manifest.get("walls",  []))
+        _floors_base_idx = len(manifest.get("floors", []))
         if "walls" not in manifest: manifest["walls"] = []
         manifest["walls"].extend(unified_man.get("walls", []))
         
@@ -2357,7 +3451,68 @@ class RevitWorkers:
         except Exception as _pv_e:
             self.log("Passenger lift void rects failed (non-fatal): {}".format(_pv_e))
         self._stair_voids = u_voids_ft
-        
+        self._stair_void_polygons = []  # filled below if rotation is active
+
+        # 6b. Rotate the entire core assembly if rotation_deg is non-zero.
+        # All wall start/end points, floor polygon points, and shaft voids are
+        # rotated in-place around f_center_mm before being handed to the build
+        # pipeline.  The stair run data receives the rotation parameters so that
+        # _build_dogleg_in_scope / _build_multipair_in_scope can rotate all
+        # DB.XYZ points just before passing them to the Revit Stairs API.
+        if _core_rotation_deg:
+            import math as _crot_math
+            _crot_rad  = _crot_math.radians(_core_rotation_deg)
+            _crot_cos  = _crot_math.cos(_crot_rad)
+            _crot_sin  = _crot_math.sin(_crot_rad)
+            _crot_cx   = f_center_mm[0]
+            _crot_cy   = f_center_mm[1]
+            _crot_cx_ft = mm_to_ft(_crot_cx)
+            _crot_cy_ft = mm_to_ft(_crot_cy)
+
+            def _crot_xy_mm(x, y):
+                dx = x - _crot_cx; dy = y - _crot_cy
+                return (_crot_cx + dx * _crot_cos - dy * _crot_sin,
+                        _crot_cy + dx * _crot_sin + dy * _crot_cos)
+
+            def _crot_xy_ft(x, y):
+                dx = x - _crot_cx_ft; dy = y - _crot_cy_ft
+                return (_crot_cx_ft + dx * _crot_cos - dy * _crot_sin,
+                        _crot_cy_ft + dx * _crot_sin + dy * _crot_cos)
+
+            # Rotate walls (start / end XY)
+            for _w in manifest["walls"][_walls_base_idx:]:
+                if "start" in _w:
+                    _nx, _ny = _crot_xy_mm(_w["start"][0], _w["start"][1])
+                    _w["start"] = [_nx, _ny, _w["start"][2]]
+                if "end" in _w:
+                    _nx, _ny = _crot_xy_mm(_w["end"][0], _w["end"][1])
+                    _w["end"] = [_nx, _ny, _w["end"][2]]
+
+            # Rotate floor polygon points
+            for _f in manifest["floors"][_floors_base_idx:]:
+                if "points" in _f:
+                    _f["points"] = [list(_crot_xy_mm(p[0], p[1])) for p in _f["points"]]
+
+            # Rotate shaft voids → store as rotated polygon loops (in ft).
+            # Keep the AABB envelope in _stair_voids for spatial/column checks;
+            # the actual polygon loops are stored in _stair_void_polygons for use
+            # in _process_floors() to cut correctly-shaped holes in floor slabs.
+            _void_polys = []
+            _void_aabbs = []
+            for (vx1, vy1, vx2, vy2) in u_voids_ft:
+                _corners = [
+                    _crot_xy_ft(vx1, vy1),
+                    _crot_xy_ft(vx2, vy1),
+                    _crot_xy_ft(vx2, vy2),
+                    _crot_xy_ft(vx1, vy2),
+                ]
+                _void_polys.append(_corners)
+                _xs = [c[0] for c in _corners]; _ys = [c[1] for c in _corners]
+                _void_aabbs.append((min(_xs), min(_ys), max(_xs), max(_ys)))
+            self._stair_void_polygons = _void_polys
+            if _void_aabbs:
+                self._stair_voids = _void_aabbs
+
         # Combined Bounds (ft)
         bounds_ft = None
         for cb in unified_man.get("core_bounds", []):
@@ -2389,7 +3544,15 @@ class RevitWorkers:
             floor_dims_mm=floor_dims, num_lifts=num_lifts, lobby_width=lobby_w,
             rotated_indices=rotated_indices, base_y_overrides=stair_overrides
         )
-        
+
+        # Stamp each run with the rotation parameters so _build_dogleg_in_scope
+        # and _build_multipair_in_scope can rotate their DB.XYZ points in place.
+        if _core_rotation_deg:
+            for _rd in self._stair_run_data:
+                _rd['_global_rotation_rad'] = _crot_rad
+                _rd['_rotation_cx_ft']      = _crot_cx_ft
+                _rd['_rotation_cy_ft']      = _crot_cy_ft
+
         # Summary for tracker
         self._stair_summary = {
             "count": len(positions),
@@ -2427,6 +3590,20 @@ class RevitWorkers:
                                  _StairsRun, _StairsLanding, _StairsRunJust):
         """Build a complex multi-pair stair (Tall Floor) within a given Staircase scope."""
         import Autodesk.Revit.DB as DB # type: ignore
+        import math as _mp_math
+        _mp_rot_rad = rd.get('_global_rotation_rad', 0.0)
+        if _mp_rot_rad:
+            _mp_cos = _mp_math.cos(_mp_rot_rad)
+            _mp_sin = _mp_math.sin(_mp_rot_rad)
+            _mp_cx  = rd['_rotation_cx_ft']
+            _mp_cy  = rd['_rotation_cy_ft']
+            def _rp(pt):
+                dx = pt.X - _mp_cx; dy = pt.Y - _mp_cy
+                return DB.XYZ(_mp_cx + dx*_mp_cos - dy*_mp_sin,
+                               _mp_cy + dx*_mp_sin + dy*_mp_cos, pt.Z)
+        else:
+            def _rp(pt):
+                return pt
         flight_list = rd.get('flight_list', [])
         num_pairs = rd.get('num_flight_pairs', 1)
         total_risers = sum(flight_list) if flight_list else num_pairs * 28
@@ -2471,11 +3648,11 @@ class RevitWorkers:
 
             # Run A — direction depends on rotation
             a_run_len = max(a_risers - 1, 1) * tread_ft
-            p_as = DB.XYZ(f1_cx, flight_y_start_ft, current_base_z)
+            p_as = _rp(DB.XYZ(f1_cx, flight_y_start_ft, current_base_z))
             if is_rotated:
-                p_ae = DB.XYZ(f1_cx, flight_y_start_ft - a_run_len, current_base_z)
+                p_ae = _rp(DB.XYZ(f1_cx, flight_y_start_ft - a_run_len, current_base_z))
             else:
-                p_ae = DB.XYZ(f1_cx, flight_y_start_ft + a_run_len, current_base_z)
+                p_ae = _rp(DB.XYZ(f1_cx, flight_y_start_ft + a_run_len, current_base_z))
             _StairsRun.CreateStraightRun(doc, stair_id, DB.Line.CreateBound(p_as, p_ae), _StairsRunJust.Center)
 
             mid_z = current_base_z + a_risers * riser_h_ft
@@ -2489,10 +3666,10 @@ class RevitWorkers:
             else:
                 land_y_bot = flight_y_start_ft + a_run_len  # near edge = end of Run A
                 land_y_top = shaft_back_y                   # far edge = shaft back wall
-            lp1 = DB.XYZ(land_x_left,  land_y_bot, mid_z)
-            lp2 = DB.XYZ(land_x_right, land_y_bot, mid_z)
-            lp3 = DB.XYZ(land_x_right, land_y_top, mid_z)
-            lp4 = DB.XYZ(land_x_left,  land_y_top, mid_z)
+            lp1 = _rp(DB.XYZ(land_x_left,  land_y_bot, mid_z))
+            lp2 = _rp(DB.XYZ(land_x_right, land_y_bot, mid_z))
+            lp3 = _rp(DB.XYZ(land_x_right, land_y_top, mid_z))
+            lp4 = _rp(DB.XYZ(land_x_left,  land_y_top, mid_z))
             mid_loop = DB.CurveLoop()
             mid_loop.Append(DB.Line.CreateBound(lp1, lp2))
             mid_loop.Append(DB.Line.CreateBound(lp2, lp3))
@@ -2504,11 +3681,11 @@ class RevitWorkers:
             b_run_len = max(b_risers - 1, 1) * tread_ft
             top_z = mid_z + b_risers * riser_h_ft
             if is_rotated:
-                p_bs = DB.XYZ(f2_cx, flight_y_start_ft - a_run_len, mid_z)
-                p_be = DB.XYZ(f2_cx, flight_y_start_ft - a_run_len + b_run_len, mid_z)
+                p_bs = _rp(DB.XYZ(f2_cx, flight_y_start_ft - a_run_len, mid_z))
+                p_be = _rp(DB.XYZ(f2_cx, flight_y_start_ft - a_run_len + b_run_len, mid_z))
             else:
-                p_bs = DB.XYZ(f2_cx, flight_y_start_ft + a_run_len, mid_z)
-                p_be = DB.XYZ(f2_cx, flight_y_start_ft + a_run_len - b_run_len, mid_z)
+                p_bs = _rp(DB.XYZ(f2_cx, flight_y_start_ft + a_run_len, mid_z))
+                p_be = _rp(DB.XYZ(f2_cx, flight_y_start_ft + a_run_len - b_run_len, mid_z))
             _StairsRun.CreateStraightRun(doc, stair_id, DB.Line.CreateBound(p_bs, p_be), _StairsRunJust.Center)
 
             # Intermediate landing — connects Run B end to next pair's Run A start.
@@ -2520,18 +3697,18 @@ class RevitWorkers:
                     # Run B ends at: flight_y_start_ft - a_run_len + b_run_len
                     b_end_y = flight_y_start_ft - a_run_len + b_run_len
                     inter_far_y = min(flight_y_start_ft, b_end_y)  # southernmost cover
-                    il1 = DB.XYZ(land_x_left,  inter_far_y, inter_z)
-                    il2 = DB.XYZ(land_x_right, inter_far_y, inter_z)
-                    il3 = DB.XYZ(land_x_right, flight_y_start_ft + dyn_landing_ft, inter_z)
-                    il4 = DB.XYZ(land_x_left,  flight_y_start_ft + dyn_landing_ft, inter_z)
+                    il1 = _rp(DB.XYZ(land_x_left,  inter_far_y, inter_z))
+                    il2 = _rp(DB.XYZ(land_x_right, inter_far_y, inter_z))
+                    il3 = _rp(DB.XYZ(land_x_right, flight_y_start_ft + dyn_landing_ft, inter_z))
+                    il4 = _rp(DB.XYZ(land_x_left,  flight_y_start_ft + dyn_landing_ft, inter_z))
                 else:
                     # Run B ends at: flight_y_start_ft + a_run_len - b_run_len
                     b_end_y = flight_y_start_ft + a_run_len - b_run_len
                     inter_far_y = max(flight_y_start_ft, b_end_y)  # northernmost cover
-                    il1 = DB.XYZ(land_x_left,  flight_y_start_ft - dyn_landing_ft, inter_z)
-                    il2 = DB.XYZ(land_x_right, flight_y_start_ft - dyn_landing_ft, inter_z)
-                    il3 = DB.XYZ(land_x_right, inter_far_y, inter_z)
-                    il4 = DB.XYZ(land_x_left,  inter_far_y, inter_z)
+                    il1 = _rp(DB.XYZ(land_x_left,  flight_y_start_ft - dyn_landing_ft, inter_z))
+                    il2 = _rp(DB.XYZ(land_x_right, flight_y_start_ft - dyn_landing_ft, inter_z))
+                    il3 = _rp(DB.XYZ(land_x_right, inter_far_y, inter_z))
+                    il4 = _rp(DB.XYZ(land_x_left,  inter_far_y, inter_z))
                 iloop = DB.CurveLoop()
                 iloop.Append(DB.Line.CreateBound(il1, il2))
                 iloop.Append(DB.Line.CreateBound(il2, il3))
@@ -3400,8 +4577,24 @@ class RevitWorkers:
         that makes it 1 riser height taller than the actual rise of the run.
         """
         import Autodesk.Revit.DB as DB  # type: ignore
+        import math as _dg_math
 
         base_z = base_lvl.ProjectElevation
+
+        # Build a point-rotation helper using params stamped on rd (0-deg = identity).
+        _dg_rot_rad = rd.get('_global_rotation_rad', 0.0)
+        if _dg_rot_rad:
+            _dg_cos = _dg_math.cos(_dg_rot_rad)
+            _dg_sin = _dg_math.sin(_dg_rot_rad)
+            _dg_cx  = rd['_rotation_cx_ft']
+            _dg_cy  = rd['_rotation_cy_ft']
+            def _rp(pt):
+                dx = pt.X - _dg_cx; dy = pt.Y - _dg_cy
+                return DB.XYZ(_dg_cx + dx*_dg_cos - dy*_dg_sin,
+                               _dg_cy + dx*_dg_sin + dy*_dg_cos, pt.Z)
+        else:
+            def _rp(pt):
+                return pt
 
         f1 = rd['flight_1']
         f2 = rd['flight_2']
@@ -3454,11 +4647,11 @@ class RevitWorkers:
 
         # --- Run A: direction depends on rotation ---
         a_run_len = max(a_risers - 1, 1) * tread_ft
-        p_as = DB.XYZ(round(f1_cx, 8), round(flight_y_start_ft, 8), base_z)
+        p_as = _rp(DB.XYZ(round(f1_cx, 8), round(flight_y_start_ft, 8), base_z))
         if is_rotated:
-            p_ae = DB.XYZ(round(f1_cx, 8), round(flight_y_start_ft - a_run_len, 8), base_z)
+            p_ae = _rp(DB.XYZ(round(f1_cx, 8), round(flight_y_start_ft - a_run_len, 8), base_z))
         else:
-            p_ae = DB.XYZ(round(f1_cx, 8), round(flight_y_start_ft + a_run_len, 8), base_z)
+            p_ae = _rp(DB.XYZ(round(f1_cx, 8), round(flight_y_start_ft + a_run_len, 8), base_z))
 
         # Diagnostic Log
         if a_run_len < 0.001:
@@ -3491,10 +4684,10 @@ class RevitWorkers:
             land_y_bot = round(flight_y_start_ft + a_run_len, 8)
             land_y_top = round(land_y_bot + dyn_landing_ft, 8)
 
-        lp1 = DB.XYZ(round(land_x_left,  8), land_y_bot, mid_elev_abs)
-        lp2 = DB.XYZ(round(land_x_right, 8), land_y_bot, mid_elev_abs)
-        lp3 = DB.XYZ(round(land_x_right, 8), land_y_top, mid_elev_abs)
-        lp4 = DB.XYZ(round(land_x_left,  8), land_y_top, mid_elev_abs)
+        lp1 = _rp(DB.XYZ(round(land_x_left,  8), land_y_bot, mid_elev_abs))
+        lp2 = _rp(DB.XYZ(round(land_x_right, 8), land_y_bot, mid_elev_abs))
+        lp3 = _rp(DB.XYZ(round(land_x_right, 8), land_y_top, mid_elev_abs))
+        lp4 = _rp(DB.XYZ(round(land_x_left,  8), land_y_top, mid_elev_abs))
 
         mid_loop = DB.CurveLoop()
         mid_loop.Append(DB.Line.CreateBound(lp1, lp2))
@@ -3507,12 +4700,12 @@ class RevitWorkers:
         b_run_len = max(b_risers - 1, 1) * tread_ft
         if is_rotated:
             # Mid-landing is at lower Y; Run B goes back toward +Y (start side)
-            p_bs = DB.XYZ(round(f2_cx, 8), round(flight_y_start_ft - a_run_len, 8), mid_elev_abs)
-            p_be = DB.XYZ(round(f2_cx, 8), round(flight_y_start_ft - a_run_len + b_run_len, 8), mid_elev_abs)
+            p_bs = _rp(DB.XYZ(round(f2_cx, 8), round(flight_y_start_ft - a_run_len, 8), mid_elev_abs))
+            p_be = _rp(DB.XYZ(round(f2_cx, 8), round(flight_y_start_ft - a_run_len + b_run_len, 8), mid_elev_abs))
         else:
             # Mid-landing is at higher Y; Run B goes back toward -Y (start side)
-            p_bs = DB.XYZ(round(f2_cx, 8), land_y_bot, mid_elev_abs)
-            p_be = DB.XYZ(round(f2_cx, 8), round(land_y_bot - b_run_len, 8), mid_elev_abs)
+            p_bs = _rp(DB.XYZ(round(f2_cx, 8), land_y_bot, mid_elev_abs))
+            p_be = _rp(DB.XYZ(round(f2_cx, 8), round(land_y_bot - b_run_len, 8), mid_elev_abs))
         
         # Diagnostic Log
         if b_run_len < 0.001:
@@ -4932,25 +6125,15 @@ class RevitWorkers:
                 safe_set_comment(dim, "AI_Dim")
             except: pass
 
-        # For Floor Plans: X-Grids (Vertical) vs Y-Grids (Horizontal)
-        # For Section Views: Only vertical lines (grids seen in projection) are visible.
-        
-        is_plan = view.ViewType == DB.ViewType.FloorPlan
-        
-        if is_plan:
-            create_dim(view, x_grids, DB.XYZ(0, -mm_to_ft(3000), 0), is_overall=False)
-            create_dim(view, x_grids, DB.XYZ(0, -mm_to_ft(5000), 0), is_overall=True)
-            create_dim(view, y_grids, DB.XYZ(-mm_to_ft(3000), 0, 0), is_overall=False)
-            create_dim(view, y_grids, DB.XYZ(-mm_to_ft(5000), 0, 0), is_overall=True)
-        else:
-            # Section view: All visible grids are vertical lines in the view plane.
-            # Combine all for a single horizontal dimension chain.
-            v_grids = x_grids + y_grids
-            if len(v_grids) >= 2:
-                # Offset in the view's current Up direction
-                up = view.UpDirection.Normalize() * mm_to_ft(3000)
-                create_dim(view, v_grids, up, is_overall=False)
-                create_dim(view, v_grids, up + view.UpDirection.Normalize() * mm_to_ft(2000), is_overall=True)
+        # Only dimension floor plan views. Section/elevation grid dimensions cause
+        # "References not parallel" errors when the user adjusts grid extents.
+        if view.ViewType != DB.ViewType.FloorPlan:
+            return
+
+        create_dim(view, x_grids, DB.XYZ(0, -mm_to_ft(3000), 0), is_overall=False)
+        create_dim(view, x_grids, DB.XYZ(0, -mm_to_ft(5000), 0), is_overall=True)
+        create_dim(view, y_grids, DB.XYZ(-mm_to_ft(3000), 0, 0), is_overall=False)
+        create_dim(view, y_grids, DB.XYZ(-mm_to_ft(5000), 0, 0), is_overall=True)
 
     def _dimension_levels_in_view(self, view):
         import Autodesk.Revit.DB as DB # type: ignore

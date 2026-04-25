@@ -111,6 +111,9 @@ def get_core_dimensions(num_lifts, internal_size=(2500, 2500), lobby_width=3000)
 def get_total_core_layout(num_lifts, internal_size=(2500, 2500), lobby_width=3000):
     """Calculates multi-core layout (back-to-back) if num_lifts > 12.
     Ensures equal distribution among cores."""
+    if num_lifts == 0:
+        return {"num_blocks": 0, "lifts_per_block": 0, "total_lifts": 0,
+                "block_w": 0, "block_d": 0, "total_w": 0, "total_d": 0}
     # Strict 12-lift max per block
     num_blocks = int(math.ceil(num_lifts / float(_MAX_PER_BLOCK)))
     

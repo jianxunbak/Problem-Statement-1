@@ -35,6 +35,12 @@ def get_log_path():
     _cached_log_path = os.path.join(root, "fastmcp_server.log")
     return _cached_log_path
 
+def get_appdata_path(subfolder):
+    """Return %APPDATA%\\RevitMCP\\<subfolder>, creating directories if needed."""
+    base = os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")), "RevitMCP", subfolder)
+    os.makedirs(base, exist_ok=True)
+    return base
+
 def safe_num(val, default=0):
     try:
         if val is None: return float(default) if default is not None else None

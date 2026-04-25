@@ -72,7 +72,7 @@ def _passenger_lift_row_centers(center_pos_mm, layout, lobby_width):
     return row1_cy, row2_cy
 
 
-def _fire_lift_shaft_walls(tag, cx_mm, cy_mm, fw_mm, fd_mm, levels_data):
+def _fire_lift_shaft_walls(tag, cx_mm, cy_mm, fw_mm, fd_mm, levels_data, overrun_height=_OVERRUN_HEIGHT):
     """Generate walls + topcap for a single fire-fighting lift shaft."""
     walls = []
     floors = []
@@ -83,7 +83,7 @@ def _fire_lift_shaft_walls(tag, cx_mm, cy_mm, fw_mm, fd_mm, levels_data):
     for l_idx, lvl in enumerate(levels_data):
         lvl_id, elev = lvl['id'], lvl['elevation']
         is_last = (l_idx == len(levels_data) - 1)
-        h = _OVERRUN_HEIGHT if is_last else (levels_data[l_idx + 1]['elevation'] - elev)
+        h = overrun_height if is_last else (levels_data[l_idx + 1]['elevation'] - elev)
         if h <= 0:
             continue
         common = {"level_id": lvl_id, "height": h, "type": "AI_Wall_Core"}
@@ -92,21 +92,32 @@ def _fire_lift_shaft_walls(tag, cx_mm, cy_mm, fw_mm, fd_mm, levels_data):
         walls.append({"id": "AI_{}_W_L{}".format(tag, l_idx + 1), "start": [x1, y1, 0], "end": [x1, y2, 0], **common})
         walls.append({"id": "AI_{}_E_L{}".format(tag, l_idx + 1), "start": [x2, y1, 0], "end": [x2, y2, 0], **common})
         if is_last:
-            cap_elev = elev + _OVERRUN_HEIGHT
+            cap_elev = elev + overrun_height
             floors.append({"id": "AI_{}_TOPCAP".format(tag), "level_id": lvl_id, "elevation": cap_elev,
                            "points": [[x1, y1], [x2, y1], [x2, y2], [x1, y2]]})
     return walls, floors
 
 
-def _should_use_ew_orientation(_lift_core_bounds_mm, _sw_nat, _sd_nat):
-    """Return True if EW orientation should be used.
+def _should_use_ew_orientation(_lift_core_bounds_mm, _sw_nat, _sd_nat,
+                               orientation="AUTO", floor_dims=None):
+    """Return True if EW orientation should be used for the core stack.
 
-    EW orientation would require a 90-degree staircase rotation (flights running
-    east-west instead of north-south) to avoid L-shaped fire safety sets.
-    That rotation is not yet implemented in staircase_logic / revit_workers, so
-    we always return False and use the NS layout, which naturally produces a
-    compact rectangle (fire lift → lobby → staircase stacked in Y).
+    EW layout: lift row runs N-S, stairs at E/W ends.
+    NS layout: lift row runs E-W, stairs at N/S ends (default).
+
+    orientation: "NS" / "EW" — explicit override from manifest.
+                 "AUTO" — auto-select based on floor plate aspect ratio.
     """
+    if orientation == "EW":
+        return True
+    if orientation == "NS":
+        return False
+    # AUTO: choose EW when the floor plate is significantly wider than deep
+    if floor_dims:
+        avg_w = sum(d[0] for d in floor_dims) / len(floor_dims)
+        avg_l = sum(d[1] for d in floor_dims) / len(floor_dims)
+        if avg_w > avg_l * 1.5:
+            return True
     return False
 
 
@@ -115,8 +126,9 @@ def _should_use_ew_orientation(_lift_core_bounds_mm, _sw_nat, _sd_nat):
 # ---------------------------------------------------------------------------
 
 def calculate_fire_safety_requirements(floor_dims_mm, core_center_mm, lift_core_bounds_mm,
-                                       typical_floor_height_mm, preset_fs, num_lifts,
-                                       lobby_width=3000):
+                                       typical_floor_height_mm, _preset_fs, num_lifts,
+                                       lobby_width=3000, compliance_overrides=None,
+                                       footprint_pts=None, orientation="AUTO"):
     """Determine positions and types for fire safety cores.
 
     Returns list of dicts: {"pos": (x, y), "type": "FIRE_LIFT"|"SMOKE_STOP"}
@@ -125,8 +137,15 @@ def calculate_fire_safety_requirements(floor_dims_mm, core_center_mm, lift_core_
                  (y = lift_ymin or lift_ymax, x = lift_core_cx).
     EW layout  — pos is the entry point at the lift-core X boundary
                  (x = lift_xmin or lift_xmax, y = lift_core_cy).
+
+    compliance_overrides: dict of RAG-derived values that override the static
+        module constants (e.g. {"max_travel_distance_mm": 60000, "fire_lift_car_size_mm": 2500}).
+        Falls back to module constants for any key not present.
     """
-    max_travel_dist = _MAX_TRAVEL
+    co = compliance_overrides or {}
+    max_travel_dist = co.get("max_travel_distance_mm", _MAX_TRAVEL)
+    fl_car_size     = co.get("fire_lift_car_size_mm",  _FL_CAR_SIZE)
+    fl_shaft_d      = fl_car_size + 2 * _WALL_THICKNESS
     final_sets = []
 
     # Compute passenger lift core bounds if not provided
@@ -152,7 +171,8 @@ def calculate_fire_safety_requirements(floor_dims_mm, core_center_mm, lift_core_
     _typ_h = typical_floor_height_mm or 4000
     sw_nat = staircase_logic.get_shaft_dimensions(_typ_h, None)[0]
     sd_nat = staircase_logic.get_shaft_dimensions(_typ_h, None)[1]
-    use_ew = _should_use_ew_orientation(lift_core_bounds_mm, sw_nat, sd_nat)
+    use_ew = _should_use_ew_orientation(lift_core_bounds_mm, sw_nat, sd_nat,
+                                        orientation=orientation, floor_dims=floor_dims_mm)
 
     if use_ew:
         # EW layout: fire lifts aligned with passenger lift rows so the passenger
@@ -161,8 +181,8 @@ def calculate_fire_safety_requirements(floor_dims_mm, core_center_mm, lift_core_
         if layout_ew and layout_ew["lifts_per_block"] >= 4:
             # 2-row block: east set at north-row centre, west set at south-row centre.
             # Row centres are half a shaft_depth inward from the lobby boundary.
-            row_cy_s = lift_core_cy - lobby_width / 2.0 - _FL_SHAFT_D / 2.0  # south row
-            row_cy_n = lift_core_cy + lobby_width / 2.0 + _FL_SHAFT_D / 2.0  # north row
+            row_cy_s = lift_core_cy - lobby_width / 2.0 - fl_shaft_d / 2.0  # south row
+            row_cy_n = lift_core_cy + lobby_width / 2.0 + fl_shaft_d / 2.0  # north row
             final_sets.append({"pos": (l_xmax, row_cy_n), "type": "FIRE_LIFT"})
             final_sets.append({"pos": (l_xmin, row_cy_s), "type": "FIRE_LIFT"})
         else:
@@ -178,8 +198,8 @@ def calculate_fire_safety_requirements(floor_dims_mm, core_center_mm, lift_core_
     # NS parallel layout: each staircase is cluster_d_p/2 beyond the lift-core
     # entry point (l_ymin or l_ymax).  Using entry points directly makes the
     # check pessimistic and causes extra perimeter sets to be added.
-    _lobby_d_est  = max(2000, sd_nat - _FL_SHAFT_D)
-    _cluster_d_est = _FL_SHAFT_D + _lobby_d_est          # ≈ 7 300 mm for 4 000 mm floors
+    _lobby_d_est  = max(2000, sd_nat - fl_shaft_d)
+    _cluster_d_est = fl_shaft_d + _lobby_d_est          # ≈ 7 300 mm for 4 000 mm floors
     stair_pos = []
     for s in final_sets:
         ex, ey = s["pos"]
@@ -188,7 +208,8 @@ def calculate_fire_safety_requirements(floor_dims_mm, core_center_mm, lift_core_
         else:                    # north entry
             stair_pos.append((ex, ey + _cluster_d_est / 2.0))
 
-    if staircase_logic._check_travel_distance(stair_pos, floor_dims_mm, max_travel_dist):
+    if staircase_logic._check_travel_distance(stair_pos, floor_dims_mm, max_travel_dist,
+                                               footprint_pts=footprint_pts):
         return final_sets
 
     # ── Perimeter SMOKE_STOP staircases (60m rule not yet satisfied) ──────────
@@ -198,51 +219,104 @@ def calculate_fire_safety_requirements(floor_dims_mm, core_center_mm, lift_core_
     # The "pos" stores (x, y_edge) where y_edge is the building boundary line.
     # generate_fire_safety_manifest detects is_perimeter=True and uses a
     # dedicated layout rather than the core-relative NS/EW branches.
+    #
+    # SMALLEST-FOOTPRINT-FIRST STRATEGY (SCDF-aware):
+    # Try placing perimeter stairs aligned to the smallest floor plate first.
+    # If that satisfies 60m for ALL floor dimensions, use it — stairs will sit
+    # inside the core of the building on most floors, minimising exposure.
+    # If not compliant for any floor, escalate to the next-smallest footprint,
+    # repeating until all floors comply.  Only fall back to max footprint as a
+    # last resort.  This mirrors SCDF Code Part IV cl. 5.3.3 intent.
     if floor_dims_mm:
-        max_w = max(d[0] for d in floor_dims_mm)
-        max_l = max(d[1] for d in floor_dims_mm)
+        # Build a sorted list of unique half-lengths (ascending) to try as edge positions.
+        unique_half_l = sorted(set(d[1] / 2.0 for d in floor_dims_mm))
     else:
-        max_w, max_l = 50000, 50000
-    hw_p = max_w / 2.0
-    hl_p = max_l / 2.0
+        unique_half_l = [25000.0]  # 50 m default half-length
 
     # Approximate shaft depth to compute staircase centre from edge position.
     _sd_approx = staircase_logic.get_shaft_dimensions(_typ_h, None)[1]
 
-    # Candidate perimeter positions (NS-oriented: south/north building edges).
-    # A single staircase at the midpoint of each edge (x=0) covers all corners
-    # for buildings up to ~120 m wide.  Placing staircases at x=0 instead of
-    # the x-extremes also minimises the total number added (typically 2 for an
-    # 80×100 m plate instead of 4 from a spread-first greedy).
-    perim_candidates = []
-    for x_frac in [0.0]:   # midpoint of each long edge — optimal for ≤120 m width
-        x_pos = x_frac * hw_p
-        # Staircase centres (used for travel-distance check)
-        perim_candidates.append((x_pos, -hl_p + _sd_approx / 2.0))   # south edge
-        perim_candidates.append((x_pos,  hl_p - _sd_approx / 2.0))   # north edge
+    # For irregular polygons, pre-compute an 8×8 grid of interior candidate positions
+    # so perimeter stairs always land inside the actual floor plate, not at bounding-box
+    # edge midpoints that may be outside a Z/L/H/etc. shaped footprint.
+    _poly_candidates = None
+    if footprint_pts and len(footprint_pts) >= 3:
+        _fp_xs = [p[0] for p in footprint_pts]
+        _fp_ys = [p[1] for p in footprint_pts]
+        _fp_xmin, _fp_xmax = min(_fp_xs), max(_fp_xs)
+        _fp_ymin, _fp_ymax = min(_fp_ys), max(_fp_ys)
+        _gN = 8
+        _gdx = (_fp_xmax - _fp_xmin) / float(_gN)
+        _gdy = (_fp_ymax - _fp_ymin) / float(_gN)
+        _interior = [
+            (_fp_xmin + (_ix + 0.5) * _gdx, _fp_ymin + (_iy + 0.5) * _gdy)
+            for _ix in range(_gN) for _iy in range(_gN)
+            if staircase_logic._point_in_polygon(
+                _fp_xmin + (_ix + 0.5) * _gdx,
+                _fp_ymin + (_iy + 0.5) * _gdy, footprint_pts)
+        ]
+        if _interior:
+            _poly_candidates = _interior
 
     # Greedy: always pick the candidate furthest from ALL existing staircases.
     all_stair_pos = list(stair_pos)
-    while perim_candidates:
-        if staircase_logic._check_travel_distance(all_stair_pos, floor_dims_mm, max_travel_dist):
-            break
-        best = max(perim_candidates, key=lambda c: min(
-            math.sqrt((c[0] - sx) ** 2 + (c[1] - sy) ** 2)
-            for sx, sy in all_stair_pos
-        ))
-        perim_candidates.remove(best)
-        # Reconstruct building-edge Y from centre Y
-        y_edge = best[1] - _sd_approx / 2.0 if best[1] < 0 else best[1] + _sd_approx / 2.0
-        final_sets.append({"pos": (best[0], y_edge), "type": "SMOKE_STOP", "is_perimeter": True})
-        all_stair_pos.append(best)
+
+    # Try each footprint from smallest to largest until 60m rule is satisfied.
+    for try_hl in unique_half_l:
+        if staircase_logic._check_travel_distance(all_stair_pos, floor_dims_mm, max_travel_dist,
+                                                   footprint_pts=footprint_pts):
+            break  # already compliant from central stairs alone
+
+        # Build candidates: polygon-interior grid points (irregular shapes) or
+        # bounding-box edge midpoints (rectangular shapes).
+        if _poly_candidates is not None:
+            perim_candidates = list(_poly_candidates)
+        else:
+            perim_candidates = [
+                (core_center_mm[0], -try_hl + _sd_approx / 2.0),   # south edge centre
+                (core_center_mm[0],  try_hl - _sd_approx / 2.0),   # north edge centre
+            ]
+
+        # Add the best candidate from this footprint tier.
+        while perim_candidates:
+            if staircase_logic._check_travel_distance(all_stair_pos, floor_dims_mm, max_travel_dist,
+                                                       footprint_pts=footprint_pts):
+                break
+            best = max(perim_candidates, key=lambda c: min(
+                math.sqrt((c[0] - sx) ** 2 + (c[1] - sy) ** 2)
+                for sx, sy in all_stair_pos
+            ))
+            perim_candidates.remove(best)
+            # Derive building-edge Y from staircase centre Y (used for is_south_p orientation)
+            y_edge = best[1] - _sd_approx / 2.0 if best[1] < 0 else best[1] + _sd_approx / 2.0
+            final_sets.append({"pos": (best[0], y_edge), "type": "SMOKE_STOP",
+                                "is_perimeter": True,
+                                "ref_half_l": try_hl})  # track which footprint tier placed this
+            all_stair_pos.append(best)
+
+    # Tag each perimeter staircase with the highest 0-based floor index where it
+    # is still required.  Above that index the central core stairs alone satisfy
+    # the travel-distance rule, so the extra shaft can terminate early.
+    if floor_dims_mm:
+        for _fs in final_sets:
+            if _fs.get("is_perimeter"):
+                _last = 0
+                for _k in range(len(floor_dims_mm) - 1, -1, -1):
+                    if not staircase_logic._check_travel_distance(
+                            stair_pos, [floor_dims_mm[_k]], max_travel_dist,
+                            footprint_pts=footprint_pts):
+                        _last = _k
+                        break
+                _fs["last_floor_idx"] = _last
 
     return final_sets
 
 
 def generate_fire_safety_manifest(safety_sets, levels_data, stair_spec,
-                                  typical_floor_height_mm, preset_fs,
+                                  typical_floor_height_mm, _preset_fs,
                                   lift_core_bounds_mm=None, num_lifts=None,
-                                  lobby_width=3000):
+                                  lobby_width=3000, all_floor_dims=None,
+                                  compliance_overrides=None, **kwargs):
     """Generate manifest for fire lifts, lobbies and staircases.
 
     Supports two layout orientations, chosen automatically in
@@ -256,7 +330,16 @@ def generate_fire_safety_manifest(safety_sets, levels_data, stair_spec,
     narrower lift banks):
         [Stair_W] [Lobby_W] [FireLift_W] [PassengerLifts] [FireLift_E] [Lobby_E] [Stair_E]
         Staircase runs N-S (normal), centred on the lift-core Y centre.
+
+    compliance_overrides: dict of RAG-derived values that override static module constants.
     """
+    co = compliance_overrides or {}
+    fl_car_size     = co.get("fire_lift_car_size_mm",   _FL_CAR_SIZE)
+    fl_shaft_d      = fl_car_size + 2 * _WALL_THICKNESS
+    overrun_height  = co.get("overrun_height_mm",       _OVERRUN_HEIGHT)
+    fire_lb_area    = co.get("fire_lobby_min_area_mm2", _FSC.get("fire_lift_lobby",  {}).get("min_area_mm2",   6000000))
+    smoke_clear_d   = co.get("smoke_lobby_min_depth_mm",_SMOKE_CLEAR_D)
+
     walls = []
     floors = []
     voids = []
@@ -271,7 +354,7 @@ def generate_fire_safety_manifest(safety_sets, levels_data, stair_spec,
     sw_nat = staircase_logic.get_shaft_dimensions(typical_floor_height_mm, stair_spec)[0]
     sd_nat = staircase_logic.get_max_shaft_depth(levels_data, stair_spec, typical_floor_height_mm)
     # NS layout also needs total_set_d
-    _, total_set_d = staircase_logic.get_safety_set_dimensions(typical_floor_height_mm, stair_spec, True, levels_data=levels_data)
+    _, total_set_d = staircase_logic.get_safety_set_dimensions(typical_floor_height_mm, stair_spec, True, levels_data=levels_data, compliance_overrides=co)
 
     l_xmin, l_ymin, l_xmax, l_ymax = lift_core_bounds_mm if lift_core_bounds_mm else (0, 0, 0, 0)
     lift_core_cy = (l_ymin + l_ymax) / 2.0
@@ -285,10 +368,10 @@ def generate_fire_safety_manifest(safety_sets, levels_data, stair_spec,
 
     t = _WALL_THICKNESS
 
-    # Pre-compute EW dimensions (Rule 3: fire lift shaft = passenger lift shaft = _FL_SHAFT_D)
-    ew_fl_dx  = _FL_SHAFT_D                                       # EW fire-lift X extent (2900 mm)
-    lb_net_y  = _FL_SHAFT_D - 2 * t                               # lobby internal Y = 2500 mm
-    ew_lb_dx  = max(2000, int(math.ceil(6000000.0 / lb_net_y)))  # EW lobby X extent (≥2400 mm for 6 m²)
+    # Pre-compute EW dimensions (Rule 3: fire lift shaft = passenger lift shaft = fl_shaft_d)
+    ew_fl_dx  = fl_shaft_d                                              # EW fire-lift X extent
+    lb_net_y  = fl_shaft_d - 2 * t                                     # lobby internal Y
+    ew_lb_dx  = max(2000, int(math.ceil(fire_lb_area / lb_net_y)))     # EW lobby X extent (≥ min area)
 
     for i, s_set in enumerate(safety_sets):
         is_fl      = (s_set["type"] == "FIRE_LIFT")
@@ -301,10 +384,22 @@ def generate_fire_safety_manifest(safety_sets, levels_data, stair_spec,
             # Simple layout: staircase at building edge, lobby between staircase and floor plate.
             # entry_y is the building-edge Y (negative = south, positive = north).
             is_south_p = (entry_y <= 0)
+
+            # Truncate levels to only those where this perimeter staircase is needed.
+            # "last_floor_idx" is the 0-based index (in all_floor_dims) of the highest
+            # floor that requires this stair.  We include one extra level as the
+            # overrun/cap so the shaft terminates cleanly at that storey.
+            _last_fi = s_set.get("last_floor_idx")
+            if (_last_fi is not None and all_floor_dims and
+                    _last_fi + 2 < len(levels_data)):
+                _set_levels = levels_data[:_last_fi + 2]
+            else:
+                _set_levels = levels_data
+            _set_lvl_ids = [lvl['id'] for lvl in _set_levels[:-1]] if len(_set_levels) > 1 else ([_set_levels[0]['id']] if _set_levels else [])
             # Smoke-stop lobby: min 2000mm clear width (= sw_nat - 2t) already
             # satisfied by the staircase width.  Depth: 2000mm clear = 2400mm outer.
             # Target ~4-5 sqm net: 2000mm clear × (sw_nat - 2t) already large enough.
-            lobby_d_p  = 2 * _WALL_THICKNESS + _SMOKE_CLEAR_D  # outer = clear depth + 2 walls
+            lobby_d_p  = 2 * _WALL_THICKNESS + smoke_clear_d  # outer = clear depth + 2 walls
             fl_box = None  # no fire lift
 
             # Inset the staircase from the building edge so the floor-slab void does
@@ -341,16 +436,16 @@ def generate_fire_safety_manifest(safety_sets, levels_data, stair_spec,
             core_bounds.append(st_rect)
             stair_centers.append((st_cx, st_cy, is_rotated_suit))
 
-            # Lobby walls
+            # Lobby walls — only up to the last floor where this stair is needed
             lobby_tag  = tag + "_LB"
             lb_x1_w, lb_x2_w = lb_box[0], lb_box[2]
             lb_y1_w, lb_y2_w = lb_box[1], lb_box[3]
-            for l_idx, lvl in enumerate(levels_data):
-                is_last_lvl = (l_idx == len(levels_data) - 1)
+            for l_idx, lvl in enumerate(_set_levels):
+                is_last_lvl = (l_idx == len(_set_levels) - 1)
                 if is_last_lvl:
-                    lvl_h = _OVERRUN_HEIGHT
+                    lvl_h = overrun_height
                 else:
-                    lvl_h = levels_data[l_idx + 1]['elevation'] - lvl['elevation']
+                    lvl_h = _set_levels[l_idx + 1]['elevation'] - lvl['elevation']
                     if lvl_h <= 0:
                         continue
                 common = {"level_id": lvl['id'], "height": lvl_h, "type": "AI_Wall_Core"}
@@ -366,19 +461,20 @@ def generate_fire_safety_manifest(safety_sets, levels_data, stair_spec,
                 if _perim_skip != "S":
                     walls.append({"id": "AI_{}_S_L{}".format(lobby_tag, l_idx + 1),
                                   "start": [lb_x1_w, lb_y1_w, 0], "end": [lb_x2_w, lb_y1_w, 0], **common})
-            if levels_data:
-                last_lvl = levels_data[-1]
+            if _set_levels:
+                last_lvl = _set_levels[-1]
                 floors.append({
                     "id": "AI_{}_TOPCAP".format(lobby_tag),
                     "level_id": last_lvl['id'],
-                    "elevation": last_lvl['elevation'] + _OVERRUN_HEIGHT,
+                    "elevation": last_lvl['elevation'] + overrun_height,
                     "points": [[lb_x1_w, lb_y1_w], [lb_x2_w, lb_y1_w], [lb_x2_w, lb_y2_w], [lb_x1_w, lb_y2_w]]
                 })
 
-            # Staircase manifest (no lift-core bounds for perimeter sets)
+            # Staircase manifest — truncated to the same level range
             st_man = staircase_logic.generate_staircase_manifest(
-                [(st_cx, st_cy)], levels_data, sw_nat, stair_spec, typical_floor_height_mm,
+                [(st_cx, st_cy)], _set_levels, sw_nat, stair_spec, typical_floor_height_mm,
                 lift_core_bounds_mm=None, num_lifts=None, lobby_width=lobby_width,
+                compliance_overrides=co,
                 base_y_override=st_base_y, rotated_indices=([0] if is_rotated_suit else []),
                 stair_idx_offset=stair_global_idx
             )
@@ -394,7 +490,9 @@ def generate_fire_safety_manifest(safety_sets, levels_data, stair_spec,
 
             # ── Door specs for perimeter smoke-stop ─────────────────────────
             # stair_global_idx already incremented above → stair_num = stair_global_idx
+            # Use _set_lvl_ids (truncated) so doors only appear on floors the stair serves.
             _sn_p = stair_global_idx
+            _set_first_id = _set_lvl_ids[0] if _set_lvl_ids else None
             if is_south_p:
                 # Staircase main landing faces NORTH (is_rotated=True), external door on SOUTH wall
                 _ext_y = st_base_y          # south wall of staircase = W_Front
@@ -403,28 +501,28 @@ def generate_fire_safety_manifest(safety_sets, levels_data, stair_spec,
                     "id": tag + "_Stair_ExtDoor",
                     "position_mm": [st_x1 + 900, _ext_y],
                     "wall_line_mm": [[st_x1, _ext_y], [st_x2, _ext_y]],
-                    "levels": [_first_lvl_id] if _first_lvl_id else [],
+                    "levels": [_set_first_id] if _set_first_id else [],
                     "swing_in": False, "flip_hand": True, "min_width_mm": 1000,
                     "door_category": "single_leaf",
-                    "wall_ai_id_map": ({_all_lvl_ids[0]: "AI_Stair_{}_L1_W_Front".format(_sn_p)} if _all_lvl_ids else {}),
+                    "wall_ai_id_map": ({_set_lvl_ids[0]: "AI_Stair_{}_L1_W_Front".format(_sn_p)} if _set_lvl_ids else {}),
                 })
                 door_specs.append({
                     "id": tag + "_Stair_LobbyDoor",
                     "position_mm": [st_x1 + 900, _lby_conn],
                     "wall_line_mm": [[st_x1, _lby_conn], [st_x2, _lby_conn]],
-                    "levels": _all_lvl_ids, "swing_in": True, "flip_hand": True, "min_width_mm": 1000,
+                    "levels": _set_lvl_ids, "swing_in": True, "flip_hand": True, "min_width_mm": 1000,
                     "door_category": "single_leaf",
                     "swing_out_level1": True,
-                    "wall_ai_id_map": {_all_lvl_ids[k]: "AI_Stair_{}_L{}_W_Back".format(_sn_p, k + 1) for k in range(len(_all_lvl_ids))},
+                    "wall_ai_id_map": {_set_lvl_ids[k]: "AI_Stair_{}_L{}_W_Back".format(_sn_p, k + 1) for k in range(len(_set_lvl_ids))},
                 })
                 door_specs.append({
                     "id": tag + "_Lobby_EntryDoor",
                     "position_mm": [st_x1 + 900, lb_y2],
                     "wall_line_mm": [[lb_box[0], lb_y2], [lb_box[2], lb_y2]],
-                    "levels": _all_lvl_ids, "swing_in": True, "flip_hand": True, "min_width_mm": 1000,
+                    "levels": _set_lvl_ids, "swing_in": True, "flip_hand": True, "min_width_mm": 1000,
                     "door_category": "single_leaf",
                     "swing_out_level1": True,
-                    "wall_ai_id_map": {_all_lvl_ids[k]: "AI_SafetySet_{}_LB_N_L{}".format(i + 1, k + 1) for k in range(len(_all_lvl_ids))},
+                    "wall_ai_id_map": {_set_lvl_ids[k]: "AI_SafetySet_{}_LB_N_L{}".format(i + 1, k + 1) for k in range(len(_set_lvl_ids))},
                 })
             else:
                 # Main landing faces SOUTH (is_rotated=False), external door on NORTH wall
@@ -434,28 +532,28 @@ def generate_fire_safety_manifest(safety_sets, levels_data, stair_spec,
                     "id": tag + "_Stair_ExtDoor",
                     "position_mm": [st_x1 + 900, _ext_y],
                     "wall_line_mm": [[st_x1, _ext_y], [st_x2, _ext_y]],
-                    "levels": [_first_lvl_id] if _first_lvl_id else [],
+                    "levels": [_set_first_id] if _set_first_id else [],
                     "swing_in": False, "flip_hand": True, "min_width_mm": 1000,
                     "door_category": "single_leaf",
-                    "wall_ai_id_map": ({_all_lvl_ids[0]: "AI_Stair_{}_L1_W_Back".format(_sn_p)} if _all_lvl_ids else {}),
+                    "wall_ai_id_map": ({_set_lvl_ids[0]: "AI_Stair_{}_L1_W_Back".format(_sn_p)} if _set_lvl_ids else {}),
                 })
                 door_specs.append({
                     "id": tag + "_Stair_LobbyDoor",
                     "position_mm": [st_x1 + 900, _lby_conn],
                     "wall_line_mm": [[st_x1, _lby_conn], [st_x2, _lby_conn]],
-                    "levels": _all_lvl_ids, "swing_in": True, "flip_hand": True, "min_width_mm": 1000,
+                    "levels": _set_lvl_ids, "swing_in": True, "flip_hand": True, "min_width_mm": 1000,
                     "door_category": "single_leaf",
                     "swing_out_level1": True,
-                    "wall_ai_id_map": {_all_lvl_ids[k]: "AI_Stair_{}_L{}_W_Front".format(_sn_p, k + 1) for k in range(len(_all_lvl_ids))},
+                    "wall_ai_id_map": {_set_lvl_ids[k]: "AI_Stair_{}_L{}_W_Front".format(_sn_p, k + 1) for k in range(len(_set_lvl_ids))},
                 })
                 door_specs.append({
                     "id": tag + "_Lobby_EntryDoor",
                     "position_mm": [st_x1 + 900, lb_y1],
                     "wall_line_mm": [[lb_box[0], lb_y1], [lb_box[2], lb_y1]],
-                    "levels": _all_lvl_ids, "swing_in": True, "flip_hand": True, "min_width_mm": 1000,
+                    "levels": _set_lvl_ids, "swing_in": True, "flip_hand": True, "min_width_mm": 1000,
                     "door_category": "single_leaf",
                     "swing_out_level1": True,
-                    "wall_ai_id_map": {_all_lvl_ids[k]: "AI_SafetySet_{}_LB_S_L{}".format(i + 1, k + 1) for k in range(len(_all_lvl_ids))},
+                    "wall_ai_id_map": {_set_lvl_ids[k]: "AI_SafetySet_{}_LB_S_L{}".format(i + 1, k + 1) for k in range(len(_set_lvl_ids))},
                 })
             continue  # skip the normal orientation detection below
 
@@ -477,7 +575,7 @@ def generate_fire_safety_manifest(safety_sets, levels_data, stair_spec,
             # fire-lift + lobby X span so the entire set forms a compact
             # rectangle rather than an L-shape.
             fl_dx  = ew_fl_dx if is_fl else 0
-            fl_Y_h = _FL_SHAFT_D / 2.0  # fire-lift Y half-extent = pax lift shaft (Rule 3)
+            fl_Y_h = fl_shaft_d / 2.0  # fire-lift Y half-extent = pax lift shaft (Rule 3)
 
             if is_east_ew:
                 fl_x1, fl_x2 = l_xmax,           l_xmax + fl_dx
@@ -558,29 +656,29 @@ def generate_fire_safety_manifest(safety_sets, levels_data, stair_spec,
             #   South → fire zone WEST, staircase EAST
             #   North → fire zone EAST, staircase WEST
             #
-            # Fire zone width = _FL_SHAFT_D (2900mm); lobby same width.
-            # Cluster depth   = fl_shaft_d + lobby_d (= _FL_SHAFT_D + max(2000, remaining))
-            # Total X         = _FL_SHAFT_D + sw_nat  (must fit inside lift bank)
+            # Fire zone width = fl_shaft_d; lobby same width.
+            # Cluster depth   = fl_shaft_d + lobby_d (= fl_shaft_d + max(2000, remaining))
+            # Total X         = fl_shaft_d + sw_nat  (must fit inside lift bank)
             # Fallback to sequential stack if lift bank too narrow.
 
             lift_bank_w  = l_xmax - l_xmin
-            fz_w         = _FL_SHAFT_D                            # fire-zone X width = shaft width
+            fz_w         = fl_shaft_d                             # fire-zone X width = shaft width
             total_pair_w = fz_w + sw_nat                          # total X needed
             use_parallel = (total_pair_w <= lift_bank_w + 1)      # fits with 1mm tolerance
 
             # Cluster depth: shaft (inner) + lobby (outer), minimum lobby 2000mm
-            fl_shaft_d_p = _FL_SHAFT_D       # 2900mm — shaft occupies inner depth
+            fl_shaft_d_p = fl_shaft_d        # shaft occupies inner depth
             lobby_d_p    = max(2000, sd_nat - fl_shaft_d_p)
             cluster_d_p  = fl_shaft_d_p + lobby_d_p
 
             if not use_parallel:
                 # ── Fallback: original sequential NS stack ───────────────────
-                fire_lift_d = _FL_SHAFT_D if is_fl else 0
+                fire_lift_d = fl_shaft_d if is_fl else 0
                 lobby_d     = total_set_d - sd_nat - fire_lift_d
                 if not is_fl:
                     lobby_d = total_set_d - sd_nat
                 sw_h  = sw_nat / 2.0
-                fl_hw = _FL_SHAFT_D / 2.0
+                fl_hw = fl_shaft_d / 2.0
                 st_cx = entry_x
                 if is_south:
                     fl_box    = [entry_x - fl_hw, entry_y - fire_lift_d, entry_x + fl_hw, entry_y] if is_fl else None
@@ -842,7 +940,7 @@ def generate_fire_safety_manifest(safety_sets, levels_data, stair_spec,
             fl_cy = (fl_box[1] + fl_box[3]) / 2.0
             fl_fw = fl_box[2] - fl_box[0]   # X extent → fw_mm
             fl_fd = fl_box[3] - fl_box[1]   # Y extent → fd_mm
-            ls_walls, ls_floors = _fire_lift_shaft_walls(tag + "_FL", fl_cx, fl_cy, fl_fw, fl_fd, levels_data)
+            ls_walls, ls_floors = _fire_lift_shaft_walls(tag + "_FL", fl_cx, fl_cy, fl_fw, fl_fd, levels_data, overrun_height=overrun_height)
             walls.extend(ls_walls)
             floors.extend(ls_floors)
 
@@ -853,7 +951,7 @@ def generate_fire_safety_manifest(safety_sets, levels_data, stair_spec,
         for l_idx, lvl in enumerate(levels_data):
             is_last_lvl = (l_idx == len(levels_data) - 1)
             if is_last_lvl:
-                lvl_h = _OVERRUN_HEIGHT
+                lvl_h = overrun_height
             else:
                 lvl_h = levels_data[l_idx + 1]['elevation'] - lvl['elevation']
                 if lvl_h <= 0:
@@ -876,7 +974,7 @@ def generate_fire_safety_manifest(safety_sets, levels_data, stair_spec,
         # ── Lobby TOPCAP — closing slab above overrun (matches lift shaft / staircase) ──
         if levels_data:
             last_lvl = levels_data[-1]
-            cap_elev = last_lvl['elevation'] + _OVERRUN_HEIGHT
+            cap_elev = last_lvl['elevation'] + overrun_height
             floors.append({
                 "id": "AI_{}_TOPCAP".format(lobby_tag),
                 "level_id": last_lvl['id'],
@@ -896,7 +994,7 @@ def generate_fire_safety_manifest(safety_sets, levels_data, stair_spec,
             [(st_cx, st_cy)], levels_data, sw_nat, stair_spec, typical_floor_height_mm,
             lift_core_bounds_mm=st_lc_bounds, num_lifts=st_num_lifts, lobby_width=lobby_width,
             base_y_override=st_base_y, rotated_indices=([0] if is_rotated_suit else []),
-            stair_idx_offset=stair_global_idx
+            stair_idx_offset=stair_global_idx, compliance_overrides=co
         )
         stair_global_idx += 1
         walls.extend(st_man.get("walls", []))
@@ -909,15 +1007,62 @@ def generate_fire_safety_manifest(safety_sets, levels_data, stair_spec,
             rotated_indices=([0] if is_rotated_suit else [])
         ))
 
+    # ── Exposed staircase detection ─────────────────────────────────────────
+    # For each perimeter staircase, determine which floor levels have a floor
+    # plate smaller than the staircase footprint.  These levels have the
+    # staircase partially or fully outside the slab edge.
+    # Returns a list of dicts so building_generator.py can optionally widen
+    # those floor plates to enclose the stairs (Step 2 of the design intent).
+    exposed_stair_info = []
+    if all_floor_dims and stair_centers:
+        for s_set_idx, s_set in enumerate(safety_sets):
+            if not s_set.get("is_perimeter"):
+                continue
+            # Retrieve the staircase X-extents and Y-extents for this set.
+            # stair_centers list is 1:1 with is_perimeter sets only — find index.
+            # core_bounds tracks [xmin, ymin, xmax, ymax] for each safety set.
+            if s_set_idx >= len(core_bounds):
+                continue
+            sb = core_bounds[s_set_idx]  # [x1, y1, x2, y2]
+            st_x1, st_y1, st_x2, st_y2 = sb
+            st_hl = max(abs(st_y1), abs(st_y2))  # furthest Y extent from centre
+
+            exposed_levels = []
+            for lvl_idx, (fw, fl) in enumerate(all_floor_dims):
+                floor_hl = fl / 2.0
+                floor_hw = fw / 2.0
+                # Exposed if staircase Y-extent exceeds floor half-length
+                # OR staircase X-extent exceeds floor half-width
+                y_exposed = st_hl > floor_hl
+                x_exposed = (abs(st_x1) > floor_hw) or (abs(st_x2) > floor_hw)
+                if y_exposed or x_exposed:
+                    # Minimum widths needed to fully enclose the staircase
+                    min_l_needed = st_hl * 2.0
+                    min_w_needed = (abs(st_x1) + abs(st_x2))
+                    exposed_levels.append({
+                        "level_index": lvl_idx + 1,   # 1-based
+                        "floor_width": fw,
+                        "floor_length": fl,
+                        "min_width_to_enclose": round(min_w_needed),
+                        "min_length_to_enclose": round(min_l_needed),
+                    })
+            if exposed_levels:
+                exposed_stair_info.append({
+                    "stair_set_index": s_set_idx,
+                    "stair_bounds": [st_x1, st_y1, st_x2, st_y2],
+                    "exposed_levels": exposed_levels,
+                })
+
     return {
-        "walls":          walls,
-        "floors":         floors,
-        "voids":          voids,
-        "core_bounds":    core_bounds,
-        "stair_centers":  stair_centers,
-        "sub_boundaries": [s for s in sub_boundaries if s],
-        "stair_overrides": stair_overrides,
-        "door_specs":     door_specs,
+        "walls":             walls,
+        "floors":            floors,
+        "voids":             voids,
+        "core_bounds":       core_bounds,
+        "stair_centers":     stair_centers,
+        "sub_boundaries":    [s for s in sub_boundaries if s],
+        "stair_overrides":   stair_overrides,
+        "door_specs":        door_specs,
+        "exposed_stair_info": exposed_stair_info,
     }
 
 

@@ -4,6 +4,9 @@ import asyncio
 import threading
 from collections import deque
 
+# Prefix used to distinguish transient status updates from permanent messages
+_STATUS_PREFIX = "\x00STATUS\x00"
+
 class BuildProgressTracker:
     def __init__(self, ctx=None, loop=None, callback=None):
         self.ctx = ctx
@@ -29,10 +32,17 @@ class BuildProgressTracker:
         }
         self.adjustments = []
         self.narrative_history = []
+        self.goal = ""
+        self.detail_level = "standard"
+        self.tone = "conversational"
         # Thread-safe queue for messages
         self._msg_queue = deque()
         self._stop_event = threading.Event()
         self._poller_task = None
+
+    def set_status(self, text):
+        """Update the transient spinner status line (replaces in-place, disappears when done)."""
+        self._deliver(_STATUS_PREFIX + text)
 
     def start(self):
         self.start_time = time.time()
@@ -44,7 +54,8 @@ class BuildProgressTracker:
         else:
             log(f"DEBUG: ProgressTracker.start() - FAILED: loop={bool(self.loop)}, ctx={bool(self.ctx)}. Streaming disabled.")
 
-        self.report("Sending prompt to AI... Waiting for building manifest.")
+        self.set_status("Waiting for AI response...")
+        log("ProgressTracker: started, waiting for manifest.")
 
     def _start_poller(self):
         """Starts the async polling task on the correct loop."""
@@ -97,9 +108,11 @@ class BuildProgressTracker:
             log(f"DEBUG: ProgressTracker Poller CRASHED: {e}")
                 
     def stop(self):
-        """Signal the poller to stop."""
+        """Signal the poller to stop and clear the spinner bubble."""
         from revit_mcp.runner import log
         log("DEBUG: ProgressTracker.stop() signaled.")
+        # Send a sentinel to tell the UI to remove the spinner bubble
+        self._deliver(_STATUS_PREFIX)
         self._stop_event.set()
         self.end_time = time.time()
         
@@ -166,36 +179,36 @@ class BuildProgressTracker:
                 parts.append(f"{col_spacing/1000:.0f}m column grid")
             parts.append(f"{stair_count} staircases")
 
-            self.report(
+            from revit_mcp.runner import log as _log
+            _log(
                 f"Manifest received: {', '.join(parts)}. "
                 f"Estimated build time: {est_min}-{est_max}s."
             )
 
         except Exception:
-            self.report("Manifest received. Building...")
+            pass
 
-    def report(self, msg, is_narrative=False):
-        """Queue a status update for the background poller, or deliver via callback."""
+    def _deliver(self, msg):
+        """Send a message via callback or queue."""
         from revit_mcp.runner import log
-        
-        # Add micro-timestamp for uniqueness to prevent client squashing
-        t_now = time.strftime("%H:%M:%S")
-        unique_msg = f"[{t_now}] {msg}"
-        
-        log(f"PROGRESS: {unique_msg}")
-
-        if is_narrative:
-            self.narrative_history.append(msg)
-
         if self._callback:
             try:
                 self._callback(msg)
             except Exception as e:
                 log(f"PROGRESS CALLBACK ERROR: {e}")
-            return
+        else:
+            self._msg_queue.append(msg)
 
-        # Simple thread-safe append (deque.append is atomic in CPython)
-        self._msg_queue.append(unique_msg)
+    def report(self, msg, is_narrative=False):
+        """Append a permanent message bubble."""
+        from revit_mcp.runner import log
+        t_now = time.strftime("%H:%M:%S")
+        log(f"PROGRESS: [{t_now}] {msg}")
+
+        if is_narrative:
+            self.narrative_history.append(msg)
+
+        self._deliver(msg)
 
     def record_created(self, category, count=1):
         """Track actual elements created during the build."""
@@ -213,24 +226,91 @@ class BuildProgressTracker:
         duration = self.end_time - self.start_time if self.start_time else 0
 
         report = []
-        report.append(f"Status: {base_summary}")
-        report.append(f"Duration: {duration:.1f} seconds")
+        _goal = getattr(self, "goal", "") or ""
+        _tone = getattr(self, "tone", "conversational") or "conversational"
+        if _goal and _tone == "conversational":
+            _goal_clean = _goal.rstrip(".")
+            report.append("**{}. Here's what was built:**".format(
+                _goal_clean[0].upper() + _goal_clean[1:]
+            ))
+        else:
+            report.append(f"**{base_summary}**")
 
-        if self.narrative_history:
-            report.append("\nArchitectural Logic:")
-            for item in self.narrative_history:
-                report.append(item)
-        report.append("\nConstructed Elements:")
-        for key, val in self.elements_created.items():
-            if val > 0:
-                label = key.replace("_", " ").capitalize()
-                report.append(f"- {label}: {val}")
+        # ── Build stats ───────────────────────────────────────────────────────
+        report.append("\n| | |")
+        report.append("|---|---|")
+        report.append(f"| **Status** | {base_summary} |")
+        report.append(f"| **Build time** | {duration:.0f}s |")
 
-        # Adjustments
+        # ── High-level building summary from manifest ─────────────────────────
+        m = getattr(self, "_last_manifest", None)
+        if m:
+            setup  = m.get("project_setup", {})
+            shell  = m.get("shell", {})
+            lifts  = m.get("lifts", {})
+            stairs = m.get("staircases", {})
+
+            levels      = int(setup.get("levels", 0))
+            storeys     = max(0, levels - 1)   # levels includes roof level
+            lh_mm       = setup.get("level_height", 0)
+            # Height overrides: recalculate total height properly
+            h_overrides = setup.get("height_overrides", {})
+            total_h_mm  = 0
+            for i in range(1, levels):
+                total_h_mm += int(h_overrides.get(str(i), lh_mm) or lh_mm)
+
+            width_mm  = shell.get("width", 0)
+            length_mm = shell.get("length", 0)
+            floor_area_m2 = (width_mm / 1000.0) * (length_mm / 1000.0) if width_mm and length_mm else 0
+            total_area_m2 = floor_area_m2 * storeys
+
+            lift_count  = lifts.get("count", self.elements_created.get("lifts", 0))
+            stair_count = stairs.get("count", self.elements_created.get("staircases", 0))
+
+            brows = []
+            if storeys:
+                brows.append(("Storeys", str(storeys)))
+            if total_h_mm:
+                brows.append(("Total height", "{:.1f} m".format(total_h_mm / 1000.0)))
+            if floor_area_m2:
+                brows.append(("Floor plate", "{:.0f} m²  ({:.0f}m × {:.0f}m)".format(
+                    floor_area_m2, width_mm / 1000.0, length_mm / 1000.0)))
+            if total_area_m2:
+                brows.append(("Total GFA", "{:.0f} m²".format(total_area_m2)))
+            if lift_count:
+                brows.append(("Lifts", str(lift_count)))
+            if stair_count:
+                brows.append(("Staircases", str(stair_count)))
+            if lh_mm:
+                brows.append(("Typical floor-to-floor", "{:.1f} m".format(lh_mm / 1000.0)))
+
+            if brows:
+                report.append("\n**Building Summary:**")
+                report.append("| | |")
+                report.append("|---|---|")
+                for k, v in brows:
+                    report.append(f"| {k} | {v} |")
+
+        # ── Constructed elements ──────────────────────────────────────────────
+        elem_rows = [(k.replace("_", " ").capitalize(), v)
+                     for k, v in self.elements_created.items() if v > 0]
+        if elem_rows:
+            report.append("\n**Constructed Elements:**")
+            report.append("| Element | Count |")
+            report.append("|---------|-------|")
+            for label, val in elem_rows:
+                report.append(f"| {label} | {val} |")
+
+        # ── Design adjustments (new info — not shown before) ──────────────────
         if self.adjustments:
-            report.append("\nDesign Adjustments:")
-            for adj in self.adjustments:
-                report.append(f"- {adj}")
+            report.append("\n**Design Adjustments:**")
+            report.append("| # | Adjustment |")
+            report.append("|---|------------|")
+            for i, adj in enumerate(self.adjustments, 1):
+                report.append(f"| {i} | {adj} |")
+
+        # narrative_history (Architectural Intent, authority codes) was already
+        # shown as permanent bubbles during the build — do NOT repeat here.
 
         return "\n".join(report)
 
