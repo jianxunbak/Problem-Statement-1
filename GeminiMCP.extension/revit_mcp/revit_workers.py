@@ -263,6 +263,13 @@ def _rotate_pts(pts_2d, angle_rad, cx=0.0, cy=0.0):
     return result
 
 
+def _poly_area_mm2(pts):
+    """Shoelace formula — returns polygon area in mm²."""
+    n = len(pts)
+    return abs(sum(pts[i][0] * pts[(i + 1) % n][1] - pts[(i + 1) % n][0] * pts[i][1]
+                   for i in range(n))) / 2.0
+
+
 def _volume_footprint_pts(vol):
     """Return the footprint polygon [[x,y], ...] (mm) for a volume entry.
     Uses explicit footprint_points if provided, otherwise builds a rectangle
@@ -396,16 +403,33 @@ class RevitWorkers:
         _svg_path = _shell.get("footprint_svg")
         if _svg_path:
             try:
-                from revit_mcp.svg_to_footprint import svg_path_to_footprint_points
-                _pts = svg_path_to_footprint_points(_svg_path)
+                from revit_mcp.svg_to_footprint import svg_path_to_multiloop
+                _ml = svg_path_to_multiloop(_svg_path)
                 _shell = dict(_shell)
-                _shell["footprint_points"] = _pts
+                _shell["footprint_points"] = _ml["outer"]
+                if _ml.get("holes"):
+                    _shell["footprint_holes"] = _ml["holes"]
+                    self.log("[SVG] footprint_svg converted: {} outer vertices, {} hole(s)".format(
+                        len(_ml["outer"]), len(_ml["holes"])))
+                else:
+                    self.log("[SVG] footprint_svg converted: {} vertices".format(len(_ml["outer"])))
                 _shell.pop("footprint_svg", None)
                 manifest = dict(manifest)
                 manifest["shell"] = _shell
-                self.log("[SVG] footprint_svg converted: {} vertices".format(len(_pts)))
             except Exception as _svg_err:
-                self.log("[SVG] footprint_svg conversion FAILED: {} — building will be rectangular".format(_svg_err))
+                self.log("[SVG] footprint_svg conversion FAILED: {}".format(_svg_err))
+                try: tg.RollBack()
+                except: pass
+                return {
+                    "status": "CONFLICT",
+                    "description": (
+                        "footprint_svg parsing failed: {}. "
+                        "The provided SVG path could not be converted to a valid floor plate polygon. "
+                        "Common causes: self-intersecting path, missing Z close command, or coordinates "
+                        "too far from origin. Fix the path or use footprint_points with straight-line "
+                        "vertices instead. Original path (first 300 chars): {}"
+                    ).format(str(_svg_err), str(_svg_path)[:300])
+                }
 
         # 1. State Scan
         registry = get_model_registry(doc)
@@ -464,11 +488,17 @@ class RevitWorkers:
                     f"({len(current_levels)} total, top elevation {elevations[-1]*304.8:.0f}mm{height_desc})"
                 )
             results["levels"] = [str(l.Id.Value) for l in current_levels]
-            floor_dims, shell = self._process_shell_dimensions(manifest, current_levels, registry)
+            # Expand shape shorthand FIRST so _process_shell_dimensions sees footprint_points
+            shell = manifest.get("shell", {})
             shell = _expand_shape_shorthand(shell)
-            # Propagate any shape expansion back so downstream keys like has_footprint stay consistent
-            if "footprint_points" in shell and "footprint_points" not in manifest.get("shell", {}):
-                manifest.setdefault("shell", {})["footprint_points"] = shell["footprint_points"]
+            manifest["shell"] = shell  # write back so _process_shell_dimensions sees footprint_points
+            # Fix 6: organic builds always define the full geometry — never inherit stale wall lengths
+            if shell.get("footprint_points") and not shell.get("force_global_dimensions"):
+                shell = dict(shell)
+                shell["force_global_dimensions"] = True
+                manifest["shell"] = shell
+                self.log("[Manifest] Auto-set force_global_dimensions=true (footprint_points present)")
+            floor_dims, shell = self._process_shell_dimensions(manifest, current_levels, registry)
 
             check_cancelled("after levels phase")
             # --- PHASE 2: VERTICAL CIRCULATION (Unified Core: Lifts + Staircases) ---
@@ -1024,6 +1054,21 @@ class RevitWorkers:
         shell["width"] = base_w
         shell["length"] = base_l
         shell["position"] = base_pos
+
+        # C2: Override base dims with footprint polygon bounding box when available.
+        # floor_overrides width/length can still specify per-level rectangular overrides.
+        _fp_pts_dim = shell.get("footprint_points")
+        if _fp_pts_dim and len(_fp_pts_dim) >= 3:
+            try:
+                _xs = [p[0] for p in _fp_pts_dim]
+                _ys = [p[1] for p in _fp_pts_dim]
+                base_w = max(_xs) - min(_xs)
+                base_l = max(_ys) - min(_ys)
+                shell["width"] = base_w
+                shell["length"] = base_l
+            except Exception:
+                pass
+
         overrides = shell.get("floor_overrides", {})
 
         # When volumes are present, levels above the topmost volume should use the
@@ -1100,6 +1145,12 @@ class RevitWorkers:
                         l = shell.get("length")
             final_w = get_random_dim(w, base_w, variation=0.25)
             final_l = get_random_dim(l, base_l, variation=0.25)
+            # Fix 1: apply per-level scale factor so tapered floor_dims match the actual slab size
+            _scale_ovr = shell.get("footprint_scale_overrides")
+            if _scale_ovr and shell.get("footprint_points"):
+                _sf = _get_interpolated_scale(_scale_ovr, lvl_idx)
+                final_w *= _sf
+                final_l *= _sf
 
             # Log transitions where dimensions differ from shell default
             if abs(final_w - base_w) > 1.0 or abs(final_l - base_l) > 1.0:
@@ -1295,6 +1346,63 @@ class RevitWorkers:
 
                     updated.append(wall)
                     results["elements"].append(str(wall.Id.Value))
+
+            # --- COURTYARD HOLE WALLS: generate enclosure walls for each footprint_holes polygon ---
+            _hole_polys = shell.get("footprint_holes", [])
+            for _h_idx, _hole_raw in enumerate(_hole_polys):
+                for k, lvl in enumerate(current_levels):
+                    from revit_mcp.cancel_manager import check_cancelled
+                    check_cancelled("hole walls level {}".format(k + 1))
+                    elev = elevations[k]
+                    orig_lvl = _level_indices[k]
+                    scale = _get_interpolated_scale(scale_overrides, orig_lvl)
+                    ox, oy = _get_interpolated_offset(offset_overrides, orig_lvl)
+                    rot = _get_interpolated_rotation(rotation_overrides, orig_lvl)
+                    _hole_pts = _scale_footprint(_hole_raw, scale, ox, oy, rot) if (scale != 1.0 or ox or oy or rot) else _hole_raw
+                    _hn = len(_hole_pts)
+                    for j in range(_hn):
+                        seg_start = _hole_pts[j]
+                        seg_end   = _hole_pts[(j + 1) % _hn]
+                        p1 = DB.XYZ(mm_to_ft(seg_start[0]), mm_to_ft(seg_start[1]), elev)
+                        p2 = DB.XYZ(mm_to_ft(seg_end[0]),   mm_to_ft(seg_end[1]),   elev)
+                        if p1.DistanceTo(p2) < mm_to_ft(2.0):
+                            continue
+                        curve = DB.Line.CreateBound(p1, p2)
+                        tag = "AI_Wall_L{}_H{}_Seg{}".format(orig_lvl, _h_idx, j)
+                        wall_id = registry.get(tag)
+                        wall = doc.GetElement(wall_id) if wall_id else None
+                        if wall and isinstance(wall, DB.Wall):
+                            w_curve = wall.Location.Curve
+                            if not (w_curve.GetEndPoint(0).IsAlmostEqualTo(curve.GetEndPoint(0)) and
+                                    w_curve.GetEndPoint(1).IsAlmostEqualTo(curve.GetEndPoint(1))):
+                                disallow_joins(wall)
+                                try:
+                                    wall.Location.Curve = curve
+                                    affected_elements.append(wall)
+                                except Exception:
+                                    doc.Delete(wall.Id)
+                                    wall = None
+                            if wall:
+                                disallow_joins(wall)
+                                reused[0] += 1
+                        if not wall or not isinstance(wall, DB.Wall):
+                            wall = DB.Wall.Create(doc, curve, lvl.Id, False)
+                            disallow_joins(wall)
+                            safe_set_comment(wall, tag)
+                            registry[tag] = wall.Id
+                            created[0] += 1
+                            affected_elements.append(wall)
+                        try:
+                            if k < len(current_levels) - 1:
+                                wall.get_Parameter(DB.BuiltInParameter.WALL_HEIGHT_TYPE).Set(current_levels[k + 1].Id)
+                            else:
+                                wall.get_Parameter(DB.BuiltInParameter.WALL_HEIGHT_TYPE).Set(DB.ElementId.InvalidElementId)
+                                h_ft = elevations[k + 1] - elevations[k] if k < len(elevations) - 1 else mm_to_ft(1000)
+                                p_h = wall.get_Parameter(DB.BuiltInParameter.WALL_USER_HEIGHT_PARAM)
+                                if p_h: p_h.Set(h_ft)
+                        except: pass
+                        updated.append(wall)
+                        results["elements"].append(str(wall.Id.Value))
             return updated
 
         # --- RECTANGULAR MODE (default): 4 straight walls per level ---
@@ -1642,6 +1750,26 @@ class RevitWorkers:
                             _shelter.append(_ph if (_dxh*_dxh + _dyh*_dyh) >= (_dxb*_dxb + _dyb*_dyb) else _pb)
                         level_pts = _shelter
 
+                # D1: Expand organic slab to cover the fixed core when offset upper
+                # floors would otherwise expose the core shaft.  Skip for tapered
+                # buildings (footprint_scale_overrides present) — the slab is supposed
+                # to shrink there, and expanding would produce protruding rectangles.
+                if _core_mm and not shell.get("footprint_scale_overrides"):
+                    _fp_xs_c = [p[0] for p in level_pts]
+                    _fp_ys_c = [p[1] for p in level_pts]
+                    _sxmin, _sxmax = min(_fp_xs_c), max(_fp_xs_c)
+                    _symin, _symax = min(_fp_ys_c), max(_fp_ys_c)
+                    _cx1, _cy1, _cx2, _cy2 = _core_mm
+                    if (_cx1 < _sxmin - 1 or _cx2 > _sxmax + 1 or
+                            _cy1 < _symin - 1 or _cy2 > _symax + 1):
+                        _nxmin = min(_sxmin, _cx1); _nxmax = max(_sxmax, _cx2)
+                        _nymin = min(_symin, _cy1); _nymax = max(_symax, _cy2)
+                        level_pts = [[_nxmin, _nymin], [_nxmax, _nymin],
+                                     [_nxmax, _nymax], [_nxmin, _nymax]]
+                        self.log("[FloorExpand] L{}: organic slab expanded bbox to cover core "
+                                 "({:.0f}x{:.0f}mm)".format(
+                                     orig_lvl, _nxmax - _nxmin, _nymax - _nymin))
+
                 n = len(level_pts)
                 for j in range(n):
                     seg_start = level_pts[j]
@@ -1734,27 +1862,36 @@ class RevitWorkers:
                     if _hole_loop.NumberOfCurves() >= 3:
                         floor_loops.Add(_hole_loop)
 
-            # Skip shaft/stair voids for any organic footprint (ellipse, polygon, etc.).
-            # The void-clipping math uses cx_ft/w_ft/l_ft centred at the shell origin,
-            # which is wrong for offset floors — the void rect may lie outside the slab
-            # boundary, causing Floor.Create to reject the loop with an invalid geometry
-            # error (which then falls through to the un-offset bbox fallback, Bug 2).
-            # Organic slabs are solid plates; the core walls already enclose the shafts.
-            _loop_has_arcs = bool(footprint_pts)
+            # Floors ALWAYS use straight-line segments (DB.Line.CreateBound, line ~1693)
+            # so _loop_has_arcs is always False.  Shaft/stair voids are now cut for
+            # all slab types — organic slabs included.
+            # F2: For organic slabs the void boundary uses the actual per-level
+            # footprint bounding box (level_pts) so offset/scaled floors clip correctly.
+            _loop_has_arcs = False  # floors never use arc segments
 
             if not _loop_has_arcs:
-                # Rectangular / rotation-only footprint: voids are safe to add.
+                # All slab types: add shaft/stair voids.
                 shaft_voids = getattr(self, '_shaft_voids', None) or []
                 stair_voids = getattr(self, '_stair_voids', None) or []
                 all_voids = (list(shaft_voids) + list(stair_voids)) if k > 0 else []
-                margin_ft = mm_to_ft(2.0)
+                margin_ft = mm_to_ft(100.0) if footprint_pts else mm_to_ft(2.0)
                 slab_hx = w_ft / 2.0 - margin_ft
                 slab_hy = l_ft / 2.0 - margin_ft
                 if all_voids and slab_hx > 0 and slab_hy > 0:
-                    slab_min_x = cx_ft - slab_hx
-                    slab_max_x = cx_ft + slab_hx
-                    slab_min_y = cy_ft - slab_hy
-                    slab_max_y = cy_ft + slab_hy
+                    if footprint_pts:
+                        # F2: Organic slab — clip voids to actual scaled/offset polygon bbox
+                        # with an inset margin so void corners stay clear of curved edges.
+                        _fp_xs_v = [mm_to_ft(p[0]) for p in level_pts]
+                        _fp_ys_v = [mm_to_ft(p[1]) for p in level_pts]
+                        slab_min_x = min(_fp_xs_v) + margin_ft
+                        slab_max_x = max(_fp_xs_v) - margin_ft
+                        slab_min_y = min(_fp_ys_v) + margin_ft
+                        slab_max_y = max(_fp_ys_v) - margin_ft
+                    else:
+                        slab_min_x = cx_ft - slab_hx
+                        slab_max_x = cx_ft + slab_hx
+                        slab_min_y = cy_ft - slab_hy
+                        slab_max_y = cy_ft + slab_hy
                     min_void_ft = mm_to_ft(200)
                     clipped = []
                     for (vx1, vy1, vx2, vy2) in all_voids:
@@ -1764,6 +1901,16 @@ class RevitWorkers:
                         cy2 = min(vy2, slab_max_y)
                         if (cx2 - cx1) < min_void_ft or (cy2 - cy1) < min_void_ft:
                             continue
+                        # For organic slabs, verify all 4 void corners lie inside the
+                        # actual polygon (bbox inset is not enough for curved edges).
+                        if footprint_pts:
+                            from revit_mcp.staircase_logic import _point_in_polygon as _pip_v
+                            _vc_mm = [
+                                (ft_to_mm(cx1), ft_to_mm(cy1)), (ft_to_mm(cx2), ft_to_mm(cy1)),
+                                (ft_to_mm(cx2), ft_to_mm(cy2)), (ft_to_mm(cx1), ft_to_mm(cy2)),
+                            ]
+                            if not all(_pip_v(x, y, level_pts) for x, y in _vc_mm):
+                                continue
                         clipped.append((cx1, cy1, cx2, cy2))
                     merged = _merge_void_rects(clipped)
                     for (vx1, vy1, vx2, vy2) in merged:
@@ -2166,6 +2313,14 @@ class RevitWorkers:
                 if inside_zone:
                     continue
 
+                # Cull columns inside courtyard / inner-void holes — there is no slab there.
+                _col_px_mm, _col_py_mm = ft_to_mm(ox), ft_to_mm(oy)
+                _fp_holes_col = shell.get("footprint_holes", []) if shell else []
+                if _fp_holes_col:
+                    from revit_mcp.staircase_logic import _point_in_polygon as _pip_col
+                    if any(_pip_col(_col_px_mm, _col_py_mm, _h) for _h in _fp_holes_col):
+                        continue
+
                 # Indices for tagging: normalize to span relative to anchor
                 ix = int(round((ox - anchor_ft_x) / span_w_ft))
                 iy = int(round((oy - anchor_ft_y) / span_l_ft))
@@ -2355,9 +2510,14 @@ class RevitWorkers:
 
         return syms[0]
 
-    def _find_wall_for_door(self, doc, pos_mm, level=None, max_dist_mm=600):
-        """Find the wall whose centreline is closest to pos_mm at the given level."""
+    def _find_wall_for_door(self, doc, pos_mm, level=None, max_dist_mm=600, wall_line_mm=None):
+        """Find the wall whose centreline is closest to pos_mm at the given level.
+
+        wall_line_mm: optional [[x1,y1],[x2,y2]] — when provided, prefer walls
+        that are collinear with this segment (same direction ± 10°).
+        """
         import Autodesk.Revit.DB as DB  # type: ignore
+        import math as _math
         tol_ft = mm_to_ft(max_dist_mm)
         px, py  = mm_to_ft(pos_mm[0]), mm_to_ft(pos_mm[1])
         outline = DB.Outline(
@@ -2370,21 +2530,49 @@ class RevitWorkers:
                     .WherePasses(bbf)
                     .ToElements())
         target   = DB.XYZ(px, py, 0.0)
+
+        # Precompute expected wall direction from wall_line_mm if provided
+        _exp_angle = None
+        if wall_line_mm and len(wall_line_mm) >= 2:
+            try:
+                dx = wall_line_mm[1][0] - wall_line_mm[0][0]
+                dy = wall_line_mm[1][1] - wall_line_mm[0][1]
+                if abs(dx) > 1 or abs(dy) > 1:
+                    _exp_angle = _math.atan2(dy, dx)
+            except Exception:
+                pass
+
         best_wall, best_dist = None, float('inf')
         for wall in walls:
             try:
-                # Match level if provided
                 if level and not self._wall_matches_level(wall, level):
                     continue
                 loc = wall.Location
                 if not isinstance(loc, DB.LocationCurve):
                     continue
+                # If wall_line_mm provided, skip walls not collinear (±10°)
+                if _exp_angle is not None:
+                    try:
+                        c = loc.Curve
+                        wdx = c.GetEndPoint(1).X - c.GetEndPoint(0).X
+                        wdy = c.GetEndPoint(1).Y - c.GetEndPoint(0).Y
+                        if abs(wdx) > 1e-6 or abs(wdy) > 1e-6:
+                            wall_angle = _math.atan2(wdy, wdx)
+                            ang_diff = abs((_exp_angle - wall_angle + _math.pi) % _math.pi)
+                            if ang_diff > _math.radians(10) and (_math.pi - ang_diff) > _math.radians(10):
+                                continue
+                    except Exception:
+                        pass
                 res = loc.Curve.Project(target)
                 if res and res.Distance < best_dist:
                     best_dist = res.Distance
                     best_wall = wall
             except:
                 pass
+        # If directional filter returned nothing, retry without it
+        if best_wall is None and _exp_angle is not None:
+            return self._find_wall_for_door(doc, pos_mm, level=level,
+                                            max_dist_mm=max_dist_mm, wall_line_mm=None)
         return best_wall if best_dist < tol_ft else None
 
     def _wall_matches_level(self, wall, level):
@@ -2483,9 +2671,12 @@ class RevitWorkers:
                         if elem and isinstance(elem, DB.Wall):
                             wall = elem
 
-                    # 2. Geometry fallback (level-constrained)
+                    # 2. Geometry fallback (level-constrained, direction-aware)
                     if not wall:
-                        wall = self._find_wall_for_door(doc, pos_mm, level=level)
+                        wall = self._find_wall_for_door(
+                            doc, pos_mm, level=level,
+                            wall_line_mm=spec.get("wall_line_mm"),
+                        )
                     if not wall:
                         self.log("  Door {} @ level {}: no wall found".format(spec_id, level_id))
                         continue
@@ -3023,10 +3214,15 @@ class RevitWorkers:
         shell = manifest.get("shell", {})
         _fw = safe_num(shell.get("width", 30000), 30000)
         _fl_dim = safe_num(shell.get("length", 50000), 50000)
+        _fp_pts_early = shell.get("footprint_points")
         _occ_density = safe_num(lifts_config.get("occupancy_density", 0.067), 0.067)
         # Apply 60% NFA efficiency (core, corridors, toilets occupy ~40% of GFA)
         _NFA_RATIO = 0.60
-        _total_occ = max(100, (_fw * _fl_dim / 1e6) * _NFA_RATIO * _occ_density * num_storeys)
+        if _fp_pts_early and len(_fp_pts_early) >= 3:
+            _floor_area_mm2 = _poly_area_mm2(_fp_pts_early)
+        else:
+            _floor_area_mm2 = _fw * _fl_dim
+        _total_occ = max(100, (_floor_area_mm2 / 1e6) * _NFA_RATIO * _occ_density * num_storeys)
         _auto_lifts = lift_logic.calculate_lift_requirements(num_storeys, typical_h_mm, _total_occ)
         # AI may return count as a dict e.g. {"passenger": 4, "fire_fighting": 2}
         if isinstance(num_lifts, dict):
@@ -3072,21 +3268,14 @@ class RevitWorkers:
             _cp_overrides["overrun_height_mm"] = int(cp["stair_overrun_mm"])
         if cp.get("max_travel_distance_mm"):
             _cp_overrides["max_travel_distance_mm"] = int(cp["max_travel_distance_mm"])
+        if cp.get("max_travel_distance_sprinklered_mm"):
+            _cp_overrides["max_travel_distance_sprinklered_mm"] = int(cp["max_travel_distance_sprinklered_mm"])
 
         # --- Pre-determine actual staircase count from travel distance compliance ---
         # Must happen before the width calculation so the occupancy load is divided
         # by the real number of stairs (central + any perimeter added for 60m rule).
         _fp_pts_pre = shell.get("footprint_points")
-        _pre_floor_dims = floor_dims
-        if _fp_pts_pre and len(_fp_pts_pre) >= 3:
-            try:
-                _fp_xs_pre = [p[0] for p in _fp_pts_pre]
-                _fp_ys_pre = [p[1] for p in _fp_pts_pre]
-                _fp_w_pre = max(_fp_xs_pre) - min(_fp_xs_pre)
-                _fp_l_pre = max(_fp_ys_pre) - min(_fp_ys_pre)
-                _pre_floor_dims = [(_fp_w_pre, _fp_l_pre)] * len(floor_dims)
-            except Exception:
-                pass
+        _pre_floor_dims = floor_dims  # _check_travel_distance uses footprint_pts polygon directly
         _f_center_pre = list(f_center_mm)  # use manifest-specified position
         _layout_pre = lift_logic.get_total_core_layout(num_lifts, lobby_width=lobby_w)
         _lift_bounds_pre = (
@@ -3100,6 +3289,7 @@ class RevitWorkers:
             typical_h_mm, preset_fs, num_lifts, lobby_w,
             compliance_overrides=_cp_overrides,
             footprint_pts=_fp_pts_pre,
+            footprint_holes=shell.get("footprint_holes", []),
             orientation=_core_orientation
         )
         _num_stairs_from_travel = max(len(_safety_sets_pre), 2)
@@ -3124,8 +3314,11 @@ class RevitWorkers:
 
         _calc_flight_width = None
         if _occupant_load_factor > 0 and _persons_per_unit > 0 and _exit_width_per_unit > 0 and floor_dims:
-            # Largest floor plate (mm -> m2)
-            _largest_area_mm2  = max(w * l for w, l in floor_dims)
+            # Largest floor plate (mm -> m2) — use actual polygon area when available
+            if _fp_pts_early and len(_fp_pts_early) >= 3:
+                _largest_area_mm2 = _poly_area_mm2(_fp_pts_early)
+            else:
+                _largest_area_mm2 = max(w * l for w, l in floor_dims)
             _largest_area_m2   = _largest_area_mm2 / 1e6
             # Core area using preset ratio midpoint
             _core_ratio        = sum(preset.get("program_requirements", {}).get("core_area_ratio", [0.20, 0.25])) / 2.0
@@ -3201,21 +3394,8 @@ class RevitWorkers:
         # at the MOST-OFFSET floor, not just the nominal centre position.
         # Shrink the effective floor dims by 2× the maximum offset so that perimeter
         # stair candidates never land outside the building on any floor.
-        _stair_floor_dims = floor_dims
+        _stair_floor_dims = floor_dims  # _check_travel_distance uses footprint_pts polygon directly
         _fp_pts = shell.get("footprint_points")
-        # For organic shapes (L/H/U/T etc.) the model walls reflect the OLD building
-        # so floor_dims may contain stale rectangular bounding-box values.  Derive
-        # the bounding box directly from footprint_points instead so that the travel
-        # distance check uses the correct building dimensions.
-        if _fp_pts and len(_fp_pts) >= 3:
-            try:
-                _fp_xs = [p[0] for p in _fp_pts]
-                _fp_ys = [p[1] for p in _fp_pts]
-                _fp_w = max(_fp_xs) - min(_fp_xs)
-                _fp_l = max(_fp_ys) - min(_fp_ys)
-                _stair_floor_dims = [(_fp_w, _fp_l)] * len(floor_dims)
-            except Exception:
-                pass
         _offset_ovr = shell.get("footprint_offset_overrides", {})
         if _offset_ovr:
             try:
@@ -3250,6 +3430,7 @@ class RevitWorkers:
             typical_h_mm, preset_fs, num_lifts, lobby_w,
             compliance_overrides=_cp_overrides,
             footprint_pts=_fp_pts,
+            footprint_holes=shell.get("footprint_holes", []),
             orientation=_core_orientation
         )
 
@@ -3274,7 +3455,8 @@ class RevitWorkers:
         unified_man = fire_safety_logic.generate_fire_safety_manifest(
             safety_sets, levels_manifest, stair_spec, typical_h_mm, preset_fs,
             lift_core_bounds_mm, num_lifts, lobby_w,
-            compliance_overrides=_cp_overrides
+            compliance_overrides=_cp_overrides,
+            footprint_pts=shell.get("footprint_points")
         )
         
         if isinstance(unified_man, dict) and unified_man.get("status") == "CONFLICT":
@@ -3304,6 +3486,181 @@ class RevitWorkers:
         # the column-exclusion logic culls only columns that actually fall inside a
         # core element — not everything inside the huge L-shaped merged bounding box.
         sub_bounds = unified_man.get("sub_boundaries", [])
+
+        # E1: Validate all core zone corners lie inside the floor plate polygon.
+        # A zone that lands in a notch, courtyard void, or outside the polygon
+        # cannot be built — return CONFLICT so Gemini can reposition the core.
+        _fp_pts_val = shell.get("footprint_points")
+        if _fp_pts_val and len(_fp_pts_val) >= 3:
+            from revit_mcp.staircase_logic import _point_in_polygon
+            _fp_holes_val = shell.get("footprint_holes", [])
+            _outside_zones = []
+            _all_zone_rects = [list(lift_core_bounds_mm)] + [sb["rect"] for sb in (sub_bounds or [])]
+            for _zr in _all_zone_rects:
+                _corners = [
+                    (_zr[0], _zr[1]), (_zr[2], _zr[1]),
+                    (_zr[2], _zr[3]), (_zr[0], _zr[3])
+                ]
+                _outside = not all(_point_in_polygon(cx, cy, _fp_pts_val) for cx, cy in _corners)
+                _in_hole = any(
+                    any(_point_in_polygon(cx, cy, h) for h in _fp_holes_val)
+                    for cx, cy in _corners
+                )
+                if _outside or _in_hole:
+                    _outside_zones.append(_zr)
+            if _outside_zones:
+                _zone_desc = "; ".join(
+                    "zone [{:.0f},{:.0f}]→[{:.0f},{:.0f}]mm".format(*z) for z in _outside_zones
+                )
+                _fp_bbox = "Polygon bbox: X=[{:.0f},{:.0f}], Y=[{:.0f},{:.0f}]".format(
+                    min(p[0] for p in _fp_pts_val), max(p[0] for p in _fp_pts_val),
+                    min(p[1] for p in _fp_pts_val), max(p[1] for p in _fp_pts_val)
+                )
+                _fp_summary = "Polygon vertices (mm): {}".format(
+                    ", ".join("[{:.0f},{:.0f}]".format(p[0], p[1]) for p in _fp_pts_val)
+                )
+                _lc = lift_core_bounds_mm  # [xmin, ymin, xmax, ymax]
+                _poly_ymin = min(p[1] for p in _fp_pts_val)
+                _poly_ymax = max(p[1] for p in _fp_pts_val)
+                _poly_xmin = min(p[0] for p in _fp_pts_val)
+                _poly_xmax = max(p[0] for p in _fp_pts_val)
+                _space_s = _lc[1] - _poly_ymin
+                _space_n = _poly_ymax - _lc[3]
+                _space_w = _lc[0] - _poly_xmin
+                _space_e = _poly_xmax - _lc[2]
+                _arm_diag = (
+                    "Space available around lift core (mm): "
+                    "South={:.0f}, North={:.0f}, West={:.0f}, East={:.0f}. "
+                    "Lift core occupies X=[{:.0f},{:.0f}], Y=[{:.0f},{:.0f}]."
+                ).format(_space_s, _space_n, _space_w, _space_e,
+                         _lc[0], _lc[2], _lc[1], _lc[3])
+
+                # Determine whether the lift core itself is outside (position problem)
+                # or only fire safety sub-zones are outside (arm too narrow problem).
+                _lc_rect = list(lift_core_bounds_mm)
+                _core_outside = any(
+                    abs(_zr[0] - _lc_rect[0]) < 1 and abs(_zr[1] - _lc_rect[1]) < 1
+                    for _zr in _outside_zones
+                )
+
+                if _core_outside:
+                    # The passenger lift core itself is outside — reposition the core
+                    _action = (
+                        "The passenger lift core is outside the floor plate. "
+                        "Move lifts.position to a point inside the solid floor plate polygon. "
+                        "For L/U/H shapes the junction of the arms is the safest location. "
+                        "Ensure all zone corners are at least 2000mm from any polygon edge. "
+                        "Do NOT change the building shape."
+                    )
+                else:
+                    # Only fire safety sub-zones are outside — the arm is too narrow
+                    _min_space = min(_space_s, _space_n, _space_w, _space_e)
+                    _tightest = {_space_s: "south", _space_n: "north",
+                                 _space_w: "west",  _space_e: "east"}[_min_space]
+                    _action = (
+                        "The passenger lift core position is valid, but the fire safety clusters "
+                        "(shaft + lobby + staircase) extend beyond the floor plate — the {} arm "
+                        "of the building is too narrow to contain them. "
+                        "Fix by widening the {} arm: increase the relevant footprint_points "
+                        "coordinates to give at least 6000mm clear depth beyond the lift core on "
+                        "that side. "
+                        "Do NOT move lifts.position. "
+                        "Do NOT change the building shape type (keep L/U/H/etc. as requested)."
+                    ).format(_tightest, _tightest)
+
+                return {
+                    "status": "CONFLICT",
+                    "description": (
+                        "{} core zone(s) extend outside the floor plate polygon: {}. "
+                        "{}. {}. {}. {}"
+                    ).format(len(_outside_zones), _zone_desc,
+                             _fp_bbox, _fp_summary, _arm_diag, _action)
+                }
+
+        # F1: Taper containment — verify the lift core fits inside the scaled footprint
+        # at every level that carries a non-unity scale override.
+        _taper_ovr = shell.get("footprint_scale_overrides")
+        _fp_pts_base = shell.get("footprint_points")
+        if _taper_ovr and _fp_pts_base and len(_fp_pts_base) >= 3:
+            from revit_mcp.staircase_logic import _point_in_polygon as _pip_t
+            _rot_ovr = shell.get("footprint_rotation_overrides", {})
+            _lc_t = lift_core_bounds_mm
+            _core_corners_t = [
+                (_lc_t[0], _lc_t[1]), (_lc_t[2], _lc_t[1]),
+                (_lc_t[2], _lc_t[3]), (_lc_t[0], _lc_t[3]),
+            ]
+            _taper_fail_levels = []
+            for _lvl_1 in range(1, len(elevations) + 1):
+                _sf = _get_interpolated_scale(_taper_ovr, _lvl_1)
+                if abs(_sf - 1.0) < 0.001:
+                    continue
+                _rot = _get_interpolated_scale(_rot_ovr, _lvl_1) if _rot_ovr else 0.0
+                _lvl_pts = _scale_footprint(_fp_pts_base, _sf, rotation_deg=_rot)
+                _lvl_pts_2d = [[p[0], p[1]] for p in _lvl_pts]
+                if not all(_pip_t(cx, cy, _lvl_pts_2d) for cx, cy in _core_corners_t):
+                    _taper_fail_levels.append(_lvl_1)
+            if _taper_fail_levels:
+                _sf_min = min(_get_interpolated_scale(_taper_ovr, l) for l in _taper_fail_levels)
+                return {
+                    "status": "CONFLICT",
+                    "description": (
+                        "Taper containment failure: lift core X=[{:.0f},{:.0f}] Y=[{:.0f},{:.0f}]mm "
+                        "extends outside the scaled floor plate on {} level(s) (first: level {}). "
+                        "Smallest plate scale at failing levels: {:.2f}×. "
+                        "Move lifts.position closer to the origin or reduce the number of lifts so "
+                        "the core footprint fits inside the building footprint at every scale level."
+                    ).format(
+                        _lc_t[0], _lc_t[2], _lc_t[1], _lc_t[3],
+                        len(_taper_fail_levels), _taper_fail_levels[0], _sf_min,
+                    )
+                }
+
+        # F1b: floor_overrides taper — verify lift core fits within the smallest
+        # per-floor width/length declared in shell.floor_overrides.
+        # This catches tapers expressed as explicit per-floor dimensions rather than
+        # footprint_scale_overrides (which F1 above already handles).
+        # Only runs for rectangular shells (no footprint_points).
+        _floor_ovr = shell.get("floor_overrides", {})
+        if _floor_ovr and not shell.get("footprint_points"):
+            _lc_b = lift_core_bounds_mm
+            _fo_min_w = None
+            _fo_min_l = None
+            _fo_fail_floor = None
+            for _fo_key, _fo_val in _floor_ovr.items():
+                if not isinstance(_fo_val, dict):
+                    continue
+                if "width" in _fo_val:
+                    _fw = safe_num(_fo_val["width"], 0)
+                    if _fw > 0 and (_fo_min_w is None or _fw < _fo_min_w):
+                        _fo_min_w = _fw
+                        _fo_fail_floor = _fo_key
+                if "length" in _fo_val:
+                    _fl_v = safe_num(_fo_val["length"], 0)
+                    if _fl_v > 0 and (_fo_min_l is None or _fl_v < _fo_min_l):
+                        _fo_min_l = _fl_v
+                        _fo_fail_floor = _fo_key
+            _core_w_needed = _lc_b[2] - _lc_b[0]
+            _core_l_needed = _lc_b[3] - _lc_b[1]
+            _fo_w_fail = _fo_min_w is not None and _fo_min_w < _core_w_needed
+            _fo_l_fail = _fo_min_l is not None and _fo_min_l < _core_l_needed
+            if _fo_w_fail or _fo_l_fail:
+                return {
+                    "status": "CONFLICT",
+                    "description": (
+                        "Taper containment failure (floor_overrides): "
+                        "lift core requires {:.0f}mm × {:.0f}mm (W×L) but "
+                        "floor override '{}' reduces the plate to "
+                        "{} × {} mm. "
+                        "Either reduce the number of lifts, move lifts.position "
+                        "closer to the origin, or ensure no floor_overrides shrinks "
+                        "the plate below the core footprint size."
+                    ).format(
+                        _core_w_needed, _core_l_needed,
+                        _fo_fail_floor,
+                        "{:.0f}".format(_fo_min_w) if _fo_min_w else "unchanged",
+                        "{:.0f}".format(_fo_min_l) if _fo_min_l else "unchanged",
+                    )
+                }
 
         # Build per-element column exclusion zones (in ft) — pax lift core + every
         # fire-safety sub-boundary.  This replaces the old single merged rect that

@@ -122,13 +122,40 @@ def _should_use_ew_orientation(_lift_core_bounds_mm, _sw_nat, _sd_nat,
 
 
 # ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _nearest_polygon_edge_angle_deg(px, py, polygon_pts):
+    """Return angle (degrees, 0=east, CCW) of the polygon edge nearest to (px, py),
+    snapped to the nearest 90° so stair walls remain axis-aligned."""
+    best_dist = float('inf')
+    best_angle = 0.0
+    n = len(polygon_pts)
+    for i in range(n):
+        x1, y1 = polygon_pts[i][0], polygon_pts[i][1]
+        x2, y2 = polygon_pts[(i + 1) % n][0], polygon_pts[(i + 1) % n][1]
+        dx, dy = x2 - x1, y2 - y1
+        seg_len_sq = dx * dx + dy * dy
+        if seg_len_sq < 1.0:
+            continue
+        t = max(0.0, min(1.0, ((px - x1) * dx + (py - y1) * dy) / seg_len_sq))
+        nx, ny = x1 + t * dx, y1 + t * dy
+        dist = math.sqrt((px - nx) ** 2 + (py - ny) ** 2)
+        if dist < best_dist:
+            best_dist = dist
+            best_angle = math.degrees(math.atan2(dy, dx))
+    return round(best_angle / 90.0) * 90.0
+
+
+# ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
 
 def calculate_fire_safety_requirements(floor_dims_mm, core_center_mm, lift_core_bounds_mm,
                                        typical_floor_height_mm, _preset_fs, num_lifts,
                                        lobby_width=3000, compliance_overrides=None,
-                                       footprint_pts=None, orientation="AUTO"):
+                                       footprint_pts=None, footprint_holes=None,
+                                       orientation="AUTO"):
     """Determine positions and types for fire safety cores.
 
     Returns list of dicts: {"pos": (x, y), "type": "FIRE_LIFT"|"SMOKE_STOP"}
@@ -143,7 +170,8 @@ def calculate_fire_safety_requirements(floor_dims_mm, core_center_mm, lift_core_
         Falls back to module constants for any key not present.
     """
     co = compliance_overrides or {}
-    max_travel_dist = co.get("max_travel_distance_mm", _MAX_TRAVEL)
+    max_travel_dist = (co.get("max_travel_distance_sprinklered_mm")
+                       or co.get("max_travel_distance_mm", _MAX_TRAVEL))
     fl_car_size     = co.get("fire_lift_car_size_mm",  _FL_CAR_SIZE)
     fl_shaft_d      = fl_car_size + 2 * _WALL_THICKNESS
     final_sets = []
@@ -248,13 +276,17 @@ def calculate_fire_safety_requirements(floor_dims_mm, core_center_mm, lift_core_
         _gN = 8
         _gdx = (_fp_xmax - _fp_xmin) / float(_gN)
         _gdy = (_fp_ymax - _fp_ymin) / float(_gN)
-        _interior = [
-            (_fp_xmin + (_ix + 0.5) * _gdx, _fp_ymin + (_iy + 0.5) * _gdy)
-            for _ix in range(_gN) for _iy in range(_gN)
-            if staircase_logic._point_in_polygon(
-                _fp_xmin + (_ix + 0.5) * _gdx,
-                _fp_ymin + (_iy + 0.5) * _gdy, footprint_pts)
-        ]
+        _holes = footprint_holes or []
+        _interior = []
+        for _ix in range(_gN):
+            for _iy in range(_gN):
+                _gx = _fp_xmin + (_ix + 0.5) * _gdx
+                _gy = _fp_ymin + (_iy + 0.5) * _gdy
+                if not staircase_logic._point_in_polygon(_gx, _gy, footprint_pts):
+                    continue
+                if any(staircase_logic._point_in_polygon(_gx, _gy, h) for h in _holes):
+                    continue
+                _interior.append((_gx, _gy))
         if _interior:
             _poly_candidates = _interior
 
@@ -264,7 +296,8 @@ def calculate_fire_safety_requirements(floor_dims_mm, core_center_mm, lift_core_
     # Try each footprint from smallest to largest until 60m rule is satisfied.
     for try_hl in unique_half_l:
         if staircase_logic._check_travel_distance(all_stair_pos, floor_dims_mm, max_travel_dist,
-                                                   footprint_pts=footprint_pts):
+                                                   footprint_pts=footprint_pts,
+                                                   footprint_holes=footprint_holes):
             break  # already compliant from central stairs alone
 
         # Build candidates: polygon-interior grid points (irregular shapes) or
@@ -280,7 +313,8 @@ def calculate_fire_safety_requirements(floor_dims_mm, core_center_mm, lift_core_
         # Add the best candidate from this footprint tier.
         while perim_candidates:
             if staircase_logic._check_travel_distance(all_stair_pos, floor_dims_mm, max_travel_dist,
-                                                       footprint_pts=footprint_pts):
+                                                       footprint_pts=footprint_pts,
+                                                       footprint_holes=footprint_holes):
                 break
             best = max(perim_candidates, key=lambda c: min(
                 math.sqrt((c[0] - sx) ** 2 + (c[1] - sy) ** 2)
@@ -289,9 +323,13 @@ def calculate_fire_safety_requirements(floor_dims_mm, core_center_mm, lift_core_
             perim_candidates.remove(best)
             # Derive building-edge Y from staircase centre Y (used for is_south_p orientation)
             y_edge = best[1] - _sd_approx / 2.0 if best[1] < 0 else best[1] + _sd_approx / 2.0
+            _perim_rot = 0.0
+            if footprint_pts and len(footprint_pts) >= 3:
+                _perim_rot = _nearest_polygon_edge_angle_deg(best[0], best[1], footprint_pts)
             final_sets.append({"pos": (best[0], y_edge), "type": "SMOKE_STOP",
                                 "is_perimeter": True,
-                                "ref_half_l": try_hl})  # track which footprint tier placed this
+                                "ref_half_l": try_hl,
+                                "rotation_deg": _perim_rot})
             all_stair_pos.append(best)
 
     # Tag each perimeter staircase with the highest 0-based floor index where it
@@ -304,7 +342,8 @@ def calculate_fire_safety_requirements(floor_dims_mm, core_center_mm, lift_core_
                 for _k in range(len(floor_dims_mm) - 1, -1, -1):
                     if not staircase_logic._check_travel_distance(
                             stair_pos, [floor_dims_mm[_k]], max_travel_dist,
-                            footprint_pts=footprint_pts):
+                            footprint_pts=footprint_pts,
+                            footprint_holes=footprint_holes):
                         _last = _k
                         break
                 _fs["last_floor_idx"] = _last
@@ -316,7 +355,7 @@ def generate_fire_safety_manifest(safety_sets, levels_data, stair_spec,
                                   typical_floor_height_mm, _preset_fs,
                                   lift_core_bounds_mm=None, num_lifts=None,
                                   lobby_width=3000, all_floor_dims=None,
-                                  compliance_overrides=None, **kwargs):
+                                  compliance_overrides=None, footprint_pts=None, **kwargs):
     """Generate manifest for fire lifts, lobbies and staircases.
 
     Supports two layout orientations, chosen automatically in
@@ -377,13 +416,14 @@ def generate_fire_safety_manifest(safety_sets, levels_data, stair_spec,
         is_fl      = (s_set["type"] == "FIRE_LIFT")
         entry_x, entry_y = s_set["pos"]
         tag        = "SafetySet_{}".format(i + 1)
+        _skip_set  = False  # set True when cluster can't fit on either side
 
         # ── Perimeter SMOKE_STOP — dedicated layout (building edge, no fire lift) ──
         is_perimeter = s_set.get("is_perimeter", False)
         if is_perimeter:
             # Simple layout: staircase at building edge, lobby between staircase and floor plate.
-            # entry_y is the building-edge Y (negative = south, positive = north).
-            is_south_p = (entry_y <= 0)
+            _rot_deg = s_set.get("rotation_deg", 0.0)
+            _is_ew_edge = abs(abs(_rot_deg) - 90.0) < 1.0  # ±90° → EW (east/west) face
 
             # Truncate levels to only those where this perimeter staircase is needed.
             # "last_floor_idx" is the 0-based index (in all_floor_dims) of the highest
@@ -408,26 +448,55 @@ def generate_fire_safety_manifest(safety_sets, levels_data, stair_spec,
             # plus Revit's minimum-face-width tolerance.
             _EDGE_GAP = _EDGE_GAP_MM
 
-            if is_south_p:
-                # Staircase at south edge (inset), lobby north of it (facing floor plate)
-                st_base_y  = entry_y + _EDGE_GAP
-                st_y2      = st_base_y + sd_nat
-                lb_y1, lb_y2 = st_y2, st_y2 + lobby_d_p
-                is_rotated_suit = True   # people enter staircase from north (floor-plate) face
+            if _is_ew_edge:
+                # EW-facing stair: width along Y, depth along X
+                # entry_x = edge X coordinate, entry_y = lateral Y position
+                is_east_p = (entry_x >= 0)
+                if is_east_p:
+                    st_x2 = entry_x - _EDGE_GAP
+                    st_x1 = st_x2 - sd_nat
+                    lb_x1 = st_x1 - lobby_d_p
+                    lb_x2 = st_x1
+                    is_rotated_suit = False
+                else:
+                    st_x1 = entry_x + _EDGE_GAP
+                    st_x2 = st_x1 + sd_nat
+                    lb_x1 = st_x2
+                    lb_x2 = st_x2 + lobby_d_p
+                    is_rotated_suit = True
+                st_y1 = entry_y - sw_nat / 2.0
+                st_y2_ew = entry_y + sw_nat / 2.0
+                lb_box = [lb_x1, st_y1, lb_x2, st_y2_ew]
+                st_box = [st_x1, st_y1, st_x2, st_y2_ew]
+                st_cx  = (st_x1 + st_x2) / 2.0
+                st_cy  = entry_y
+                st_rect = [min(st_x1, lb_x1), st_y1, max(st_x2, lb_x2), st_y2_ew]
+                st_base_y  = st_y1        # min Y of EW staircase — needed by shared code below
+                st_y2      = st_y2_ew     # max Y alias for door-spec block below
+                is_south_p = False        # EW: use "not south" door-orientation path
             else:
-                # Staircase at north edge (inset), lobby south of it (facing floor plate)
-                st_y2      = entry_y - _EDGE_GAP
-                st_base_y  = st_y2 - sd_nat
-                lb_y1, lb_y2 = st_base_y - lobby_d_p, st_base_y
-                is_rotated_suit = False  # people enter staircase from south (floor-plate) face
+                # NS-facing stair: entry_y is building-edge Y (negative=south, positive=north)
+                is_south_p = (entry_y <= 0)
+                if is_south_p:
+                    # Staircase at south edge (inset), lobby north of it (facing floor plate)
+                    st_base_y  = entry_y + _EDGE_GAP
+                    st_y2      = st_base_y + sd_nat
+                    lb_y1, lb_y2 = st_y2, st_y2 + lobby_d_p
+                    is_rotated_suit = True   # people enter staircase from north (floor-plate) face
+                else:
+                    # Staircase at north edge (inset), lobby south of it (facing floor plate)
+                    st_y2      = entry_y - _EDGE_GAP
+                    st_base_y  = st_y2 - sd_nat
+                    lb_y1, lb_y2 = st_base_y - lobby_d_p, st_base_y
+                    is_rotated_suit = False  # people enter staircase from south (floor-plate) face
 
-            st_x1 = entry_x - sw_nat / 2.0
-            st_x2 = entry_x + sw_nat / 2.0
-            lb_box = [st_x1, lb_y1, st_x2, lb_y2]
-            st_box = [st_x1, st_base_y, st_x2, st_y2]
-            st_cx  = entry_x
-            st_cy  = (st_base_y + st_y2) / 2.0
-            st_rect = [st_x1, min(st_base_y, lb_y1), st_x2, max(st_y2, lb_y2)]
+                st_x1 = entry_x - sw_nat / 2.0
+                st_x2 = entry_x + sw_nat / 2.0
+                lb_box = [st_x1, lb_y1, st_x2, lb_y2]
+                st_box = [st_x1, st_base_y, st_x2, st_y2]
+                st_cx  = entry_x
+                st_cy  = (st_base_y + st_y2) / 2.0
+                st_rect = [st_x1, min(st_base_y, lb_y1), st_x2, max(st_y2, lb_y2)]
 
             sub_boundaries.append(None)  # no shaft
             sub_boundaries.append({"id": tag + "_Lobby", "rect": lb_box})
@@ -666,9 +735,13 @@ def generate_fire_safety_manifest(safety_sets, levels_data, stair_spec,
             total_pair_w = fz_w + sw_nat                          # total X needed
             use_parallel = (total_pair_w <= lift_bank_w + 1)      # fits with 1mm tolerance
 
-            # Cluster depth: shaft (inner) + lobby (outer), minimum lobby 2000mm
-            fl_shaft_d_p = fl_shaft_d        # shaft occupies inner depth
-            lobby_d_p    = max(2000, sd_nat - fl_shaft_d_p)
+            # Cluster depth: shaft (inner) + lobby (outer).
+            # Lobby must satisfy minimum depth from RAG AND minimum area from RAG.
+            fl_shaft_d_p = fl_shaft_d
+            _fire_lb_min_d = co.get("fire_lobby_min_depth_mm", 2000)
+            _lb_net_w_p    = fl_shaft_d - 2 * t         # lobby net width (shaft width - 2 walls)
+            _lb_d_from_area = int(math.ceil(fire_lb_area / max(_lb_net_w_p, 1))) + t
+            lobby_d_p    = max(_fire_lb_min_d, _lb_d_from_area, sd_nat - fl_shaft_d_p)
             cluster_d_p  = fl_shaft_d_p + lobby_d_p
 
             if not use_parallel:
@@ -687,6 +760,27 @@ def generate_fire_safety_manifest(safety_sets, levels_data, stair_spec,
                     st_cy     = (st_box[1] + st_box[3]) / 2.0
                     st_base_y = st_box[1]
                     st_rect   = [entry_x - sw_h, st_box[1], entry_x + sw_h, entry_y]
+                    # Polygon check: if south cluster falls outside floor plate (e.g. U-shape notch) flip north
+                    if footprint_pts and len(footprint_pts) >= 3:
+                        from revit_mcp.staircase_logic import _point_in_polygon as _pip_sq
+                        _sq_all = ([fl_box] if fl_box else []) + [lb_box, st_box]
+                        _sq_corners = [pt for b in _sq_all
+                                       for pt in [(b[0], b[1]), (b[2], b[1]), (b[2], b[3]), (b[0], b[3])]]
+                        if not all(_pip_sq(cx, cy, footprint_pts) for cx, cy in _sq_corners):
+                            is_south = False
+                            _ny = l_ymax
+                            fl_box    = [entry_x - fl_hw, _ny, entry_x + fl_hw, _ny + fire_lift_d] if is_fl else None
+                            lb_box    = [entry_x - sw_h, _ny + fire_lift_d, entry_x + sw_h, _ny + fire_lift_d + lobby_d]
+                            st_box    = [entry_x - sw_h, _ny + fire_lift_d + lobby_d, entry_x + sw_h, _ny + fire_lift_d + lobby_d + sd_nat]
+                            st_cy     = (st_box[1] + st_box[3]) / 2.0
+                            st_base_y = st_box[1]
+                            st_rect   = [entry_x - sw_h, _ny, entry_x + sw_h, st_box[3]]
+                            # Both sides failed — suppress this safety set
+                            _sq_n_all = ([fl_box] if fl_box else []) + [lb_box, st_box]
+                            _sq_n_corners = [pt for b in _sq_n_all
+                                             for pt in [(b[0], b[1]), (b[2], b[1]), (b[2], b[3]), (b[0], b[3])]]
+                            if not all(_pip_sq(cx, cy, footprint_pts) for cx, cy in _sq_n_corners):
+                                _skip_set = True
                 else:
                     fl_box    = [entry_x - fl_hw, entry_y, entry_x + fl_hw, entry_y + fire_lift_d] if is_fl else None
                     lb_box    = [entry_x - sw_h, entry_y + fire_lift_d, entry_x + sw_h, entry_y + fire_lift_d + lobby_d]
@@ -694,6 +788,14 @@ def generate_fire_safety_manifest(safety_sets, levels_data, stair_spec,
                     st_cy     = (st_box[1] + st_box[3]) / 2.0
                     st_base_y = st_box[1]
                     st_rect   = [entry_x - sw_h, entry_y, entry_x + sw_h, st_box[3]]
+                    # Polygon check: if north cluster also outside floor plate
+                    if footprint_pts and len(footprint_pts) >= 3:
+                        from revit_mcp.staircase_logic import _point_in_polygon as _pip_sq
+                        _sq_n_all = ([fl_box] if fl_box else []) + [lb_box, st_box]
+                        _sq_n_corners = [pt for b in _sq_n_all
+                                         for pt in [(b[0], b[1]), (b[2], b[1]), (b[2], b[3]), (b[0], b[3])]]
+                        if not all(_pip_sq(cx, cy, footprint_pts) for cx, cy in _sq_n_corners):
+                            _skip_set = True
                 is_rotated_suit = is_south
                 # ── Door specs: NS sequential ────────────────────────────────
                 # stair_global_idx not yet incremented → stair_num = stair_global_idx + 1
@@ -806,6 +908,32 @@ def generate_fire_safety_manifest(safety_sets, levels_data, stair_spec,
                     # cluster zone, including any gap between the staircase east edge
                     # and the lift core east wall (l_xmax).
                     st_rect   = [l_xmin, l_ymin - cluster_d_p, l_xmax, l_ymin]
+                    # Polygon check: if south cluster falls outside floor plate (e.g. U/H notch) flip north
+                    if footprint_pts and len(footprint_pts) >= 3:
+                        from revit_mcp.staircase_logic import _point_in_polygon as _pip_p
+                        _p_all = ([fl_box] if fl_box else []) + [lb_box, st_box]
+                        _p_corners = [pt for b in _p_all
+                                      for pt in [(b[0], b[1]), (b[2], b[1]), (b[2], b[3]), (b[0], b[3])]]
+                        if not all(_pip_p(cx, cy, footprint_pts) for cx, cy in _p_corners):
+                            is_south = False
+                            st_x1 = l_xmin;             st_x2 = l_xmin + sw_nat
+                            fz_x1 = st_x2;              fz_x2 = fz_x1 + fz_w
+                            fl_y1 = l_ymax;              fl_y2 = l_ymax + fl_shaft_d_p
+                            lb_y1 = fl_y2;               lb_y2 = l_ymax + cluster_d_p
+                            fl_box = [fz_x1, fl_y1, fz_x2, fl_y2] if is_fl else None
+                            lb_box = [fz_x1, lb_y1, fz_x2, lb_y2]
+                            st_box    = [st_x1, l_ymax, st_x2, l_ymax + cluster_d_p]
+                            st_cx     = (st_x1 + st_x2) / 2.0
+                            st_cy     = (st_box[1] + st_box[3]) / 2.0
+                            st_base_y = st_box[1]
+                            is_rotated_suit = True
+                            st_rect   = [l_xmin, l_ymax, l_xmax, l_ymax + cluster_d_p]
+                            # Both sides failed — suppress this safety set
+                            _p_n_all = ([fl_box] if fl_box else []) + [lb_box, st_box]
+                            _p_n_corners = [pt for b in _p_n_all
+                                            for pt in [(b[0], b[1]), (b[2], b[1]), (b[2], b[3]), (b[0], b[3])]]
+                            if not all(_pip_p(cx, cy, footprint_pts) for cx, cy in _p_n_corners):
+                                _skip_set = True
                 else:
                     # North cluster: extends northward from l_ymax
                     # Fire zone EAST, staircase WEST (pinwheel)
@@ -829,6 +957,14 @@ def generate_fire_safety_manifest(safety_sets, levels_data, stair_spec,
                     # cluster zone, including any gap between the fire zone east edge
                     # and the lift core east wall (l_xmax).
                     st_rect   = [l_xmin, l_ymax, l_xmax, l_ymax + cluster_d_p]
+                    # Polygon check: if north cluster falls outside floor plate
+                    if footprint_pts and len(footprint_pts) >= 3:
+                        from revit_mcp.staircase_logic import _point_in_polygon as _pip_p
+                        _p_n_all = ([fl_box] if fl_box else []) + [lb_box, st_box]
+                        _p_n_corners = [pt for b in _p_n_all
+                                        for pt in [(b[0], b[1]), (b[2], b[1]), (b[2], b[3]), (b[0], b[3])]]
+                        if not all(_pip_p(cx, cy, footprint_pts) for cx, cy in _p_n_corners):
+                            _skip_set = True
 
                 # ── Door specs: NS parallel ──────────────────────────────────
                 # stair_global_idx not yet incremented → stair_num = stair_global_idx + 1
@@ -926,6 +1062,8 @@ def generate_fire_safety_manifest(safety_sets, levels_data, stair_spec,
             _skip_lobby_face = None
 
         # ── Sub-boundary reservations ────────────────────────────────────────
+        if _skip_set:
+            continue
         sub_boundaries.append({"id": tag + "_Shaft", "rect": fl_box} if is_fl else None)
         sub_boundaries.append({"id": tag + "_Lobby", "rect": lb_box})
         sub_boundaries.append({"id": tag + "_Staircase", "rect": st_box})

@@ -240,9 +240,10 @@ def get_safety_set_dimensions(typical_floor_height_mm, spec=None, is_fire_lift=F
     compliance_overrides: dict of RAG-derived values that override static module constants.
     """
     co = compliance_overrides or {}
-    fire_lb_area = co.get("fire_lobby_min_area_mm2",  _FIRE_LB_AREA)
+    fire_lb_area  = co.get("fire_lobby_min_area_mm2",  _FIRE_LB_AREA)
     smoke_lb_area = co.get("smoke_lobby_min_area_mm2", _SMOKE_LB_AREA)
-    min_lb_depth  = co.get("smoke_lobby_min_depth_mm", _MIN_LB_DEPTH)
+    min_lb_depth  = (co.get("fire_lobby_min_depth_mm", _MIN_LB_DEPTH) if is_fire_lift
+                     else co.get("smoke_lobby_min_depth_mm", _MIN_LB_DEPTH))
 
     net_w = get_shaft_dimensions(4000, spec)[0]
     # Identify typical depth across all levels if data is provided, else fallback
@@ -412,7 +413,8 @@ def _point_in_polygon(px, py, polygon_pts):
 
 
 def _check_travel_distance(stair_positions, floor_dims_mm,
-                           max_dist_mm, num_required=2, footprint_pts=None):
+                           max_dist_mm, num_required=2, footprint_pts=None,
+                           footprint_holes=None):
     """Return True if every sampled floor-plate point can reach at least
     *num_required* staircases within *max_dist_mm* (Euclidean).
 
@@ -422,6 +424,10 @@ def _check_travel_distance(stair_positions, floor_dims_mm,
     vertices (slightly inset toward the centroid) are added to guarantee
     coverage of each actual corner — which is the worst-case travel point for
     non-rectangular shapes such as L, H, U, or T floor plates.
+
+    footprint_holes: optional list of hole polygons (each a list of [x, y]
+    vertices).  Grid test-points inside any hole are excluded so courtyard
+    voids are not counted as occupiable floor area.
     """
     if len(stair_positions) < num_required:
         return False
@@ -451,16 +457,17 @@ def _check_travel_distance(stair_positions, floor_dims_mm,
         _N = 8  # 8×8 grid → ~64 candidates, cell centres avoid polygon edges
         _dx = (_fp_xmax - _fp_xmin) / float(_N)
         _dy = (_fp_ymax - _fp_ymin) / float(_N)
-        poly_test_pts = [
-            (_fp_xmin + (_ix + 0.5) * _dx, _fp_ymin + (_iy + 0.5) * _dy)
-            for _ix in range(_N)
-            for _iy in range(_N)
-            if _point_in_polygon(
-                _fp_xmin + (_ix + 0.5) * _dx,
-                _fp_ymin + (_iy + 0.5) * _dy,
-                footprint_pts
-            )
-        ]
+        _td_holes = footprint_holes or []
+        poly_test_pts = []
+        for _ix in range(_N):
+            for _iy in range(_N):
+                _gx = _fp_xmin + (_ix + 0.5) * _dx
+                _gy = _fp_ymin + (_iy + 0.5) * _dy
+                if not _point_in_polygon(_gx, _gy, footprint_pts):
+                    continue
+                if any(_point_in_polygon(_gx, _gy, h) for h in _td_holes):
+                    continue
+                poly_test_pts.append((_gx, _gy))
         if not poly_test_pts:
             poly_test_pts = [(0.0, 0.0)]
         for px, py in poly_test_pts:
