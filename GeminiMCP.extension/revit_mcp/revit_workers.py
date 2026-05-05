@@ -369,12 +369,32 @@ def pre_analyse_floor_plate(manifest, compliance_overrides=None, user_goal=None)
 
     # ── Compliance overrides ─────────────────────────────────────────────────
     cp = compliance_overrides or manifest.get("compliance_parameters", {})
+    # Gemini emits compliance_parameters with "staircase" as a direct child key.
+    # Also handles older manifests where it was nested under "fire_safety[_scdf]".
+    def _cp_get_travel(key):
+        # 1. Flat key on cp (legacy)
+        if cp.get(key):
+            return cp[key]
+        # 2. cp["staircase"][key]  ← current Gemini format
+        _st = cp.get("staircase", {})
+        if isinstance(_st, dict) and _st.get(key):
+            return _st[key]
+        # 3. cp["fire_safety[_scdf]"]["staircase"][key]  ← older nested format
+        _fs = cp.get("fire_safety_scdf", cp.get("fire_safety", {}))
+        if isinstance(_fs, dict):
+            _st2 = _fs.get("staircase", {})
+            if isinstance(_st2, dict) and _st2.get(key):
+                return _st2[key]
+        return None
     _cp_overrides = {}
     if cp.get("stair_riser_mm"):        _cp_overrides["max_riser_mm"]              = int(cp["stair_riser_mm"])
     if cp.get("stair_tread_mm"):        _cp_overrides["min_tread_mm"]              = int(cp["stair_tread_mm"])
     if cp.get("stair_headroom_mm"):     _cp_overrides["min_headroom_mm"]           = int(cp["stair_headroom_mm"])
     if cp.get("stair_overrun_mm"):      _cp_overrides["overrun_height_mm"]         = int(cp["stair_overrun_mm"])
-    if cp.get("max_travel_distance_mm"):_cp_overrides["max_travel_distance_mm"]    = int(cp["max_travel_distance_mm"])
+    _td = _cp_get_travel("max_travel_distance_mm")
+    if _td:                             _cp_overrides["max_travel_distance_mm"]    = int(_td)
+    _tds = _cp_get_travel("max_travel_distance_sprinklered_mm")
+    if _tds:                            _cp_overrides["max_travel_distance_sprinklered_mm"] = int(_tds)
 
     # ── Passenger lift element dimensions ────────────────────────────────────
     _lift_internal = tuple(preset.get("core_logic", {}).get("lift_internal_size", [2500, 2500]))
@@ -3266,7 +3286,18 @@ class RevitWorkers:
             except Exception:
                 pass
 
+        def _is_ai_wall(w):
+            try:
+                p = w.get_Parameter(DB.BuiltInParameter.ALL_MODEL_INSTANCE_COMMENTS)
+                return p and p.HasValue and p.AsString().startswith("AI_")
+            except Exception:
+                return False
+
+        # Two-pass selection: prefer AI-tagged walls (core/lobby/stair) over
+        # non-AI shell walls.  A 3000mm wide fallback can otherwise grab the outer
+        # building wall when a lobby wall sits close to the building perimeter.
         best_wall, best_dist = None, float('inf')
+        best_ai_wall, best_ai_dist = None, float('inf')
         for wall in walls:
             try:
                 if level and not self._wall_matches_level(wall, level):
@@ -3288,16 +3319,24 @@ class RevitWorkers:
                     except Exception:
                         pass
                 res = loc.Curve.Project(target)
-                if res and res.Distance < best_dist:
-                    best_dist = res.Distance
-                    best_wall = wall
+                if res:
+                    if _is_ai_wall(wall):
+                        if res.Distance < best_ai_dist:
+                            best_ai_dist = res.Distance
+                            best_ai_wall = wall
+                    if res.Distance < best_dist:
+                        best_dist = res.Distance
+                        best_wall = wall
             except:
                 pass
+        # Prefer the closest AI-tagged wall; fall back to any wall if no AI wall found
+        result_wall = best_ai_wall if best_ai_wall is not None else best_wall
+        result_dist = best_ai_dist if best_ai_wall is not None else best_dist
         # If directional filter returned nothing, retry without it
-        if best_wall is None and _exp_angle is not None:
+        if result_wall is None and _exp_angle is not None:
             return self._find_wall_for_door(doc, pos_mm, level=level,
                                             max_dist_mm=max_dist_mm, wall_line_mm=None)
-        return best_wall if best_dist < tol_ft else None
+        return result_wall if result_dist < tol_ft else None
 
     def _wall_matches_level(self, wall, level):
         """Return True if wall's base constraint matches the given level.
@@ -3388,43 +3427,54 @@ class RevitWorkers:
                     continue
                 try:
                     import Autodesk.Revit.DB as DB  # type: ignore
-                    # LB lobby entry doors: level-constrained lookup is unreliable because
-                    # LB walls may be registered under a different level key.  Skip directly
-                    # to the wide fallback which reliably finds them by geometry.
-                    _is_lb_entry = "_Lobby_EntryDoor" in spec_id and bool(wall_ai_id_map)
                     wall = None
-                    if _is_lb_entry and li > 0:
-                        # Floors L2+: go straight to wide fallback (faster, avoids spurious misses)
+                    # 1. Registry-first: look up wall by deterministic AI ID.
+                    # This is the most reliable path — always try it regardless of
+                    # door type or floor index.  The old "LB fast-path" that skipped
+                    # registry for L2+ lobby entry doors was causing the wide geometry
+                    # search to pick up outer shell walls instead of the correct lobby
+                    # wall, leading to Revit's "Can't cut instance" error.
+                    wall_ai_id = wall_ai_id_map.get(level_id) if wall_ai_id_map else None
+                    if wall_ai_id:
+                        # Try exact ID first, then _Gap0/_Gap1 variants.
+                        # Staircase walls that overlap the lift core boundary are
+                        # split by wall_overlaps_box into "AI_..._W_Front_Gap0" etc.
+                        # The door spec still references the un-split name, so we must
+                        # probe gap variants when the exact key is absent.
+                        _candidates = [wall_ai_id,
+                                       wall_ai_id + "_Gap0",
+                                       wall_ai_id + "_Gap1"]
+                        for _cid in _candidates:
+                            if _cid in registry:
+                                elem = doc.GetElement(registry[_cid])
+                                if elem and isinstance(elem, DB.Wall):
+                                    wall = elem
+                                    break
+
+                    # 2. Geometry fallback (level-constrained, direction-aware)
+                    if not wall:
+                        wall = self._find_wall_for_door(
+                            doc, pos_mm, level=level,
+                            wall_line_mm=spec.get("wall_line_mm"),
+                        )
+                        if not wall and li == 1:
+                            # Diagnostic: log what the 600mm search sees for L2 to diagnose misses
+                            self.log("  [DIAG] {} L2 step2 miss: pos={} wall_line={} level={}".format(
+                                spec_id, pos_mm, spec.get("wall_line_mm"), level_id))
+                    # 3. Wide geometry fallback — if still not found, try without level constraint
+                    if not wall:
                         wall = self._find_wall_for_door(
                             doc, pos_mm, level=None,
                             max_dist_mm=3000,
                             wall_line_mm=spec.get("wall_line_mm"),
                         )
                         if wall:
-                            self.log("  Door {} @ level {}: LB fast-path via wide fallback".format(spec_id, level_id))
-                    else:
-                        # 1. Registry-first: look up wall by deterministic AI ID
-                        wall_ai_id = wall_ai_id_map.get(level_id) if wall_ai_id_map else None
-                        if wall_ai_id and wall_ai_id in registry:
-                            elem = doc.GetElement(registry[wall_ai_id])
-                            if elem and isinstance(elem, DB.Wall):
-                                wall = elem
-
-                        # 2. Geometry fallback (level-constrained, direction-aware)
-                        if not wall:
-                            wall = self._find_wall_for_door(
-                                doc, pos_mm, level=level,
-                                wall_line_mm=spec.get("wall_line_mm"),
-                            )
-                        # 3. Wide geometry fallback — if still not found, try without level constraint
-                        if not wall:
-                            wall = self._find_wall_for_door(
-                                doc, pos_mm, level=None,
-                                max_dist_mm=3000,
-                                wall_line_mm=spec.get("wall_line_mm"),
-                            )
-                            if wall:
-                                self.log("  Door {} @ level {}: found via wide fallback (no-level, 3000mm)".format(spec_id, level_id))
+                            try:
+                                _wc = wall.get_Parameter(DB.BuiltInParameter.ALL_MODEL_INSTANCE_COMMENTS)
+                                _wtag = _wc.AsString() if (_wc and _wc.HasValue) else str(wall.Id.Value)
+                            except Exception:
+                                _wtag = str(wall.Id.Value)
+                            self.log("  Door {} @ level {}: wide fallback picked wall='{}'".format(spec_id, level_id, _wtag))
                     if not wall:
                         # Log registry miss info for diagnosis
                         _dbg_ai_id = wall_ai_id_map.get(level_id) if wall_ai_id_map else None
@@ -3469,7 +3519,12 @@ class RevitWorkers:
                     results["elements"].append(str(door_inst.Id.Value))
                     placed += 1
                 except Exception as _de:
-                    self.log("  Door {} @ level {}: {}".format(spec_id, level_id, _de))
+                    try:
+                        _wc2 = wall.get_Parameter(DB.BuiltInParameter.ALL_MODEL_INSTANCE_COMMENTS) if wall else None
+                        _wtag2 = _wc2.AsString() if (_wc2 and _wc2.HasValue) else (str(wall.Id.Value) if wall else "None")
+                    except Exception:
+                        _wtag2 = "unknown"
+                    self.log("  Door {} @ level {} in wall='{}': {}".format(spec_id, level_id, _wtag2, _de))
 
         self.log("Door phase complete: {} doors placed.".format(placed))
         return placed
@@ -4037,6 +4092,20 @@ class RevitWorkers:
         # Only fall back to preset/JSON if a key is absent or zero.
         cp = self._compliance_params  # extracted from manifest at top of execute()
         _cp_overrides = {}
+        # Gemini emits compliance_parameters with "staircase" as a direct child key.
+        # Also handles older manifests where it was nested under "fire_safety[_scdf]".
+        def _cp_get_travel2(key):
+            if cp.get(key):
+                return cp[key]
+            _st = cp.get("staircase", {})
+            if isinstance(_st, dict) and _st.get(key):
+                return _st[key]
+            _fs = cp.get("fire_safety_scdf", cp.get("fire_safety", {}))
+            if isinstance(_fs, dict):
+                _st2 = _fs.get("staircase", {})
+                if isinstance(_st2, dict) and _st2.get(key):
+                    return _st2[key]
+            return None
 
         # Staircase geometry — riser/tread/headroom/overrun from compliance_parameters
         if cp.get("stair_riser_mm"):
@@ -4049,10 +4118,14 @@ class RevitWorkers:
             _cp_overrides["min_headroom_mm"] = int(cp["stair_headroom_mm"])
         if cp.get("stair_overrun_mm"):
             _cp_overrides["overrun_height_mm"] = int(cp["stair_overrun_mm"])
-        if cp.get("max_travel_distance_mm"):
-            _cp_overrides["max_travel_distance_mm"] = int(cp["max_travel_distance_mm"])
-        if cp.get("max_travel_distance_sprinklered_mm"):
-            _cp_overrides["max_travel_distance_sprinklered_mm"] = int(cp["max_travel_distance_sprinklered_mm"])
+        _td2 = _cp_get_travel2("max_travel_distance_mm")
+        if _td2:
+            _cp_overrides["max_travel_distance_mm"] = int(_td2)
+        _tds2 = _cp_get_travel2("max_travel_distance_sprinklered_mm")
+        if _tds2:
+            _cp_overrides["max_travel_distance_sprinklered_mm"] = int(_tds2)
+        self.log("[ComplianceOverride] Travel distance: non-sprinklered={} sprinklered={}".format(
+            _cp_overrides.get("max_travel_distance_mm"), _cp_overrides.get("max_travel_distance_sprinklered_mm")))
 
         # --- Pre-determine actual staircase count from travel distance compliance ---
         # Must happen before the width calculation so the occupancy load is divided
@@ -4239,12 +4312,23 @@ class RevitWorkers:
             _cp_overrides["smoke_lobby_min_area_mm2"] = int(_sm_lb_cp["min_area_mm2"])
         if not _cp_overrides.get("smoke_lobby_min_depth_mm") and _sm_lb_cp.get("min_depth_mm"):
             _cp_overrides["smoke_lobby_min_depth_mm"] = int(_sm_lb_cp["min_depth_mm"])
+        if not _cp_overrides.get("smoke_lobby_min_width_mm") and _sm_lb_cp.get("min_width_mm"):
+            _cp_overrides["smoke_lobby_min_width_mm"] = int(_sm_lb_cp["min_width_mm"])
         if not _cp_overrides.get("min_corridor_width_mm") and _cor_cp.get("min_corridor_width_mm"):
             _cp_overrides["min_corridor_width_mm"] = int(_cor_cp["min_corridor_width_mm"])
 
         if _cp_overrides:
             self.log("[ComplianceOverride] Applying {} RAG-derived value(s) to engine: {}".format(
                 len(_cp_overrides), list(_cp_overrides.keys())))
+
+        # Apply min_corridor_width_mm: lobby_w must be >= RAG minimum, but never shrink
+        # a wider value already set by the manifest or preset.
+        _min_corr_w = _cp_overrides.get("min_corridor_width_mm")
+        if _min_corr_w and lobby_w < _min_corr_w:
+            self.log("[ComplianceOverride] lobby_w raised from {}mm to {}mm (min_corridor_width_mm)".format(
+                lobby_w, _min_corr_w))
+            lobby_w = int(_min_corr_w)
+            self._last_lobby_w = lobby_w
 
         self._stair_spec = stair_spec
         self.log("[StairSpec] FINAL stair_spec: riser={} tread={} flight_w={} landing={} "
@@ -4360,8 +4444,12 @@ class RevitWorkers:
                     except (TypeError, ValueError):
                         pass
                 _cluster_sets.append(_cs)
-            safety_sets = _cluster_sets
-            self.log("[Core] Cluster directives: {} set(s) from lifts.clusters".format(len(_cluster_sets)))
+            # Keep any perimeter SMOKE_STOP sets calculated by calculate_fire_safety_requirements
+            # — those are compliance-driven and must not be discarded by the cluster override.
+            _perim_sets = [s for s in safety_sets if s.get("is_perimeter")]
+            safety_sets = _cluster_sets + _perim_sets
+            self.log("[Core] Cluster directives: {} set(s) from lifts.clusters + {} perimeter set(s)".format(
+                len(_cluster_sets), len(_perim_sets)))
 
         # 5. Build Manifest Data
         levels_manifest = []
@@ -5110,6 +5198,7 @@ class RevitWorkers:
             footprint_pts=shell.get("footprint_points"),
             footprint_holes=_normalise_footprint_holes(shell.get("footprint_holes", [])),
             all_floor_dims=floor_dims,
+            center_pos=f_center_mm,
         )
 
         if isinstance(unified_man, dict) and unified_man.get("status") == "CONFLICT":

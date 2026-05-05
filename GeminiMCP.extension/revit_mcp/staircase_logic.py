@@ -287,6 +287,7 @@ def get_safety_set_dimensions(typical_floor_height_mm, spec=None, is_fire_lift=F
     smoke_lb_area = co.get("smoke_lobby_min_area_mm2", _SMOKE_LB_AREA)
     min_lb_depth  = (co.get("fire_lobby_min_depth_mm", _MIN_LB_DEPTH) if is_fire_lift
                      else co.get("smoke_lobby_min_depth_mm", _MIN_LB_DEPTH))
+    smoke_lb_min_w = co.get("smoke_lobby_min_width_mm", 0)
 
     net_w = get_shaft_dimensions(4000, spec)[0]
     # Identify typical depth across all levels if data is provided, else fallback
@@ -300,14 +301,17 @@ def get_safety_set_dimensions(typical_floor_height_mm, spec=None, is_fire_lift=F
     target_net_area = fire_lb_area if is_fire_lift else smoke_lb_area
     # Minimum required lobby clear dimension (as per compliance rules)
     min_net_depth = min_lb_depth
-    
+
     # Add depth to accommodate lobby area
     # net_d already includes 2*w_landing. We need to ADD a dedicated lobby depth.
     # The staircase and lobby share one wall (T-junction).
     # Total depth = stair_d + lobby_d
-    
-    # Lobby net width matches shaft net width
+
+    # Lobby net width: shaft width, floored by smoke stop lobby min width from RAG
     net_w_internal = net_w - 2*t
+    if not is_fire_lift and smoke_lb_min_w and net_w_internal < smoke_lb_min_w:
+        net_w_internal = int(smoke_lb_min_w)
+        net_w = net_w_internal + 2 * t
     lobby_net_d = max(min_net_depth, target_net_area / (max(net_w_internal, 1000)))
     
     total_w = net_w

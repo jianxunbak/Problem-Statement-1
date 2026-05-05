@@ -132,8 +132,35 @@ def _should_use_ew_orientation(_lift_core_bounds_mm, _sw_nat, _sd_nat,
     NS layout: lift row runs E-W, stairs at N/S ends (default).
 
     orientation: "NS" / "EW" — explicit override from manifest.
-                 "AUTO" — auto-select based on floor plate aspect ratio.
+                 "AUTO" — auto-select based on floor plate aspect ratio and
+                          available clearance N/S of the lift core.
     """
+    # Physical feasibility check: if either the north or south side of the lift
+    # core lacks enough clearance for a staircase shaft, NS layout is impossible
+    # regardless of the requested orientation.  Both fire sets need their own
+    # clear side (one N, one S); if one side is blocked the second set has
+    # nowhere to go and the layout engine produces a scrambled result.
+    # This happens when Gemini pushes the core near a building edge to avoid a void.
+    if _lift_core_bounds_mm and floor_dims:
+        _avg_l = sum(d[1] for d in floor_dims) / len(floor_dims)
+        l_xmin, l_ymin, l_xmax, l_ymax = _lift_core_bounds_mm
+        # Determine the building's south/north edge in the same coordinate frame.
+        # Gemini emits coordinates with the SW corner at (0,0), so l_ymin is the
+        # absolute distance from the south wall.  In legacy centred-origin tests
+        # the core straddles Y=0 (l_ymin < 0); in that case infer edges from avg_l.
+        if l_ymin >= 0:
+            _bld_south = 0.0
+            _bld_north = _avg_l
+        else:
+            _core_cy = (l_ymin + l_ymax) / 2.0
+            _bld_south = _core_cy - _avg_l / 2.0
+            _bld_north = _core_cy + _avg_l / 2.0
+        _MARGIN = 500  # edge gap + wall thickness tolerance
+        _space_n = _bld_north - l_ymax
+        _space_s = l_ymin - _bld_south
+        if _space_n < _sd_nat + _MARGIN or _space_s < _sd_nat + _MARGIN:
+            return True  # force EW regardless of requested orientation
+
     if orientation == "EW":
         return True
     if orientation == "NS":
@@ -802,26 +829,13 @@ def calculate_fire_safety_requirements(floor_dims_mm, core_center_mm, lift_core_
     # fire_lift shaft depth + lobby depth + half staircase depth.
     _stair_centre_offset = fl_shaft_d + _lobby_d_est + sd_nat / 2.0
 
-    # Translate footprint polygon to match the lift-bank coordinate frame.
-    # Gemini emits footprint_pts with SW corner at (0,0); stair positions are
-    # centred at core_center_mm.  Shift so test points and stair positions share
-    # the same origin — avoids spurious perimeter SMOKE_STOP stairs on standard
-    # 60×60 m buildings where the footprint centroid is at (30000,30000).
-    # The raw footprint_pts is NOT modified so generate_fire_safety_manifest
-    # still receives the original absolute-coords polygon for OR-Tools.
+    # Keep footprint polygon in absolute building coordinates.
+    # Both stair positions (from FIRE_LIFT sets) and travel-distance test points
+    # must share the same coordinate frame.  Translating the footprint to match
+    # the core breaks distance checks when the core is offset from the building
+    # centroid (e.g. core near north edge to avoid a void).
     _fp_use = footprint_pts
     _fp_holes_use = footprint_holes
-    _fp_dx = _fp_dy = 0.0
-    if footprint_pts and len(footprint_pts) >= 3:
-        _fp_cx = sum(p[0] for p in footprint_pts) / float(len(footprint_pts))
-        _fp_cy = sum(p[1] for p in footprint_pts) / float(len(footprint_pts))
-        _fp_dx = float(core_center_mm[0]) - _fp_cx
-        _fp_dy = float(core_center_mm[1]) - _fp_cy
-        if abs(_fp_dx) > 100 or abs(_fp_dy) > 100:
-            _fp_use = [[p[0] + _fp_dx, p[1] + _fp_dy] for p in footprint_pts]
-            if footprint_holes:
-                _fp_holes_use = [[[pt[0] + _fp_dx, pt[1] + _fp_dy] for pt in h]
-                                  for h in footprint_holes]
 
     def _ew_stair_pos(sets_list):
         """Estimate stair centres for EW fire-set entry positions (exit E or W)."""
@@ -913,19 +927,32 @@ def calculate_fire_safety_requirements(floor_dims_mm, core_center_mm, lift_core_
     # repeating until all floors comply.  Only fall back to max footprint as a
     # last resort.  This mirrors SCDF Code Part IV cl. 5.3.3 intent.
     if floor_dims_mm:
-        # Build a sorted list of unique half-lengths (ascending) to try as edge positions.
-        unique_half_l = sorted(set(d[1] / 2.0 for d in floor_dims_mm))
+        # Build sorted lists of unique half-dimensions for N/S and E/W edge positions.
+        unique_half_l = sorted(set(d[1] / 2.0 for d in floor_dims_mm))  # Y half-lengths
+        unique_half_w = sorted(set(d[0] / 2.0 for d in floor_dims_mm))  # X half-widths
     else:
         unique_half_l = [25000.0]  # 50 m default half-length
+        unique_half_w = [25000.0]
 
     # Approximate shaft depth to compute staircase centre from edge position.
     _sd_approx = staircase_logic.get_shaft_dimensions(_typ_h, None)[1]
 
-    # For irregular polygons, pre-compute an 8×8 grid of interior candidate positions
-    # so perimeter stairs always land inside the actual floor plate, not at bounding-box
-    # edge midpoints that may be outside a Z/L/H/etc. shaped footprint.
+    # For non-rectangular polygons (L, U, H, etc.), pre-compute an 8×8 grid of interior
+    # candidate positions so perimeter stairs always land inside the actual floor plate,
+    # not at bounding-box edge midpoints that may be outside the footprint.
+    # Simple rectangles (with or without interior holes/courtyards) always use the
+    # rectangular edge-candidate path so stairs target outer building edges, not the void.
+    def _is_simple_rectangle(pts):
+        """True if pts describes an axis-aligned rectangle (4 unique corners, ±closed)."""
+        unique = list({(round(p[0]), round(p[1])) for p in pts})
+        if len(unique) != 4:
+            return False
+        xs = sorted(set(p[0] for p in unique))
+        ys = sorted(set(p[1] for p in unique))
+        return len(xs) == 2 and len(ys) == 2
+
     _poly_candidates = None
-    if footprint_pts and len(footprint_pts) >= 3:
+    if footprint_pts and len(footprint_pts) >= 3 and not _is_simple_rectangle(footprint_pts):
         _fp_xs = [p[0] for p in footprint_pts]
         _fp_ys = [p[1] for p in footprint_pts]
         _fp_xmin, _fp_xmax = min(_fp_xs), max(_fp_xs)
@@ -950,22 +977,66 @@ def calculate_fire_safety_requirements(floor_dims_mm, core_center_mm, lift_core_
     # Greedy: always pick the candidate furthest from ALL existing staircases.
     all_stair_pos = list(stair_pos)
 
-    # Try each footprint from smallest to largest until 60m rule is satisfied.
-    for try_hl in unique_half_l:
+    # Building centre for perimeter candidate placement.
+    # Use the footprint bbox centre when a footprint polygon is available;
+    # fall back to floor_dims bbox centre.  Do NOT use core_center_mm — when
+    # the core is offset (e.g. placed near the north edge to avoid a void) the
+    # perimeter candidates would land outside the building or inside the void.
+    if footprint_pts and len(footprint_pts) >= 3:
+        _fp_xs_c = [p[0] for p in footprint_pts]
+        _fp_ys_c = [p[1] for p in footprint_pts]
+        _cx0 = (min(_fp_xs_c) + max(_fp_xs_c)) / 2.0
+        _cy0 = (min(_fp_ys_c) + max(_fp_ys_c)) / 2.0
+    elif floor_dims_mm:
+        # Derive from the largest floor plate bbox; half-widths are already available.
+        _cx0 = core_center_mm[0]  # X centre matches core (no void in X typically)
+        _cy0 = core_center_mm[1]
+    else:
+        _cx0 = core_center_mm[0]
+        _cy0 = core_center_mm[1]
+
+    # Build a unified tier list covering both N/S (from half-length) and E/W (from half-width)
+    # edge positions.  For each tier we build candidates for all four building edges so the
+    # greedy loop can place stairs at corners/east/west when N/S alone is insufficient.
+    _unique_dims = sorted(set(unique_half_l + unique_half_w))
+
+    # Try each footprint dimension tier from smallest to largest until 60m rule satisfied.
+    for try_hl in _unique_dims:
         if staircase_logic._check_travel_distance(all_stair_pos, floor_dims_mm, max_travel_dist,
                                                    footprint_pts=_fp_use,
                                                    footprint_holes=_fp_holes_use):
             break  # already compliant from central stairs alone
 
         # Build candidates: polygon-interior grid points (irregular shapes) or
-        # bounding-box edge midpoints (rectangular shapes).
+        # all four building-edge midpoints (rectangular shapes).
+        # Each candidate is (stair_cx, stair_cy, pos_x, pos_y, rotation_deg) where
+        # (stair_cx, stair_cy) is the staircase shaft centre used for distance checks
+        # and (pos_x, pos_y) + rotation_deg is what gets stored in the safety set.
         if _poly_candidates is not None:
-            perim_candidates = list(_poly_candidates)
+            # Polygon path: candidates are interior grid points; pos derived at placement time.
+            perim_candidates = [(cx, cy, None, None, None) for cx, cy in _poly_candidates]
         else:
-            perim_candidates = [
-                (core_center_mm[0], -try_hl + _sd_approx / 2.0),   # south edge centre
-                (core_center_mm[0],  try_hl - _sd_approx / 2.0),   # north edge centre
+            # Rectangular path: build mid-edge candidates for all four building faces.
+            # The N/S edge midpoints use the current tier Y half-length;
+            # the E/W edge midpoints use the corresponding X half-width for that tier.
+            _ns_hl = try_hl if try_hl in unique_half_l else max(unique_half_l)
+            _ew_hw = try_hl if try_hl in unique_half_w else max(unique_half_w)
+            # N/S: stair centre is inset from the edge by half the shaft depth; rotation=0.
+            _sc_ns = _sd_approx / 2.0
+            # E/W: stair centre is inset from the east/west edge; rotation=90 triggers EW path.
+            _sc_ew = _sd_approx / 2.0
+            _raw_cands = [
+                # (stair_cx, stair_cy, pos_x, pos_y, rot_deg)
+                # pos_x/pos_y are ABSOLUTE building coordinates (not origin-relative).
+                (_cx0,  _cy0 - _ns_hl + _sc_ns,  _cx0,  _cy0 - _ns_hl,  0.0),  # south NS
+                (_cx0,  _cy0 + _ns_hl - _sc_ns,  _cx0,  _cy0 + _ns_hl,  0.0),  # north NS
+                (_cx0 - _ew_hw + _sc_ew,  _cy0,  _cx0 - _ew_hw,  _cy0,  90.0),  # west EW
+                (_cx0 + _ew_hw - _sc_ew,  _cy0,  _cx0 + _ew_hw,  _cy0,  90.0),  # east EW
             ]
+            # Skip candidates already placed in a previous tier to avoid duplicates.
+            _placed = set((round(sx), round(sy)) for sx, sy in all_stair_pos)
+            perim_candidates = [c for c in _raw_cands
+                                 if (round(c[0]), round(c[1])) not in _placed]
 
         # Add the best candidate from this footprint tier.
         while perim_candidates:
@@ -978,16 +1049,19 @@ def calculate_fire_safety_requirements(floor_dims_mm, core_center_mm, lift_core_
                 for sx, sy in all_stair_pos
             ))
             perim_candidates.remove(best)
-            # Derive building-edge Y from staircase centre Y (used for is_south_p orientation)
-            y_edge = best[1] - _sd_approx / 2.0 if best[1] < 0 else best[1] + _sd_approx / 2.0
-            _perim_rot = 0.0
-            if _fp_use and len(_fp_use) >= 3:
-                _perim_rot = _nearest_polygon_edge_angle_deg(best[0], best[1], _fp_use)
-            final_sets.append({"pos": (best[0], y_edge), "type": "SMOKE_STOP",
+            _bcx, _bcy, _bpx, _bpy, _brot = best
+            if _bpx is None:
+                # Polygon interior path: derive pos/rotation from nearest polygon edge.
+                _bpx = _bcx
+                _bpy = _bcy - _sd_approx / 2.0 if _bcy < _cy0 else _bcy + _sd_approx / 2.0
+                _brot = 0.0
+                if _fp_use and len(_fp_use) >= 3:
+                    _brot = _nearest_polygon_edge_angle_deg(_bcx, _bcy, _fp_use)
+            final_sets.append({"pos": (_bpx, _bpy), "type": "SMOKE_STOP",
                                 "is_perimeter": True,
                                 "ref_half_l": try_hl,
-                                "rotation_deg": _perim_rot})
-            all_stair_pos.append(best)
+                                "rotation_deg": _brot})
+            all_stair_pos.append((_bcx, _bcy))
 
     # Tag each perimeter staircase with the highest 0-based floor index where it
     # is still required.  Above that index the central core stairs alone satisfy
@@ -1360,6 +1434,11 @@ def generate_fire_safety_manifest(safety_sets, levels_data, stair_spec,
     l_xmin, l_ymin, l_xmax, l_ymax = lift_core_bounds_mm if lift_core_bounds_mm else (0, 0, 0, 0)
     lift_core_cy = (l_ymin + l_ymax) / 2.0
 
+    # Building centre used to classify perimeter stair orientation (east/west/south/north).
+    # Prefer caller-supplied center_pos; fall back to lift core centre.
+    _bld_cx = center_pos[0] if center_pos else (l_xmin + l_xmax) / 2.0
+    _bld_cy = center_pos[1] if center_pos else (l_ymin + l_ymax) / 2.0
+
     layout = lift_logic.get_total_core_layout(num_lifts, lobby_width=lobby_width) if num_lifts else None
     row1_cy, row2_cy = _passenger_lift_row_centers((0, 0), layout, lobby_width) if layout else (0, 0)
 
@@ -1556,31 +1635,60 @@ def generate_fire_safety_manifest(safety_sets, levels_data, stair_spec,
             _anc_w_chk, sd_nat, _anc_w_chk - sd_nat))
         _fslog("[LayoutEngine] bank orientation: unrestricted — OR-Tools picks best side via cl_perim")
 
-        # Per-set half-bank anchors: when there are exactly 2 non-perimeter fire sets,
-        # each set gets its own half-bank anchor so both staircases attach to an
-        # independent row.  Set 0 (north) gets the north half-bank; Set 1 (south) gets
-        # the south half-bank.  This is the "build both sides separately" model.
+        # Per-set anchors: when there are exactly 2 non-perimeter fire sets,
+        # each set gets its own anchor so both staircases attach to an independent
+        # portion of the bank.  Two cases:
+        #
+        #   Multi-block bank (num_blocks >= 2):
+        #     Each fire set anchors to a full block (N block / S block).
+        #     The staircase extends outward from the block's outer face, so it
+        #     always lands outside the overall bank Y extents.
+        #
+        #   Single-block 2-row bank (num_blocks == 1):
+        #     Use half-row anchors as before — Set 0 (north) = inner N row,
+        #     Set 1 (south) = inner S row.
         _non_perim_fire_sets = [
             i for i, s in enumerate(safety_sets)
             if not s.get("is_perimeter") and s["type"] == "FIRE_LIFT"
         ]
         _lift_shaft_depth = _PAX_CAR_D + 2 * _WALL_THICKNESS  # matches fl_shaft_d
         _bank_cy = (_l_ymin + _l_ymax) / 2.0
+        _layout_nb = layout["num_blocks"] if layout else 1
+        _layout_bd = layout["block_d"]    if layout else (_l_ymax - _l_ymin)
         if len(_non_perim_fire_sets) == 2 and num_lifts and num_lifts >= 4:
-            # North half-bank (Row1, floor(n/2) lifts, upper y-range)
-            _north_anc = (_l_xmin, _bank_cy + lobby_width / 2.0,
-                          _l_xmax, _bank_cy + lobby_width / 2.0 + _lift_shaft_depth)
-            # South half-bank (Row2, ceil(n/2) lifts, lower y-range)
-            _south_anc = (_l_xmin, _bank_cy - _lift_shaft_depth - lobby_width / 2.0,
-                          _l_xmax, _bank_cy - lobby_width / 2.0)
-            _per_set_anchors = {
-                _non_perim_fire_sets[0]: _north_anc,
-                _non_perim_fire_sets[1]: _south_anc,
-            }
-            _fslog("[LayoutEngine] 2-set half-bank anchors: Set{}→N({:.0f},{:.0f},{:.0f},{:.0f}) "
-                   "Set{}→S({:.0f},{:.0f},{:.0f},{:.0f})".format(
-                   _non_perim_fire_sets[0], *_north_anc,
-                   _non_perim_fire_sets[1], *_south_anc))
+            if _layout_nb >= 2:
+                # Multi-block: anchor each fire set to a full block.
+                # Block 0 (southernmost) spans [bank_cy - N*bd/2, bank_cy - (N-1)*bd/2].
+                # For N=2: Block 0 = [_bank_cy - block_d, _bank_cy], Block 1 = [_bank_cy, _bank_cy + block_d].
+                _north_anc = (_l_xmin, _bank_cy,                           # Block N-1 (top)
+                              _l_xmax, _bank_cy + _layout_bd)
+                _south_anc = (_l_xmin, _bank_cy - _layout_bd,              # Block 0 (bottom)
+                              _l_xmax, _bank_cy)
+                _per_set_anchors = {
+                    _non_perim_fire_sets[0]: _north_anc,
+                    _non_perim_fire_sets[1]: _south_anc,
+                }
+                _fslog("[LayoutEngine] 2-set block anchors (num_blocks={}): Set{}→N-block({:.0f},{:.0f},{:.0f},{:.0f}) "
+                       "Set{}→S-block({:.0f},{:.0f},{:.0f},{:.0f})".format(
+                       _layout_nb,
+                       _non_perim_fire_sets[0], *_north_anc,
+                       _non_perim_fire_sets[1], *_south_anc))
+            else:
+                # Single-block: use inner-row half-bank anchors (original logic).
+                # North half-bank (Row1, upper y-range)
+                _north_anc = (_l_xmin, _bank_cy + lobby_width / 2.0,
+                              _l_xmax, _bank_cy + lobby_width / 2.0 + _lift_shaft_depth)
+                # South half-bank (Row2, lower y-range)
+                _south_anc = (_l_xmin, _bank_cy - _lift_shaft_depth - lobby_width / 2.0,
+                              _l_xmax, _bank_cy - lobby_width / 2.0)
+                _per_set_anchors = {
+                    _non_perim_fire_sets[0]: _north_anc,
+                    _non_perim_fire_sets[1]: _south_anc,
+                }
+                _fslog("[LayoutEngine] 2-set half-bank anchors: Set{}→N({:.0f},{:.0f},{:.0f},{:.0f}) "
+                       "Set{}→S({:.0f},{:.0f},{:.0f},{:.0f})".format(
+                       _non_perim_fire_sets[0], *_north_anc,
+                       _non_perim_fire_sets[1], *_south_anc))
         else:
             _per_set_anchors = {}
 
@@ -2177,34 +2285,42 @@ def generate_fire_safety_manifest(safety_sets, levels_data, stair_spec,
             _EDGE_GAP = _EDGE_GAP_MM
 
             if _is_ew_edge:
-                # EW-facing stair: width along Y, depth along X
-                # entry_x = edge X coordinate, entry_y = lateral Y position
-                is_east_p = (entry_x >= 0)
+                # EW-edge stair: positioned at east or west building edge.
+                # The shaft itself runs N-S (sw_nat in X, sd_nat in Y) — same orientation
+                # as generate_staircase_manifest always produces, so the walls align.
+                # The lobby is a N-S strip on the floor-plate side (west of east stair,
+                # east of west stair), lobby depth running in X.
+                is_east_p = (entry_x >= _bld_cx)
                 if is_east_p:
+                    # Shaft near east wall: right edge inset by _EDGE_GAP from building edge.
                     st_x2 = entry_x - _EDGE_GAP
-                    st_x1 = st_x2 - sd_nat
-                    lb_x1 = st_x1 - lobby_d_p
-                    lb_x2 = st_x1
-                    is_rotated_suit = False
+                    st_x1 = st_x2 - sw_nat          # shaft width (narrow) in X
+                    lb_x2 = st_x1                   # lobby east face = stair west face
+                    lb_x1 = lb_x2 - lobby_d_p       # lobby depth runs west
+                    is_rotated_suit = False          # stair main landing faces west (floor-plate side)
                 else:
+                    # Shaft near west wall: left edge inset by _EDGE_GAP from building edge.
                     st_x1 = entry_x + _EDGE_GAP
-                    st_x2 = st_x1 + sd_nat
-                    lb_x1 = st_x2
-                    lb_x2 = st_x2 + lobby_d_p
-                    is_rotated_suit = True
-                st_y1 = entry_y - sw_nat / 2.0
-                st_y2_ew = entry_y + sw_nat / 2.0
-                lb_box = [lb_x1, st_y1, lb_x2, st_y2_ew]
-                st_box = [st_x1, st_y1, st_x2, st_y2_ew]
-                st_cx  = (st_x1 + st_x2) / 2.0
-                st_cy  = entry_y
-                st_rect = [min(st_x1, lb_x1), st_y1, max(st_x2, lb_x2), st_y2_ew]
-                st_base_y  = st_y1        # min Y of EW staircase — needed by shared code below
-                st_y2      = st_y2_ew     # max Y alias for door-spec block below
-                is_south_p = False        # EW: use "not south" door-orientation path
+                    st_x2 = st_x1 + sw_nat          # shaft width (narrow) in X
+                    lb_x1 = st_x2                   # lobby west face = stair east face
+                    lb_x2 = lb_x1 + lobby_d_p       # lobby depth runs east
+                    is_rotated_suit = True           # stair main landing faces east (floor-plate side)
+                # Shaft height (sd_nat) runs N-S, centred on entry_y
+                st_base_y = entry_y - sd_nat / 2.0
+                st_y2     = entry_y + sd_nat / 2.0
+                lb_y1     = st_base_y               # lobby same Y extents as shaft
+                lb_y2     = st_y2
+                lb_box    = [lb_x1, lb_y1, lb_x2, lb_y2]
+                st_box    = [st_x1, st_base_y, st_x2, st_y2]
+                st_cx     = (st_x1 + st_x2) / 2.0
+                st_cy     = entry_y
+                st_rect   = [min(st_x1, lb_x1), st_base_y, max(st_x2, lb_x2), st_y2]
+                st_y1     = st_base_y               # alias used by door-spec block below
+                st_y2_ew  = st_y2                   # alias for door-spec block below
+                is_south_p = False                  # EW: use "not south" door-orientation path
             else:
-                # NS-facing stair: entry_y is building-edge Y (negative=south, positive=north)
-                is_south_p = (entry_y <= 0)
+                # NS-facing stair: entry_y is absolute building-edge Y coordinate
+                is_south_p = (entry_y <= _bld_cy)
                 if is_south_p:
                     # Staircase at south edge (inset), lobby north of it (facing floor plate)
                     st_base_y  = entry_y + _EDGE_GAP
@@ -2247,12 +2363,19 @@ def generate_fire_safety_manifest(safety_sets, levels_data, stair_spec,
                     if lvl_h <= 0:
                         continue
                 common = {"level_id": lvl['id'], "height": lvl_h, "type": "AI_Wall_Core"}
-                # Skip lobby face shared with staircase W_Back/W_Front to avoid duplicate wall
-                _perim_skip = "S" if is_south_p else "N"
-                walls.append({"id": "AI_{}_W_L{}".format(lobby_tag, l_idx + 1),
-                              "start": [lb_x1_w, lb_y1_w, 0], "end": [lb_x1_w, lb_y2_w, 0], **common})
-                walls.append({"id": "AI_{}_E_L{}".format(lobby_tag, l_idx + 1),
-                              "start": [lb_x2_w, lb_y1_w, 0], "end": [lb_x2_w, lb_y2_w, 0], **common})
+                # Skip lobby face shared with staircase to avoid duplicate wall.
+                # NS stair: shared face is S (south stair) or N (north stair).
+                # EW stair: shared face is E (east stair, lb_x2==st_x1) or W (west stair, lb_x1==st_x2).
+                if _is_ew_edge:
+                    _perim_skip = "E" if is_east_p else "W"
+                else:
+                    _perim_skip = "S" if is_south_p else "N"
+                if _perim_skip != "W":
+                    walls.append({"id": "AI_{}_W_L{}".format(lobby_tag, l_idx + 1),
+                                  "start": [lb_x1_w, lb_y1_w, 0], "end": [lb_x1_w, lb_y2_w, 0], **common})
+                if _perim_skip != "E":
+                    walls.append({"id": "AI_{}_E_L{}".format(lobby_tag, l_idx + 1),
+                                  "start": [lb_x2_w, lb_y1_w, 0], "end": [lb_x2_w, lb_y2_w, 0], **common})
                 if _perim_skip != "N":
                     walls.append({"id": "AI_{}_N_L{}".format(lobby_tag, l_idx + 1),
                                   "start": [lb_x1_w, lb_y2_w, 0], "end": [lb_x2_w, lb_y2_w, 0], **common})
@@ -2322,8 +2445,68 @@ def generate_fire_safety_manifest(safety_sets, levels_data, stair_spec,
                     "swing_out_level1": True,
                     "wall_ai_id_map": {_set_lvl_ids[k]: "AI_SafetySet_{}_LB_N_L{}".format(i + 1, k + 1) for k in range(len(_set_lvl_ids))},
                 })
+            elif _is_ew_edge:
+                # EW perimeter stair: shaft runs E-W, lobby is on the floor-plate side.
+                # is_east_p=True  → staircase near east edge, lobby west of stair.
+                #   External door on east wall of staircase (st_x2).
+                #   Lobby entry door on west wall of lobby (lb_x1, floor-plate side).
+                # is_east_p=False → staircase near west edge, lobby east of stair.
+                #   External door on west wall of staircase (st_x1).
+                #   Lobby entry door on east wall of lobby (lb_x2, floor-plate side).
+                _door_y_off = st_y1 + 900      # 900mm from south edge for position
+                if is_east_p:
+                    # Staircase near EAST edge.  Lobby is WEST of staircase.
+                    # lb_x2 == st_x1 (shared wall stair↔lobby, lobby E = stair W).
+                    # _perim_skip="E" → lobby E wall omitted; use staircase's W_Left wall instead.
+                    _ext_x        = st_x2   # external door: east wall of staircase
+                    _lby_conn_x   = lb_x2   # stair↔lobby door: at lobby east = stair west X
+                    _entry_x      = lb_x1   # floor-plate entry: west wall of lobby
+                    _entry_dir    = "W"     # lobby wall direction for floor-plate entry door
+                    _ext_wall     = "AI_Stair_{}_L1_W_Right".format(_sn_p)
+                    # Lobby E wall is skipped (shared with stair); door goes on stair W wall.
+                    _lby_conn_wall_key = lambda k: "AI_Stair_{}_L{}_W_Left".format(_sn_p, k + 1)
+                else:
+                    # Staircase near WEST edge.  Lobby is EAST of staircase.
+                    # lb_x1 == st_x2 (shared wall stair↔lobby, lobby W = stair E).
+                    # _perim_skip="W" → lobby W wall omitted; use staircase's W_Right wall instead.
+                    _ext_x        = st_x1   # external door: west wall of staircase
+                    _lby_conn_x   = lb_x1   # stair↔lobby door: at lobby west = stair east X
+                    _entry_x      = lb_x2   # floor-plate entry: east wall of lobby
+                    _entry_dir    = "E"     # lobby wall direction for floor-plate entry door
+                    _ext_wall     = "AI_Stair_{}_L1_W_Left".format(_sn_p)
+                    # Lobby W wall is skipped (shared with stair); door goes on stair E wall.
+                    _lby_conn_wall_key = lambda k: "AI_Stair_{}_L{}_W_Right".format(_sn_p, k + 1)
+                _entry_wall_fmt    = "AI_SafetySet_{}_LB_{}_L{{}}".format(i + 1, _entry_dir)
+                door_specs.append({
+                    "id": tag + "_Stair_ExtDoor",
+                    "position_mm": [_ext_x, _door_y_off],
+                    "wall_line_mm": [[_ext_x, st_y1], [_ext_x, st_y2_ew]],
+                    "levels": [_set_first_id] if _set_first_id else [],
+                    "swing_in": False, "flip_hand": True, "min_width_mm": 1000,
+                    "door_category": "single_leaf",
+                    "wall_ai_id_map": ({_set_lvl_ids[0]: _ext_wall} if _set_lvl_ids else {}),
+                })
+                door_specs.append({
+                    "id": tag + "_Stair_LobbyDoor",
+                    "position_mm": [_lby_conn_x, _door_y_off],
+                    "wall_line_mm": [[_lby_conn_x, st_y1], [_lby_conn_x, st_y2_ew]],
+                    "levels": _set_lvl_ids, "swing_in": True, "flip_hand": True, "min_width_mm": 1000,
+                    "door_category": "single_leaf",
+                    "swing_out_level1": True,
+                    "wall_ai_id_map": {_set_lvl_ids[k]: _lby_conn_wall_key(k) for k in range(len(_set_lvl_ids))},
+                })
+                door_specs.append({
+                    "id": tag + "_Lobby_EntryDoor",
+                    "position_mm": [_entry_x, _door_y_off],
+                    "wall_line_mm": [[_entry_x, lb_box[1]], [_entry_x, lb_box[3]]],
+                    "levels": _set_lvl_ids, "swing_in": True, "flip_hand": True, "min_width_mm": 1000,
+                    "door_category": "single_leaf",
+                    "swing_out_level1": True,
+                    "wall_ai_id_map": {_set_lvl_ids[k]: _entry_wall_fmt.format(k + 1) for k in range(len(_set_lvl_ids))},
+                })
             else:
-                # Main landing faces SOUTH (is_rotated=False), external door on NORTH wall
+                # NS-north perimeter stair: main landing faces SOUTH (is_rotated=False),
+                # external door on NORTH wall, lobby entry on SOUTH wall of lobby.
                 _ext_y = st_y2              # north wall of staircase = W_Back
                 _lby_conn = st_base_y       # shared wall between staircase and lobby = W_Front
                 door_specs.append({
